@@ -28,33 +28,41 @@ def _git_version(repo_root: Path) -> str:
 def _build_frontend(source: Path) -> str:
     html = source.read_text(encoding="utf-8")
 
-    # 移除仓库自带的演示 fetch 拦截。演示模式存在时，所有 api 请求都会
-    # 被假数据截获，真实后端永远收不到消息。
+    # 移除演示 fetch 拦截，让请求真正进入后端。
     start = html.find(DEMO_START)
     end = html.find(DEMO_END, start if start >= 0 else 0)
     if start >= 0 and end > start:
         html = html[:start] + html[end:]
 
-    # 部署时的个人化文字。源文件仍保持上游原貌，避免以后同步上游时冲突。
+    # 部署时个人化文字，源文件保持上游原貌。
     replacements = {
-        r"\u987e\u5c7f": r"\u6c90",          # 顾屿 -> 沐
-        r"\u6b23\u6b23": r"\u598d\u598d", # 欣欣 -> 妍妍
-        r"\u8001\u5a46\u7684": r"\u598d\u598d\u7684", # 老婆的 -> 妍妍的
-        r"\u8001\u516c": r"\u6c90",          # 老公 -> 沐
+        r"\u987e\u5c7f": r"\u6c90",
+        r"\u6b23\u6b23": r"\u598d\u598d",
+        r"\u8001\u5a46\u7684": r"\u598d\u598d\u7684",
+        r"\u8001\u516c": r"\u6c90",
         "YU \\u00b7 XIN GENERAL STORE": "MU \\u00b7 YAN GENERAL STORE",
     }
     for old, new in replacements.items():
         html = html.replace(old, new)
 
-    # 上游日历页面移除了生理周期卡片变量 p，但还残留 p.appendChild，
-    # 会导致整个日历渲染抛错。
+    # 修复上游日历残留的未定义变量 p。
     html = html.replace(
         "  p.appendChild(moodRow);\n  box.appendChild(p);",
         "  box.appendChild(moodRow);",
     )
 
-    # 悄悄话原本藏在“日记”主页里，而空日记数据会让入口根本渲染不出来。
-    # 这里直接在侧栏加入稳定入口，不依赖日记模块是否已有数据。
+    # 日记为空时，上游原代码会把空数组当成错误，并在 renderBento 中对
+    # undefined 日期调用 slice。允许空日记正常进入主页。
+    html = html.replace(
+        "if (!d.ok || !d.bricks.length) throw 0;",
+        "if (!d.ok) throw 0;",
+    )
+    html = html.replace(
+        "const latestDate = boardDates[boardDates.length - 1];",
+        "const latestDate = boardDates[boardDates.length - 1] || todayStr();",
+    )
+
+    # 悄悄话提供独立侧栏入口，不依赖日记墙是否已有内容。
     wall_button = '<button class="item" id="navWall"><span class="ic" data-i="pen"></span>日记</button>'
     whisper_button = wall_button + '\n      <button class="item" id="navWhisper"><span class="ic" data-i="note"></span>悄悄话</button>'
     if 'id="navWhisper"' not in html:
@@ -91,7 +99,6 @@ def register_frontend_feature(server_module):
             "entrypoint": "run.py",
         })
 
-    # server.py 已注册根路由；替换它，避免重复 URL。
     server_module.app.view_functions["index"] = index_real
     server_module.app.add_url_rule(
         "/api/version",
