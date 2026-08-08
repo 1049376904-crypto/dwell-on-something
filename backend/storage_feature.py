@@ -5,7 +5,19 @@
 
 import sqlite3
 
+from flask import jsonify
+
 from paths import resolve_db_path
+
+
+TABLES = [
+    "messages",
+    "todos",
+    "calendar_events",
+    "calendar_day_records",
+    "whispers",
+    "diary_entries",
+]
 
 
 def register_storage_feature(server_module):
@@ -22,6 +34,31 @@ def register_storage_feature(server_module):
 
     server_module.get_db = get_db
     server_module.init_db()
+
+    def api_storage():
+        counts = {}
+        with get_db() as db:
+            for table in TABLES:
+                try:
+                    row = db.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+                    counts[table] = row["n"]
+                except sqlite3.Error:
+                    # 对应模块还没注册时，表可能不存在。
+                    counts[table] = None
+        return jsonify({
+            "ok": True,
+            "db_path": str(db_path),
+            "exists": db_path.exists(),
+            "size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+            "counts": counts,
+        })
+
+    server_module.app.add_url_rule(
+        "/api/storage",
+        endpoint="api_storage",
+        view_func=api_storage,
+        methods=["GET"],
+    )
 
     print(f"[dwell] 数据库: {db_path}")
     return db_path
