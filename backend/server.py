@@ -5,8 +5,10 @@ dwell-backend
 
 启动：
   cd backend
+  cp ../web/index.html .
   pip install flask flask-cors requests
   python3 server.py
+然后访问 http://你的IP:8888
 """
 
 import json
@@ -18,7 +20,7 @@ import queue
 from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 # ── 配置 ────────────────────────────────────────────────────────
@@ -27,6 +29,8 @@ GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "sk-ebb1179c1f074daeb406c80efe203aca"
 DEFAULT_MODEL = os.getenv("MODEL",         "claude-sonnet-4-5")
 PORT          = int(os.getenv("PORT",       "8888"))
 DB_PATH       = Path(os.getenv("DB_PATH",   "dwell.db"))
+# 前端 index.html 放在这个目录（和 server.py 同一层）
+STATIC_DIR    = Path(__file__).parent
 
 # ── Flask ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -170,7 +174,6 @@ def call_gateway(messages, model):
             state["busy"] = False
         return
 
-    # 生成完成
     content_parts = []
     if think_text:
         content_parts.append({"type": "thinking", "thinking": think_text})
@@ -185,7 +188,14 @@ def call_gateway(messages, model):
     with state_lock:
         state["busy"] = False
 
-# ── 接口 ─────────────────────────────────────────────────────────────────────
+# ── 前端静态文件 ────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def index():
+    """index.html 和 server.py 放在同一目录。"""
+    return send_from_directory(STATIC_DIR, "index.html")
+
+# ── 聊天接口 ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/messages")
 @app.get("/api/said")
@@ -298,58 +308,58 @@ def api_chats():
 
 
 # 其余 stub
-@app.post("/api/newchat")  
-def api_newchat():     return jsonify({"ok": True})
-@app.post("/api/chats")    
-def api_chats_post():  return jsonify({"ok": True})
-@app.get("/api/usage")     
-def api_usage():       return jsonify({"ok": False})
-@app.get("/api/cal")       
-def api_cal():         return jsonify({"ok": False})
-@app.post("/api/cal")      
-def api_cal_post():    return jsonify({"ok": True})
-@app.get("/api/wall")      
-def api_wall():        return jsonify({"ok": False})
-@app.get("/api/todos")     
-def api_todos():       return jsonify({"ok": True, "mine": [], "hers": []})
-@app.post("/api/todos")    
-def api_todos_post():  return jsonify({"ok": True, "mine": [], "hers": []})
-@app.get("/api/news")      
-def api_news():        return jsonify({"ok": False})
-@app.get("/api/nook/books")
-def api_nook():        return jsonify([])
-@app.get("/api/health")    
-def api_health():      return jsonify({"ok": False})
-@app.get("/api/repo/log")  
-def api_repo_log():    return jsonify({"ok": False, "items": []})
-@app.get("/api/whisper")   
-def api_whisper():     return jsonify({"items": []})
-@app.post("/api/whisper")  
-def api_whisper_post(): return jsonify({"ok": True})
-@app.get("/api/notes")     
-def api_notes():       return jsonify({"gu": [], "her": []})
-@app.post("/api/notes")    
-def api_notes_post():  return jsonify({"gu": [], "her": []})
-@app.get("/api/dreams")    
-def api_dreams():      return jsonify({"items": []})
-@app.get("/api/night")     
-def api_night():       return jsonify({"days": []})
-@app.get("/api/music")     
-def api_music():       return jsonify({"ok": False})
-@app.get("/api/gong")      
-def api_gong():        return jsonify({"msgs": []})
-@app.post("/api/gong")     
-def api_gong_post():   return jsonify({"reply": ""})
-@app.get("/api/find")      
-def api_find():        return jsonify({"ok": True, "hits": []})
-@app.get("/api/herdiary")  
-def api_herdiary():    return jsonify({"items": []})
-@app.post("/api/herdiary") 
-def api_herdiary_post(): return jsonify({"ok": True})
-@app.get("/api/favlines")  
-def api_favlines():    return jsonify({"ok": True, "text": ""})
-@app.get("/api/authmode")  
-def api_authmode():    return jsonify({"mode": "subscription"})
+@app.post("/api/newchat")   
+def api_newchat():      return jsonify({"ok": True})
+@app.post("/api/chats")     
+def api_chats_post():   return jsonify({"ok": True})
+@app.get("/api/usage")      
+def api_usage():        return jsonify({"ok": False})
+@app.get("/api/cal")        
+def api_cal():          return jsonify({"ok": False})
+@app.post("/api/cal")       
+def api_cal_post():     return jsonify({"ok": True})
+@app.get("/api/wall")       
+def api_wall():         return jsonify({"ok": False})
+@app.get("/api/todos")      
+def api_todos():        return jsonify({"ok": True, "mine": [], "hers": []})
+@app.post("/api/todos")     
+def api_todos_post():   return jsonify({"ok": True, "mine": [], "hers": []})
+@app.get("/api/news")       
+def api_news():         return jsonify({"ok": False})
+@app.get("/api/nook/books") 
+def api_nook():         return jsonify([])
+@app.get("/api/health")     
+def api_health():       return jsonify({"ok": False})
+@app.get("/api/repo/log")   
+def api_repo_log():     return jsonify({"ok": False, "items": []})
+@app.get("/api/whisper")    
+def api_whisper():      return jsonify({"items": []})
+@app.post("/api/whisper")   
+def api_whisper_post():  return jsonify({"ok": True})
+@app.get("/api/notes")      
+def api_notes():        return jsonify({"gu": [], "her": []})
+@app.post("/api/notes")     
+def api_notes_post():   return jsonify({"gu": [], "her": []})
+@app.get("/api/dreams")     
+def api_dreams():       return jsonify({"items": []})
+@app.get("/api/night")      
+def api_night():        return jsonify({"days": []})
+@app.get("/api/music")      
+def api_music():        return jsonify({"ok": False})
+@app.get("/api/gong")       
+def api_gong():         return jsonify({"msgs": []})
+@app.post("/api/gong")      
+def api_gong_post():    return jsonify({"reply": ""})
+@app.get("/api/find")       
+def api_find():         return jsonify({"ok": True, "hits": []})
+@app.get("/api/herdiary")   
+def api_herdiary():     return jsonify({"items": []})
+@app.post("/api/herdiary")  
+def api_herdiary_post():  return jsonify({"ok": True})
+@app.get("/api/favlines")   
+def api_favlines():     return jsonify({"ok": True, "text": ""})
+@app.get("/api/authmode")   
+def api_authmode():     return jsonify({"mode": "subscription"})
 
 # ── 启动 ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
