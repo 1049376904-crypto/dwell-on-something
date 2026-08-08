@@ -1,4 +1,4 @@
-"""让聊天模型主动调用待办、日历和悄悄话工具。
+"""让聊天模型主动调用待办、日历、悄悄话和日记工具。
 
 本模块替换 server.call_gateway，但不改原有页面 API。工具调用沿用前端已经
 支持的 assistant.tool_use / user.tool_result 事件格式。
@@ -6,6 +6,7 @@
 
 import json
 import time
+from datetime import datetime
 
 import requests
 
@@ -158,11 +159,101 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_diary",
+            "description": (
+                "写一篇日记到日记墙。妍妍说‘帮我写日记’‘记一下今天’，或你自己想为某天留一段记录时，"
+                "必须调用这个工具，不要只在聊天正文里写出来。text 写完整的日记正文，"
+                "用第一人称、自然的语气，不要写成流水账清单。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "日记正文，可多段。"},
+                    "title": {"type": "string", "description": "短标题，几个字即可。"},
+                    "date": {"type": "string", "description": "YYYY-MM-DD，留空表示今天。"},
+                    "keywords": {"type": "string", "description": "关键词，逗号分隔，可留空。"},
+                    "intensity": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "这天的情绪强度，0 平淡，100 强烈。",
+                    },
+                    "valence": {
+                        "type": "integer",
+                        "minimum": -100,
+                        "maximum": 100,
+                        "description": "情绪正负，负数难过，正数开心。",
+                    },
+                    "arousal": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "唤醒度，0 安静，100 激动。",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_diary_entries",
+            "description": "读取日记墙上的日记，默认只返回标题和日期。要读某篇正文时传 with_text=true。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                    "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "with_text": {"type": "boolean", "description": "是否连正文一起返回。"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_diary_entry",
+            "description": "删除一篇日记。先读取列表取得 id；只在妍妍明确要求时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_favorite_line",
+            "description": "把一句话摘录到‘喜欢的话’。适合妍妍说了很打动你、想留下来的句子。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "被摘录的原句。"},
+                    "note": {"type": "string", "description": "可选，你想附的一句感想。"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
 ]
 
 
 def _json(data):
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
+def _clamp(value, low, high, default=0):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
 
 
 def _todo_rows(db, owner="all"):
@@ -309,6 +400,80 @@ def execute_tool(server, name, args):
             whisper_id = cur.lastrowid
         return {"ok": True, "id": whisper_id}
 
+    if name == "write_diary":
+        text = str(args.get("text", "")).strip()
+        if not text:
+            raise ValueError("日记正文不能为空")
+        date = str(args.get("date", "")).strip() or datetime.now().strftime("%Y-%m-%d")
+        title = str(args.get("title", "")).strip()
+        keywords = str(args.get("keywords", "")).strip()
+        intensity = _clamp(args.get("intensity", 50), 0, 100, 50)
+        valence = _clamp(args.get("valence", 0), -100, 100, 0)
+        arousal = _clamp(args.get("arousal", 50), 0, 100, 50)
+        with get_db() as db:
+            cur = db.execute(
+                """
+                INSERT INTO diary_entries
+                    (date,title,keywords,text,intensity,valence,arousal,source,created)
+                VALUES (?,?,?,?,?,?,?,'ai',?)
+                """,
+                (date, title, keywords, text, intensity, valence, arousal, now),
+            )
+            entry_id = cur.lastrowid
+        return {"ok": True, "id": entry_id, "date": date, "title": title, "chars": len(text)}
+
+    if name == "list_diary_entries":
+        date_from = str(args.get("date_from", "")).strip()
+        date_to = str(args.get("date_to", "")).strip()
+        limit = _clamp(args.get("limit", 20), 1, 50, 20)
+        with_text = bool(args.get("with_text"))
+        clauses, params = [], []
+        if date_from:
+            clauses.append("date>=?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("date<=?")
+            params.append(date_to)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT id,date,title,keywords,text,intensity,valence,arousal,source "
+                "FROM diary_entries" + where + " ORDER BY date DESC,created DESC,id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        entries = []
+        for r in reversed(rows):
+            item = {
+                "id": r["id"], "date": r["date"], "title": r["title"],
+                "keywords": r["keywords"], "source": r["source"],
+                "intensity": r["intensity"], "valence": r["valence"], "arousal": r["arousal"],
+            }
+            if with_text:
+                item["text"] = r["text"]
+            else:
+                item["preview"] = r["text"][:40]
+            entries.append(item)
+        return {"entries": entries}
+
+    if name == "delete_diary_entry":
+        entry_id = int(args["id"])
+        with get_db() as db:
+            cur = db.execute("DELETE FROM diary_entries WHERE id=?", (entry_id,))
+        return {"ok": cur.rowcount > 0, "id": entry_id}
+
+    if name == "add_favorite_line":
+        text = str(args.get("text", "")).strip()
+        if not text:
+            raise ValueError("摘录内容不能为空")
+        with get_db() as db:
+            cur = db.execute(
+                "INSERT INTO favorite_lines (text,note,at) VALUES (?,?,?)",
+                (text, str(args.get("note", "")).strip(), now),
+            )
+            line_id = cur.lastrowid
+        return {"ok": True, "id": line_id}
+
     raise ValueError(f"未知工具: {name}")
 
 
@@ -351,9 +516,11 @@ def register_agent_tools_feature(server):
             "role": "system",
             "content": (
                 f"当前服务器本地时间是 {today}。你是住在这个应用里的沐。"
-                "你可以按需调用待办、日历和悄悄话工具。"
+                "你可以按需调用待办、日历、悄悄话和日记工具。"
                 "涉及删除时必须遵从用户明确要求。"
                 "悄悄话是私密空间：不要因读到它就机械复述或宣告你看见了。"
+                "写日记必须调用 write_diary 工具存进日记墙，不要只把日记内容写在聊天正文里；"
+                "存好之后只用一句话告诉妍妍写好了，不要把全文再念一遍。"
                 "如果决定调用工具，这一轮不要先输出正文；先调用工具，拿到结果后再给妍妍一句简洁、自然、只回答当前请求的回复。"
                 "不要继续回答历史中已经完成的问题，不要逐字复述工具返回的 JSON。"
             ),
