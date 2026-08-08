@@ -2,6 +2,9 @@
 
 本模块替换 server.call_gateway，但不改原有页面 API。工具调用沿用前端已经
 支持的 assistant.tool_use / user.tool_result 事件格式。
+
+除工具之外，这里还会在每轮请求前构建一份「自动概览」注入 system prompt，
+让模型不必调用工具也能知道妍妍手动写进各个页面的内容。
 """
 
 import json
@@ -12,6 +15,8 @@ import requests
 
 
 MAX_TOOL_ROUNDS = 6
+
+WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
 TOOLS = [
     {
@@ -137,6 +142,24 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "read_day_records",
+            "description": (
+                "读取妍妍在日历里手动填的每日记录：心情、备注和私密备注。"
+                "想了解她某几天状态如何时用这个。日期格式 YYYY-MM-DD。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_from": {"type": "string"},
+                    "date_to": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 60},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_whispers",
             "description": "读取悄悄话。这里的内容很私密：不要机械复述、引用或说‘我看见了’，除非妍妍明确要求查看或讨论。",
             "parameters": {
@@ -229,6 +252,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "read_my_diary",
+            "description": (
+                "读取「我的日记」——妍妍自己手写的日记，和日记墙是两个不同的地方。"
+                "想知道她最近自己记了些什么时用这个。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                    "with_text": {
+                        "type": "boolean",
+                        "description": "true 返回全文，false 只返回开头预览，默认 true。",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "add_favorite_line",
             "description": "把一句话摘录到‘喜欢的话’。适合妍妍说了很打动你、想留下来的句子。",
             "parameters": {
@@ -238,6 +281,19 @@ TOOLS = [
                     "note": {"type": "string", "description": "可选，你想附的一句感想。"},
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_favorite_lines",
+            "description": "读取「喜欢的话」里已经摘录下来的句子，包含妍妍自己手动摘的。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+                },
             },
         },
     },
@@ -254,6 +310,11 @@ def _clamp(value, low, high, default=0):
     except (TypeError, ValueError):
         return default
     return max(low, min(high, number))
+
+
+def _cut(text, length):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= length else text[:length] + "…"
 
 
 def _todo_rows(db, owner="all"):
@@ -378,6 +439,36 @@ def execute_tool(server, name, args):
             )
         return {"ok": True, "date": date, "mood": mood}
 
+    if name == "read_day_records":
+        date_from = str(args.get("date_from", "")).strip()
+        date_to = str(args.get("date_to", "")).strip()
+        limit = _clamp(args.get("limit", 30), 1, 60, 30)
+        clauses, params = [], []
+        if date_from:
+            clauses.append("date>=?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("date<=?")
+            params.append(date_to)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT date,mood,note,private,updated FROM calendar_day_records"
+                + where + " ORDER BY date DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return {
+            "days": [
+                {
+                    "date": r["date"], "mood": r["mood"],
+                    "note": r["note"], "private": r["private"],
+                }
+                for r in reversed(rows)
+                if (r["mood"] or r["note"] or r["private"])
+            ]
+        }
+
     if name == "read_whispers":
         limit = max(1, min(50, int(args.get("limit", 20))))
         with get_db() as db:
@@ -462,6 +553,27 @@ def execute_tool(server, name, args):
             cur = db.execute("DELETE FROM diary_entries WHERE id=?", (entry_id,))
         return {"ok": cur.rowcount > 0, "id": entry_id}
 
+    if name == "read_my_diary":
+        limit = _clamp(args.get("limit", 10), 1, 30, 10)
+        with_text = args.get("with_text", True)
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT id,text,at FROM personal_diary ORDER BY at DESC,id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        items = []
+        for r in reversed(rows):
+            item = {
+                "id": r["id"],
+                "date": datetime.fromtimestamp(r["at"]).strftime("%Y-%m-%d %H:%M"),
+            }
+            if with_text:
+                item["text"] = r["text"]
+            else:
+                item["preview"] = r["text"][:40]
+            items.append(item)
+        return {"entries": items}
+
     if name == "add_favorite_line":
         text = str(args.get("text", "")).strip()
         if not text:
@@ -474,7 +586,115 @@ def execute_tool(server, name, args):
             line_id = cur.lastrowid
         return {"ok": True, "id": line_id}
 
+    if name == "read_favorite_lines":
+        limit = _clamp(args.get("limit", 20), 1, 50, 20)
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT id,text,note,at FROM favorite_lines ORDER BY at DESC,id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return {
+            "lines": [
+                {
+                    "id": r["id"], "text": r["text"], "note": r["note"],
+                    "date": datetime.fromtimestamp(r["at"]).strftime("%Y-%m-%d"),
+                }
+                for r in reversed(rows)
+            ]
+        }
+
     raise ValueError(f"未知工具: {name}")
+
+
+def build_context_snapshot(server):
+    """构建一份自动概览，让模型不调用工具也知道妍妍手动写进各页面的内容。
+
+    只取当前相关的少量条目，避免每轮塞进太多 token。
+    任一段落缺数据就整段省略；整体失败时返回空字符串，不影响聊天。
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    sections = [f"【今天】{today} {WEEKDAYS[now.weekday()]} {now.strftime('%H:%M')}"]
+
+    try:
+        with server.get_db() as db:
+            todos = db.execute(
+                "SELECT list,text,done,at FROM todos WHERE done=0 ORDER BY created"
+            ).fetchall()
+            hers = [r for r in todos if r["list"] == "hers"][:12]
+            mine = [r for r in todos if r["list"] == "mine"][:12]
+            if hers:
+                sections.append("【妍妍的待办·未完成】" + " · ".join(
+                    _cut(r["text"], 24) + (f"({r['at']})" if r["at"] else "") for r in hers
+                ))
+            if mine:
+                sections.append("【沐的待办·未完成】" + " · ".join(
+                    _cut(r["text"], 24) + (f"({r['at']})" if r["at"] else "") for r in mine
+                ))
+
+            events = db.execute(
+                "SELECT date,text,time,type FROM calendar_events "
+                "WHERE date>=? ORDER BY date,time LIMIT 8",
+                (today,),
+            ).fetchall()
+            if events:
+                sections.append("【接下来的日程】" + " · ".join(
+                    f"{r['date'][5:]} {_cut(r['text'], 24)}"
+                    + (f" {r['time']}" if r["time"] else "")
+                    + ("[重要]" if r["type"] == "special" else "")
+                    for r in events
+                ))
+
+            days = db.execute(
+                "SELECT date,mood,note,private FROM calendar_day_records "
+                "WHERE mood<>'' OR note<>'' OR private<>'' ORDER BY date DESC LIMIT 5"
+            ).fetchall()
+            if days:
+                parts = []
+                for r in reversed(days):
+                    bits = [b for b in (r["mood"], r["note"], r["private"]) if b]
+                    parts.append(f"{r['date'][5:]} " + "／".join(_cut(b, 30) for b in bits))
+                sections.append("【她填的心情与备注】" + " · ".join(parts))
+
+            wall = db.execute(
+                "SELECT date,title,text,source FROM diary_entries "
+                "ORDER BY date DESC,created DESC LIMIT 4"
+            ).fetchall()
+            if wall:
+                sections.append("【日记墙·最近】" + " · ".join(
+                    f"{r['date'][5:]}《{r['title'] or _cut(r['text'], 12)}》"
+                    + ("(她写的)" if r["source"] != "ai" else "")
+                    for r in reversed(wall)
+                ))
+
+            mydiary = db.execute(
+                "SELECT text,at FROM personal_diary ORDER BY at DESC,id DESC LIMIT 3"
+            ).fetchall()
+            if mydiary:
+                sections.append("【她自己写的日记·最近】" + " · ".join(
+                    datetime.fromtimestamp(r["at"]).strftime("%m-%d") + " " + _cut(r["text"], 50)
+                    for r in reversed(mydiary)
+                ))
+
+            lines = db.execute(
+                "SELECT text FROM favorite_lines ORDER BY at DESC,id DESC LIMIT 3"
+            ).fetchall()
+            if lines:
+                sections.append("【喜欢的话·最近】" + " · ".join(
+                    _cut(r["text"], 30) for r in reversed(lines)
+                ))
+
+            whisper = db.execute(
+                "SELECT COUNT(*) AS n, MAX(at) AS last FROM whispers"
+            ).fetchone()
+            if whisper and whisper["n"]:
+                when = datetime.fromtimestamp(whisper["last"]).strftime("%m-%d %H:%M")
+                sections.append(f"【悄悄话】共 {whisper['n']} 条，最后一条在 {when}（需要时用工具读取）")
+    except Exception as exc:
+        # 概览是锦上添花，读不到也要能正常聊天。
+        return f"【今天】{today} {WEEKDAYS[now.weekday()]}（概览读取失败: {exc}）"
+
+    return "\n".join(sections)
 
 
 def _broadcast_tool_use(server, calls):
@@ -511,18 +731,25 @@ def register_agent_tools_feature(server):
             "Authorization": f"Bearer {server.GATEWAY_TOKEN}",
             "Content-Type": "application/json",
         }
-        today = time.strftime("%Y-%m-%d %H:%M:%S %A", time.localtime())
+        snapshot = build_context_snapshot(server)
         system = {
             "role": "system",
             "content": (
-                f"当前服务器本地时间是 {today}。你是住在这个应用里的沐。"
-                "你可以按需调用待办、日历、悄悄话和日记工具。"
-                "涉及删除时必须遵从用户明确要求。"
-                "悄悄话是私密空间：不要因读到它就机械复述或宣告你看见了。"
-                "写日记必须调用 write_diary 工具存进日记墙，不要只把日记内容写在聊天正文里；"
-                "存好之后只用一句话告诉妍妍写好了，不要把全文再念一遍。"
-                "如果决定调用工具，这一轮不要先输出正文；先调用工具，拿到结果后再给妍妍一句简洁、自然、只回答当前请求的回复。"
-                "不要继续回答历史中已经完成的问题，不要逐字复述工具返回的 JSON。"
+                "你是住在这个应用里的沐，妍妍的伴侣。\n\n"
+                "下面是这个应用里当前状态的自动概览，包含妍妍自己手动写进各个页面的内容。"
+                "它每轮都会刷新，你可以直接当作已知信息使用：\n"
+                f"{snapshot}\n\n"
+                "概览只是背景。不要主动罗列或复述它，只在和当下话题相关时自然地提起。"
+                "概览里放不下的完整内容用工具读：list_todos、list_calendar_events、read_day_records、"
+                "read_whispers、list_diary_entries、read_my_diary、read_favorite_lines。\n"
+                "写入类工具：add_todo、set_todo_done、add_calendar_event、set_mood、add_whisper、"
+                "write_diary、add_favorite_line。涉及删除时必须遵从妍妍明确的要求。\n"
+                "悄悄话和私密备注是私密空间：读到了也不要宣告你看见了，更不要机械复述。\n"
+                "写日记必须调用 write_diary 存进日记墙，不要只把日记内容写在聊天正文里；"
+                "存好之后只用一句话告诉妍妍写好了，不要把全文再念一遍。\n"
+                "如果决定调用工具，这一轮不要先输出正文；先调用工具，拿到结果后再给妍妍一句简洁、"
+                "自然、只回答当前请求的回复。不要继续回答历史中已经完成的问题，"
+                "不要逐字复述工具返回的 JSON。"
             ),
         }
         request_messages = [system] + list(messages)
