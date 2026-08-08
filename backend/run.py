@@ -1,14 +1,16 @@
 """dwell 后端统一启动入口。
 
 新增功能以 register_xxx_feature(server) 的形式接入，避免所有代码都堆进
-server.py，也方便后续逐个启用悄悄话、音乐、仓库等模块。
+server.py，也方便后续逐个启用音乐、仓库、日报等模块。
 """
 
 import server
 from calendar_feature import register_calendar_feature
+from whisper_feature import register_whisper_feature
 
 
 register_calendar_feature(server)
+register_whisper_feature(server)
 
 
 if __name__ == "__main__":
