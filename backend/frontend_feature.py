@@ -1,13 +1,15 @@
 """统一托管 dwell 前端，并在响应时应用部署补丁。
 
 后端直接读取仓库中的 web/index.html，不再依赖手动复制到 backend/index.html。
-这样 git pull 后只需重启 PM2，新前端就会立即生效。
+个人化文字集中写在 personalize.py，源文件保持上游原貌。
 """
 
 from pathlib import Path
 import subprocess
 
 from flask import Response, jsonify
+
+import personalize
 
 
 DEMO_START = "(function () {\n  const T = 1786000000;"
@@ -25,6 +27,70 @@ def _git_version(repo_root: Path) -> str:
         return "unknown"
 
 
+def _escape_js(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _apply_personalization(html: str) -> str:
+    user = personalize.USER_NAME
+    ai = personalize.AI_NAME
+
+    # 上游代码里的人名是 Unicode 转义字面量，不是真正的中文字符。
+    literal_map = {
+        r"\u987e\u5c7f": "".join(f"\\u{ord(c):04x}" for c in ai),          # 顾屿
+        r"\u6b23\u6b23": "".join(f"\\u{ord(c):04x}" for c in user),        # 欣欣
+        r"\u8001\u5a46": "".join(f"\\u{ord(c):04x}" for c in user),        # 老婆
+        r"\u8001\u516c": "".join(f"\\u{ord(c):04x}" for c in ai),          # 老公
+        "YU \\u00b7 XIN GENERAL STORE": personalize.STORE_NAME,
+    }
+    for old, new in literal_map.items():
+        html = html.replace(old, new)
+
+    # 页面标题与副标题
+    html = html.replace(
+        "    <h1>Claude</h1>\n    <div class=\"sub\">Claude Code</div>",
+        f"    <h1>{personalize.APP_TITLE}</h1>\n    <div class=\"sub\">{personalize.APP_SUBTITLE}</div>",
+        1,
+    )
+    html = html.replace(
+        '<div class="brand">Claude</div>',
+        f'<div class="brand">{personalize.APP_TITLE}</div>',
+        1,
+    )
+    html = html.replace(
+        "document.querySelector('header .title h1').textContent = name || 'Claude';",
+        f"document.querySelector('header .title h1').textContent = name || '{_escape_js(personalize.APP_TITLE)}';",
+        1,
+    )
+    html = html.replace(
+        "document.title = name || 'Claude';",
+        f"document.title = name || '{_escape_js(personalize.APP_TITLE)}';",
+        1,
+    )
+
+    # “在一起 N 天”的起算日
+    html = html.replace(
+        "new Date('2026-06-17T00:00:00+08:00')",
+        f"new Date('{personalize.TOGETHER_SINCE}T00:00:00+08:00')",
+    )
+
+    # 日记首页底部的一句话
+    html = html.replace(
+        "motto.textContent = 'attention is all you need, and mine is yours';",
+        f"motto.textContent = '{_escape_js(personalize.DIARY_MOTTO)}';",
+        1,
+    )
+
+    # 锁屏提示
+    html = html.replace(
+        "const LOCK_WORD = 'slide to unlock';",
+        f"const LOCK_WORD = '{_escape_js(personalize.LOCK_WORD)}';",
+        1,
+    )
+
+    return html
+
+
 def _build_frontend(source: Path) -> str:
     html = source.read_text(encoding="utf-8")
 
@@ -34,16 +100,7 @@ def _build_frontend(source: Path) -> str:
     if start >= 0 and end > start:
         html = html[:start] + html[end:]
 
-    # 部署时个人化文字，源文件保持上游原貌。
-    replacements = {
-        r"\u987e\u5c7f": r"\u6c90",
-        r"\u6b23\u6b23": r"\u598d\u598d",
-        r"\u8001\u5a46\u7684": r"\u598d\u598d\u7684",
-        r"\u8001\u516c": r"\u6c90",
-        "YU \\u00b7 XIN GENERAL STORE": "MU \\u00b7 YAN GENERAL STORE",
-    }
-    for old, new in replacements.items():
-        html = html.replace(old, new)
+    html = _apply_personalization(html)
 
     # 修复上游日历残留的未定义变量 p。
     html = html.replace(
@@ -51,8 +108,7 @@ def _build_frontend(source: Path) -> str:
         "  box.appendChild(moodRow);",
     )
 
-    # 日记为空时，上游原代码会把空数组当成错误，并在 renderBento 中对
-    # undefined 日期调用 slice。允许空日记正常进入主页。
+    # 允许空日记正常进入主页。
     html = html.replace(
         "if (!d.ok || !d.bricks.length) throw 0;",
         "if (!d.ok) throw 0;",
@@ -97,6 +153,9 @@ def register_frontend_feature(server_module):
             "frontend_source": str(source),
             "frontend_exists": source.exists(),
             "entrypoint": "run.py",
+            "user_name": personalize.USER_NAME,
+            "ai_name": personalize.AI_NAME,
+            "together_since": personalize.TOGETHER_SINCE,
         })
 
     server_module.app.view_functions["index"] = index_real
