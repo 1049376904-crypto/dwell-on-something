@@ -5,7 +5,9 @@
 """
 
 import server
+from compat import register_compat
 from storage_feature import register_storage_feature
+from gateway_config import register_gateway_config
 from frontend_feature import register_frontend_feature
 from calendar_feature import register_calendar_feature
 from whisper_feature import register_whisper_feature
@@ -14,8 +16,11 @@ from event_stream_feature import register_event_stream_feature
 from agent_tools_feature import register_agent_tools_feature
 
 
+register_compat(server)
 # 存储必须最先固定，否则其余模块会在错误的数据库里建表。
 db_path = register_storage_feature(server)
+# 网关配置要在聊天代理之前生效。
+register_gateway_config(server)
 
 register_frontend_feature(server)
 register_calendar_feature(server)
@@ -36,4 +41,5 @@ if __name__ == "__main__":
     print("  modules : 聊天 / 待办 / 日历 / 悄悄话 / 日记")
     print("  tools   : 待办 / 日历 / 悄悄话")
     print("  events  : 可重放游标队列")
+    print("  config  : 设置 → 接入 API（地址/令牌/模型名）")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
