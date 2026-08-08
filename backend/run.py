@@ -8,11 +8,13 @@ import server
 from frontend_feature import register_frontend_feature
 from calendar_feature import register_calendar_feature
 from whisper_feature import register_whisper_feature
+from agent_tools_feature import register_agent_tools_feature
 
 
 register_frontend_feature(server)
 register_calendar_feature(server)
 register_whisper_feature(server)
+register_agent_tools_feature(server)
 
 
 if __name__ == "__main__":
@@ -21,4 +23,5 @@ if __name__ == "__main__":
     print(f"  model   : {server.current_model()}")
     print(f"  port    : {server.PORT}")
     print("  frontend: ../web/index.html（动态读取，无需复制）")
+    print("  tools   : 待办 / 日历 / 悄悄话")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
