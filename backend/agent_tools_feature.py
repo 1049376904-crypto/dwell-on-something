@@ -5,7 +5,6 @@
 """
 
 import json
-import threading
 import time
 
 import requests
@@ -355,7 +354,8 @@ def register_agent_tools_feature(server):
                 "你可以按需调用待办、日历和悄悄话工具。"
                 "涉及删除时必须遵从用户明确要求。"
                 "悄悄话是私密空间：不要因读到它就机械复述或宣告你看见了。"
-                "工具成功后自然地继续对话，不必逐字复述工具返回的 JSON。"
+                "如果决定调用工具，这一轮不要先输出正文；先调用工具，拿到结果后再给妍妍一句简洁、自然、只回答当前请求的回复。"
+                "不要继续回答历史中已经完成的问题，不要逐字复述工具返回的 JSON。"
             ),
         }
         request_messages = [system] + list(messages)
@@ -364,7 +364,7 @@ def register_agent_tools_feature(server):
             server.state["busy"] = True
             server.state["stop_flag"] = False
 
-        final_texts = []
+        final_answer = ""
         failed = False
 
         try:
@@ -453,16 +453,18 @@ def register_agent_tools_feature(server):
                         "args": args,
                     })
 
+                # 正文和思考已经通过 delta 流式显示；这里的 assistant 事件用于
+                # 结束对应 UI 缓冲并给工具调用建立清晰边界。
                 assistant_parts = []
                 if thinking:
                     assistant_parts.append({"type": "thinking", "thinking": thinking})
                 if text:
                     assistant_parts.append({"type": "text", "text": text})
-                    final_texts.append(text)
                 if assistant_parts:
                     server.broadcast({"type": "assistant", "message": {"content": assistant_parts}})
 
                 if not calls:
+                    final_answer = text.strip()
                     break
 
                 _broadcast_tool_use(server, calls)
@@ -502,9 +504,10 @@ def register_agent_tools_feature(server):
             server.broadcast({"type": "stderr", "text": f"gateway/工具调用错误: {exc}"})
             server.broadcast({"type": "result", "is_error": True, "result": str(exc)})
         finally:
-            combined = "\n\n".join(t for t in final_texts if t.strip()).strip()
-            if combined:
-                server.save_message("gu", combined)
+            # 只保存工具执行完成后的最后一轮正式回复，不再把工具前的临时正文
+            # 和最终答案拼在一起，避免刷新后看见一串混乱回复。
+            if final_answer:
+                server.save_message("gu", final_answer)
             if not failed:
                 server.broadcast({"type": "result", "is_error": False})
             with server.state_lock:
