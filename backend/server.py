@@ -23,20 +23,18 @@ import requests
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-# ── 配置 ────────────────────────────────────────────────────────
+# ── 配置
 GATEWAY_URL   = os.getenv("GATEWAY_URL",   "http://127.0.0.1:18003")
 GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "sk-ebb1179c1f074daeb406c80efe203aca")
 DEFAULT_MODEL = os.getenv("MODEL",         "claude-sonnet-4-5")
 PORT          = int(os.getenv("PORT",       "8888"))
 DB_PATH       = Path(os.getenv("DB_PATH",   "dwell.db"))
-# 前端 index.html 放在这个目录（和 server.py 同一层）
 STATIC_DIR    = Path(__file__).parent
 
-# ── Flask ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
 
-# ── 数据库 ─────────────────────────────────────────────────────────────────
+# ── 数据库
 def get_db():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
@@ -55,15 +53,22 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS todos (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                list    TEXT    NOT NULL DEFAULT 'hers',
+                text    TEXT    NOT NULL,
+                done    INTEGER NOT NULL DEFAULT 0,
+                fixed   INTEGER NOT NULL DEFAULT 0,
+                at      TEXT    NOT NULL DEFAULT '',
+                by      TEXT    NOT NULL DEFAULT 'her',
+                created INTEGER NOT NULL
+            );
         """)
-        db.execute(
-            "INSERT OR IGNORE INTO settings VALUES ('model', ?)",
-            (DEFAULT_MODEL,)
-        )
+        db.execute("INSERT OR IGNORE INTO settings VALUES ('model', ?)", (DEFAULT_MODEL,))
 
 init_db()
 
-# ── 全局状态 ─────────────────────────────────────────────────────────────────
+# ── 全局状态
 state = {"busy": False, "stop_flag": False, "since": 0}
 state_lock = threading.Lock()
 subscribers: list = []
@@ -78,12 +83,9 @@ def broadcast(event: dict):
             except Exception:
                 dead.append(q)
         for q in dead:
-            try:
-                subscribers.remove(q)
-            except ValueError:
-                pass
+            try: subscribers.remove(q)
+            except ValueError: pass
 
-# ── 工具 ────────────────────────────────────────────────────────────────────
 def current_model():
     with get_db() as db:
         row = db.execute("SELECT value FROM settings WHERE key='model'").fetchone()
@@ -91,10 +93,8 @@ def current_model():
 
 def save_message(kind, text):
     with get_db() as db:
-        cur = db.execute(
-            "INSERT INTO messages (kind, text, at) VALUES (?, ?, ?)",
-            (kind, text, int(time.time()))
-        )
+        cur = db.execute("INSERT INTO messages (kind,text,at) VALUES (?,?,?)",
+                         (kind, text, int(time.time())))
         return cur.lastrowid
 
 def load_messages(limit=400, before=None):
@@ -102,101 +102,68 @@ def load_messages(limit=400, before=None):
         if before:
             rows = db.execute(
                 "SELECT seq,kind,text,at FROM messages WHERE seq<? ORDER BY seq DESC LIMIT ?",
-                (before, limit)
-            ).fetchall()
-            rows = list(reversed(rows))
+                (before, limit)).fetchall()
         else:
             rows = db.execute(
                 "SELECT seq,kind,text,at FROM messages ORDER BY seq DESC LIMIT ?",
-                (limit,)
-            ).fetchall()
-            rows = list(reversed(rows))
+                (limit,)).fetchall()
+        rows = list(reversed(rows))
         return [{"seq": r["seq"], "kind": r["kind"], "text": r["text"], "at": r["at"]} for r in rows]
 
-# ── 调 gateway 流式生成 ─────────────────────────────────────────────────
+# ── 调 gateway
 def call_gateway(messages, model):
-    headers = {
-        "Authorization": f"Bearer {GATEWAY_TOKEN}",
-        "Content-Type":  "application/json",
-    }
+    headers = {"Authorization": f"Bearer {GATEWAY_TOKEN}", "Content-Type": "application/json"}
     payload = {"model": model, "stream": True, "messages": messages}
-
     with state_lock:
-        state["busy"]      = True
+        state["busy"] = True
         state["stop_flag"] = False
-
-    full_text  = ""
+    full_text = ""
     think_text = ""
-
     try:
-        resp = requests.post(
-            f"{GATEWAY_URL}/v1/chat/completions",
-            headers=headers, json=payload, stream=True, timeout=120
-        )
+        resp = requests.post(f"{GATEWAY_URL}/v1/chat/completions",
+                             headers=headers, json=payload, stream=True, timeout=120)
         resp.raise_for_status()
-
         for raw in resp.iter_lines():
             with state_lock:
-                if state["stop_flag"]:
-                    break
-            if not raw:
-                continue
+                if state["stop_flag"]: break
+            if not raw: continue
             line = raw.decode() if isinstance(raw, bytes) else raw
-            if not line.startswith("data:"):
-                continue
+            if not line.startswith("data:"): continue
             data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-            except Exception:
-                continue
-
+            if data == "[DONE]": break
+            try: chunk = json.loads(data)
+            except Exception: continue
             delta = chunk.get("choices", [{}])[0].get("delta", {})
-
             thinking = delta.get("thinking", "")
             if thinking:
                 think_text += thinking
                 broadcast({"type": "stream_event",
                            "event": {"delta": {"type": "thinking_delta", "thinking": thinking}}})
                 continue
-
             content = delta.get("content", "")
             if content:
                 full_text += content
                 broadcast({"type": "stream_event",
                            "event": {"delta": {"type": "text_delta", "text": content}}})
-
     except Exception as e:
         broadcast({"type": "stderr", "text": f"gateway 错误: {e}"})
         broadcast({"type": "result", "is_error": True, "result": str(e)})
-        with state_lock:
-            state["busy"] = False
+        with state_lock: state["busy"] = False
         return
-
     content_parts = []
-    if think_text:
-        content_parts.append({"type": "thinking", "thinking": think_text})
-    if full_text:
-        content_parts.append({"type": "text", "text": full_text})
+    if think_text: content_parts.append({"type": "thinking", "thinking": think_text})
+    if full_text:  content_parts.append({"type": "text", "text": full_text})
     broadcast({"type": "assistant", "message": {"content": content_parts}})
-
-    if full_text:
-        save_message("gu", full_text)
-
+    if full_text: save_message("gu", full_text)
     broadcast({"type": "result", "is_error": False})
-    with state_lock:
-        state["busy"] = False
+    with state_lock: state["busy"] = False
 
-# ── 前端静态文件 ────────────────────────────────────────────────────────────────
-
+# ── 前端
 @app.get("/")
 def index():
-    """index.html 和 server.py 放在同一目录。"""
     return send_from_directory(STATIC_DIR, "index.html")
 
-# ── 聊天接口 ─────────────────────────────────────────────────────────────────
-
+# ── 聊天
 @app.get("/api/messages")
 @app.get("/api/said")
 def api_messages():
@@ -206,43 +173,31 @@ def api_messages():
     upto   = msgs[-1]["seq"] if msgs else 0
     return jsonify({"msgs": msgs, "upto": upto, "more": False})
 
-
 @app.post("/api/send")
 def api_send():
     data = request.get_json(force=True)
     text = (data.get("text") or "").strip()
-    if not text:
-        return jsonify({"ok": False}), 400
+    if not text: return jsonify({"ok": False}), 400
     with state_lock:
-        if state["busy"]:
-            return jsonify({"ok": False, "error": "busy"}), 429
-
+        if state["busy"]: return jsonify({"ok": False, "error": "busy"}), 429
     save_message("her", text)
     broadcast({"type": "echo", "text": text})
-
     msgs    = load_messages(40)
-    history = [{"role": "user" if m["kind"] == "her" else "assistant",
-                "content": m["text"]} for m in msgs]
+    history = [{"role": "user" if m["kind"] == "her" else "assistant", "content": m["text"]} for m in msgs]
     model   = current_model()
-
     threading.Thread(target=call_gateway, args=(history, model), daemon=True).start()
     return jsonify({"ok": True})
 
-
 @app.post("/api/stop")
 def api_stop():
-    with state_lock:
-        state["stop_flag"] = True
+    with state_lock: state["stop_flag"] = True
     broadcast({"type": "system", "subtype": "stopped"})
     return jsonify({"ok": True})
-
 
 @app.get("/api/poll")
 def api_poll():
     q = queue.Queue(maxsize=64)
-    with subs_lock:
-        subscribers.append(q)
-
+    with subs_lock: subscribers.append(q)
     events   = []
     deadline = time.time() + 25
     try:
@@ -253,26 +208,19 @@ def api_poll():
                 while not q.empty() and len(events) < 32:
                     events.append(q.get_nowait())
                 break
-            except queue.Empty:
-                continue
+            except queue.Empty: continue
     finally:
         with subs_lock:
-            try:
-                subscribers.remove(q)
-            except ValueError:
-                pass
-
+            try: subscribers.remove(q)
+            except ValueError: pass
     with state_lock:
         cur = state["since"]
         state["since"] = cur + len(events)
-
     return jsonify({"events": events, "next": cur + len(events)})
-
 
 @app.get("/api/model")
 def api_get_model():
     return jsonify({"model": current_model(), "effort": "high"})
-
 
 @app.post("/api/model")
 def api_set_model():
@@ -284,13 +232,10 @@ def api_set_model():
         broadcast({"type": "system", "subtype": "model", "model": model})
     return jsonify({"ok": True, "model": current_model()})
 
-
 @app.get("/api/status")
 def api_status():
-    with state_lock:
-        busy = state["busy"]
+    with state_lock: busy = state["busy"]
     return jsonify({"alive": True, "busy": busy, "since": int(time.time())})
-
 
 @app.get("/api/context")
 def api_context():
@@ -300,68 +245,102 @@ def api_context():
     pct    = min(100, round(used / window * 100))
     return jsonify({"ok": True, "used": used, "window": window, "pct": pct, "model": current_model()})
 
-
 @app.get("/api/chats")
 def api_chats():
     return jsonify({"items": [{"id": "main", "name": "Claude",
                                "current": True, "last": int(time.time()), "preview": ""}]})
 
+# ── 待办
+def todos_to_dict(rows):
+    return [{"id": r["id"], "text": r["text"], "done": bool(r["done"]),
+             "fixed": bool(r["fixed"]), "at": r["at"], "by": r["by"],
+             "created": r["created"]} for r in rows]
 
-# 其余 stub
-@app.post("/api/newchat")   
+@app.get("/api/todos")
+def api_todos():
+    with get_db() as db:
+        mine  = db.execute("SELECT * FROM todos WHERE list='mine'  ORDER BY created").fetchall()
+        hers  = db.execute("SELECT * FROM todos WHERE list='hers'  ORDER BY created").fetchall()
+    return jsonify({"ok": True, "mine": todos_to_dict(mine), "hers": todos_to_dict(hers)})
+
+@app.post("/api/todos")
+def api_todos_post():
+    data   = request.get_json(force=True)
+    action = data.get("action", "")
+    with get_db() as db:
+        if action == "add":
+            lst   = data.get("list", "hers")
+            text  = (data.get("text") or "").strip()
+            if not text: return jsonify({"ok": False}), 400
+            db.execute(
+                "INSERT INTO todos (list,text,done,fixed,at,by,created) VALUES (?,?,0,?,?,?,?)",
+                (lst, text, int(data.get("fixed", 0)), data.get("at", ""),
+                 data.get("by", "her"), int(time.time()))
+            )
+        elif action == "toggle":
+            row = db.execute("SELECT done FROM todos WHERE id=?", (data["id"],)).fetchone()
+            if row:
+                db.execute("UPDATE todos SET done=? WHERE id=?",
+                           (0 if row["done"] else 1, data["id"]))
+        elif action == "del":
+            db.execute("DELETE FROM todos WHERE id=?", (data["id"],))
+        # 每日重置：把 fixed=1 的项目 done 清零
+        elif action == "reset_daily":
+            db.execute("UPDATE todos SET done=0 WHERE fixed=1")
+        mine = db.execute("SELECT * FROM todos WHERE list='mine' ORDER BY created").fetchall()
+        hers = db.execute("SELECT * FROM todos WHERE list='hers' ORDER BY created").fetchall()
+    return jsonify({"ok": True, "mine": todos_to_dict(mine), "hers": todos_to_dict(hers)})
+
+# ── 其余 stub
+@app.post("/api/newchat")    
 def api_newchat():      return jsonify({"ok": True})
-@app.post("/api/chats")     
+@app.post("/api/chats")      
 def api_chats_post():   return jsonify({"ok": True})
-@app.get("/api/usage")      
+@app.get("/api/usage")       
 def api_usage():        return jsonify({"ok": False})
-@app.get("/api/cal")        
+@app.get("/api/cal")         
 def api_cal():          return jsonify({"ok": False})
-@app.post("/api/cal")       
+@app.post("/api/cal")        
 def api_cal_post():     return jsonify({"ok": True})
-@app.get("/api/wall")       
+@app.get("/api/wall")        
 def api_wall():         return jsonify({"ok": False})
-@app.get("/api/todos")      
-def api_todos():        return jsonify({"ok": True, "mine": [], "hers": []})
-@app.post("/api/todos")     
-def api_todos_post():   return jsonify({"ok": True, "mine": [], "hers": []})
-@app.get("/api/news")       
+@app.get("/api/news")        
 def api_news():         return jsonify({"ok": False})
-@app.get("/api/nook/books") 
+@app.get("/api/nook/books")  
 def api_nook():         return jsonify([])
-@app.get("/api/health")     
+@app.get("/api/health")      
 def api_health():       return jsonify({"ok": False})
-@app.get("/api/repo/log")   
+@app.get("/api/repo/log")    
 def api_repo_log():     return jsonify({"ok": False, "items": []})
-@app.get("/api/whisper")    
+@app.get("/api/whisper")     
 def api_whisper():      return jsonify({"items": []})
-@app.post("/api/whisper")   
-def api_whisper_post():  return jsonify({"ok": True})
-@app.get("/api/notes")      
+@app.post("/api/whisper")    
+def api_whisper_post(): return jsonify({"ok": True})
+@app.get("/api/notes")       
 def api_notes():        return jsonify({"gu": [], "her": []})
-@app.post("/api/notes")     
+@app.post("/api/notes")      
 def api_notes_post():   return jsonify({"gu": [], "her": []})
-@app.get("/api/dreams")     
+@app.get("/api/dreams")      
 def api_dreams():       return jsonify({"items": []})
-@app.get("/api/night")      
+@app.get("/api/night")       
 def api_night():        return jsonify({"days": []})
-@app.get("/api/music")      
+@app.get("/api/music")       
 def api_music():        return jsonify({"ok": False})
-@app.get("/api/gong")       
+@app.get("/api/gong")        
 def api_gong():         return jsonify({"msgs": []})
-@app.post("/api/gong")      
+@app.post("/api/gong")       
 def api_gong_post():    return jsonify({"reply": ""})
-@app.get("/api/find")       
+@app.get("/api/find")        
 def api_find():         return jsonify({"ok": True, "hits": []})
-@app.get("/api/herdiary")   
+@app.get("/api/herdiary")    
 def api_herdiary():     return jsonify({"items": []})
-@app.post("/api/herdiary")  
-def api_herdiary_post():  return jsonify({"ok": True})
-@app.get("/api/favlines")   
+@app.post("/api/herdiary")   
+def api_herdiary_post(): return jsonify({"ok": True})
+@app.get("/api/favlines")    
 def api_favlines():     return jsonify({"ok": True, "text": ""})
-@app.get("/api/authmode")   
+@app.get("/api/authmode")    
 def api_authmode():     return jsonify({"mode": "subscription"})
 
-# ── 启动 ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"dwell-backend 启动")
     print(f"  gateway : {GATEWAY_URL}")
