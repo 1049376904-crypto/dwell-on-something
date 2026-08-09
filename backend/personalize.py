@@ -13,9 +13,19 @@ import os
 USER_NAME = os.getenv("DWELL_USER_NAME", "妍妍")
 AI_NAME = os.getenv("DWELL_AI_NAME", "沐")
 
-# 首页标题与副标题
+# 首页标题与副标题（应用内的表头，不影响系统层面的名字）
 APP_TITLE = os.getenv("DWELL_APP_TITLE", AI_NAME)
 APP_SUBTITLE = os.getenv("DWELL_APP_SUBTITLE", f"{USER_NAME} · {AI_NAME}")
+
+# 主屏图标下面显示的名字，来自 <meta name="apple-mobile-web-app-title">。
+# 刻意跟 APP_TITLE 分开：应用内表头仍是「沐」，桌面上叫 Luminae。
+HOME_SCREEN_NAME = os.getenv("DWELL_HOME_SCREEN_NAME", "Luminae")
+
+# PWA 名称，来自 manifest 的 name。iOS 拿它当推送通知的标题，
+# 所以这个值决定锁屏上那一行显示什么。
+# 注意它必须和 HOME_SCREEN_NAME 不同，否则通知会出现
+# 「X / from X / 正文」这种重复两行的观感。
+PWA_NAME = os.getenv("DWELL_PWA_NAME", "予妍")
 
 # “在一起 N 天”的起算日，格式 YYYY-MM-DD
 TOGETHER_SINCE = os.getenv("DWELL_TOGETHER_SINCE", "2026-07-13")
