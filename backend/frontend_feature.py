@@ -111,8 +111,20 @@ def _build_frontend(source: Path) -> str:
     # 上游 renderSaid 只认 kind='me'，而后端（和上游自己的演示数据）用的是
     # kind='her'，导致刷新后妍妍的消息全部不渲染。这里让它同时认两种。
     html = html.replace(
+        "if (m.kind === 'me' || m.kind === 'her') {",
+        "if (m.kind === 'me') {",
+    )
+    html = html.replace(
         "if (m.kind === 'me') {",
         "if (m.kind === 'me' || m.kind === 'her') {",
+    )
+
+    # 上游重放历史工具卡片时把结果写死成空字符串（原意是「别让它转圈」），
+    # 于是刷新后返回值和错误状态全部消失。后端已把结果并进同一条 tool 记录，
+    # 这里改成读 m.result / m.is_error。
+    html = html.replace(
+        "markToolDone(tid, false, '');",
+        "markToolDone(tid, !!m.is_error, m.result || '');",
     )
 
     # 允许空日记正常进入主页。
