@@ -10,10 +10,18 @@
 * 推送内容只放摘要，最多 80 字。通知会出现在锁屏上，
   别人瞥一眼就看见全文不合适。
 * 订阅端点唯一，重复订阅走 UPSERT，不会堆出一堆重复记录。
-* 自带一个独立的开关面板（/push）。妍妍只有手机，
-  iOS 上没有控制台，订阅必须能靠点按完成。
-  面板把 CLIENT_SCRIPT 内联进自己的 HTML，不依赖 frontend_feature 的注入：
-  那个注入只作用于 index.html，面板是另一个页面。
+* 同时支持两条订阅入口：上游设置页里的「手机通知」开关，
+  以及本模块自带的面板 /push。两者写进同一张表。
+
+上游那条路要求接口长成它期待的样子（见 web/index.html 与
+05-推送 那篇文档）：
+    GET  api/pushkey  → {key: "<base64url 公钥>"}
+    POST api/subscribe ← 订阅 JSON
+它拿到 key 后直接 atob(key.replace(/-/g,'+').replace(/_/g,'/'))，
+中间不补 padding。Safari 的 atob 对长度不是 4 的倍数的输入会抛
+InvalidCharacterError: The string did not match the expected pattern.
+未压缩 P-256 公钥是 65 字节，base64url 去掉 padding 正好是 87 字符，
+87 % 4 == 3，必然触发这个错误。所以这里返回带 padding 的公钥。
 
 两道前提，顺序不能颠倒：
 1. HTTPS。非安全上下文下浏览器压根不暴露 PushManager，
@@ -43,6 +51,17 @@ DEAD_STATUS = {404, 410}
 def _b64url_nopad(raw: bytes) -> str:
     import base64
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _pad_b64(text: str) -> str:
+    """补回 base64 padding。
+
+    上游前端的 atob 不补 padding，Safari 会直接抛
+    「The string did not match the expected pattern.」
+    """
+    if not text:
+        return ""
+    return text + "=" * ((4 - len(text) % 4) % 4)
 
 
 def _generate_vapid_keys():
@@ -190,7 +209,7 @@ CLIENT_SCRIPT = """
 
 # 独立面板。刻意不塞进上游那个设置页：那边结构复杂、
 # 字符串补丁很容易打歪，而这个页面只需要能点。
-# {client_script} 由 api_push_panel 填入，面板不依赖外部注入。
+# __CLIENT_SCRIPT__ 由 api_push_panel 填入，面板不依赖外部注入。
 PANEL_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -421,6 +440,9 @@ def register_push_feature(server_module):
         # cryptography 缺失等极端情况：不要让整个后端起不来。
         print(f"[dwell] VAPID 密钥生成失败，推送不可用: {exc}")
 
+    def public_key_padded():
+        return _pad_b64(read(KEY_VAPID_PUBLIC))
+
     def subscriptions():
         with get_db() as db:
             return db.execute(
@@ -516,10 +538,21 @@ def register_push_feature(server_module):
         return response
 
     def api_push_key():
-        public_b64 = read(KEY_VAPID_PUBLIC)
+        public_b64 = public_key_padded()
         if not public_b64:
             return jsonify({"ok": False, "error": "VAPID 公钥缺失"}), 500
         return jsonify({"ok": True, "public_key": public_b64})
+
+    def api_pushkey_upstream():
+        """上游设置页里「手机通知」开关用的接口。
+
+        它读 d.key 并直接 atob，不补 padding，所以这里必须返回带 padding 的值。
+        配套文档里读的是 key.pub，两种字段都给上。
+        """
+        public_b64 = public_key_padded()
+        if not public_b64:
+            return jsonify({"ok": False, "error": "VAPID 公钥缺失"}), 500
+        return jsonify({"ok": True, "key": public_b64, "pub": public_b64})
 
     def api_push_subscribe():
         data = request.get_json(force=True, silent=True) or {}
@@ -628,6 +661,9 @@ def register_push_feature(server_module):
         ("/api/push/unsubscribe", "api_push_unsubscribe", api_push_unsubscribe, ["POST"]),
         # GET 也接受：手机浏览器直接打开就能测。
         ("/api/push/test", "api_push_test", api_push_test, ["GET", "POST"]),
+        # 上游原生开关用的路径，与上面几条共用同一张订阅表。
+        ("/api/pushkey", "api_pushkey", api_pushkey_upstream, ["GET"]),
+        ("/api/subscribe", "api_subscribe", api_push_subscribe, ["POST"]),
     ]
     for rule, endpoint, view, methods in routes:
         server_module.app.add_url_rule(rule, endpoint=endpoint, view_func=view, methods=methods)
