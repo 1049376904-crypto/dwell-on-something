@@ -71,6 +71,32 @@ EXTRA_ICONS = (
     "a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48\"/>'),\n"
 )
 
+# 上传按钮的样式。上游 .ic 没有全局宽高（只在 .toolline .ic 之类的场景里
+# 单独写过），动态插进去的 SVG 会按父容器铺满——之前那个回形针占了半屏。
+# 这里给按钮和它内部的 svg 都写死尺寸，不依赖上游任何 class。
+UPLOAD_STYLE = """
+<style>
+  #dwellPickBtn {
+    width: 34px; height: 34px; padding: 0; margin: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    flex: 0 0 auto; border: 0; background: transparent;
+    color: var(--dim); cursor: pointer; border-radius: 50%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #dwellPickBtn:active { background: rgba(0, 0, 0, .06); }
+  #dwellPickBtn .ic {
+    width: 19px; height: 19px; display: block;
+    flex: 0 0 auto; line-height: 0;
+  }
+  #dwellPickBtn .ic svg { width: 19px; height: 19px; display: block; }
+  #dwellUploadHint {
+    color: var(--dim); font-size: 12.5px; align-self: center;
+    flex: 0 1 auto; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+</style>
+"""
+
 # 侧边栏锚点：上游的「日记」按钮。
 NAV_WALL_BUTTON = (
     '<button class="item" id="navWall">'
@@ -170,7 +196,7 @@ UPLOAD_SCRIPT = """
     if (!images.length) return;
 
     const mark = document.getElementById('dwellUploadHint');
-    if (mark) mark.textContent = '正在上传 ' + images.length + ' 张…';
+    if (mark) mark.textContent = '上传中…';
 
     for (const file of images) {
       try {
@@ -179,7 +205,7 @@ UPLOAD_SCRIPT = """
         box.value = (box.value ? box.value.replace(/\\s*$/, '') + '\\n' : '') + r.markdown + '\\n';
         box.dispatchEvent(new Event('input', { bubbles: true }));
       } catch (e) {
-        if (mark) mark.textContent = '上传失败：' + e.message;
+        if (mark) mark.textContent = '失败：' + e.message;
         return;
       }
     }
@@ -203,23 +229,27 @@ UPLOAD_SCRIPT = """
     btn.type = 'button';
     btn.id = 'dwellPickBtn';
     btn.title = '发图片';
-    btn.innerHTML = '<span class="ic" data-i="paperclip"></span>';
-    btn.style.cssText = 'background:transparent;border:0;color:var(--dim);'
-      + 'cursor:pointer;padding:6px 8px;line-height:1;';
+    btn.setAttribute('aria-label', '发图片');
+    // 尺寸全部交给 UPLOAD_STYLE 里的 #dwellPickBtn 规则，
+    // 不写 inline style，免得跟那边打架。
+    btn.innerHTML = '<span class="ic"></span>';
     btn.onclick = () => input.click();
 
     const hint = document.createElement('span');
     hint.id = 'dwellUploadHint';
-    hint.style.cssText = 'color:var(--dim);font-size:13px;margin-left:6px;';
 
     const bar = box.parentElement;
     bar.appendChild(input);
     bar.appendChild(btn);
     bar.appendChild(hint);
 
-    // 上游的图标是靠 data-i 在启动时统一填充的，动态加的这个要自己画。
+    // 上游的图标是启动时按 data-i 统一填充的，动态加的这个要自己画。
+    // 拿不到 ICONS 就退回一个纯文本回形针，总比空白好。
+    const slot = btn.querySelector('.ic');
     if (window.ICONS && window.ICONS.paperclip) {
-      btn.querySelector('.ic').innerHTML = window.ICONS.paperclip;
+      slot.innerHTML = window.ICONS.paperclip;
+    } else {
+      slot.textContent = '\\uD83D\\uDCCE';
     }
 
     // 粘贴和拖拽都接上，手机上主要用选择器，桌面上这两个更顺手。
@@ -330,11 +360,6 @@ def _patch_icons(html: str) -> str:
     if "window.ICONS = ICONS;" not in html:
         # 动态添加的按钮要能自己取图标，所以暴露出来。
         html = html.replace(
-            "/* ============ 线条图标",
-            "window.__dwellIconsHook = 1;\n/* ============ 线条图标",
-            1,
-        )
-        html = html.replace(
             "\nfunction basename(p)",
             "\nwindow.ICONS = ICONS;\nfunction basename(p)",
             1,
@@ -399,7 +424,7 @@ def _patch_nav(html: str) -> str:
 
 
 def _patch_head(html: str, icon_links: str) -> str:
-    """补 PWA 清单、图标和主屏标题。
+    """补 PWA 清单、图标、主屏标题和上传按钮样式。
 
     清单是 iOS 的硬性前提：只有「添加到主屏幕」之后才允许申请通知权限。
     apple-mobile-web-app-title 决定主屏图标下面显示的名字，同时也是
@@ -417,6 +442,8 @@ def _patch_head(html: str, icon_links: str) -> str:
         )
     if icon_links and "apple-touch-icon" not in html:
         head_bits.append(icon_links.rstrip("\n"))
+    if "#dwellPickBtn" not in html:
+        head_bits.append(UPLOAD_STYLE.strip())
 
     if head_bits:
         html = html.replace("</head>", "\n".join(head_bits) + "\n</head>", 1)
@@ -428,8 +455,10 @@ def _patch_tail(html: str, push_script: str) -> str:
     bits = []
     if push_script and "window.dwellPush" not in html:
         bits.append(push_script)
-    if "dwellPickBtn" not in html:
-        bits.append(UPLOAD_SCRIPT)
+    if "dwellPickBtn" not in html or "#dwellPickBtn" in html:
+        # 只有样式没有脚本时也要补上脚本；两者的判据不能共用同一个串。
+        if "getElementById('dwellPick')" not in html:
+            bits.append(UPLOAD_SCRIPT)
     if bits:
         html = html.replace("</body>", "".join(bits) + "</body>", 1)
     return html
@@ -537,7 +566,8 @@ def register_frontend_feature(server_module):
                 "tool_labels": "case 'write_diary'" in built,
                 "verbof_anchor_found": VERBOF_ANCHOR in source_text,
                 "push_script": "window.dwellPush" in built,
-                "upload_script": "dwellPickBtn" in built,
+                "upload_script": "getElementById('dwellPick')" in built,
+                "upload_style": "#dwellPickBtn" in built,
                 "cpu_icon": "  cpu: S(" in built,
                 "icons_exposed": "window.ICONS = ICONS;" in built,
                 "manifest_link": 'rel="manifest"' in built,
