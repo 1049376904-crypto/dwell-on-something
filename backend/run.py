@@ -12,6 +12,7 @@ from frontend_feature import register_frontend_feature
 from calendar_feature import register_calendar_feature
 from whisper_feature import register_whisper_feature
 from journal_feature import register_journal_feature
+from repo_feature import register_repo_feature
 from event_stream_feature import register_event_stream_feature
 from transcript_feature import register_transcript_feature
 from agent_tools_feature import register_agent_tools_feature
@@ -27,9 +28,11 @@ register_frontend_feature(server)
 register_calendar_feature(server)
 register_whisper_feature(server)
 register_journal_feature(server)
+register_repo_feature(server)
 # 先替换事件流，再注册会广播工具事件的聊天代理。
 register_event_stream_feature(server)
-# transcript 要在 agent_tools 之前，后者需要 server.save_transcript。
+# transcript 在 event_stream 之后接管 api_messages，并需在 agent_tools 之前
+# 注册，后者依赖 server.save_transcript。
 register_transcript_feature(server)
 register_agent_tools_feature(server)
 
@@ -41,7 +44,7 @@ if __name__ == "__main__":
     print(f"  port    : {server.PORT}")
     print(f"  db      : {db_path}")
     print("  frontend: ../web/index.html（动态读取，无需复制）")
-    print("  modules : 聊天 / 待办 / 日历 / 悄悄话 / 日记")
+    print("  modules : 聊天 / 待办 / 日历 / 悄悄话 / 日记 / 仓库")
     print("  tools   : 待办 / 日历 / 悄悄话 / 日记 / 摘录")
     print("  events  : 可重放游标队列")
     print("  history : 思考与工具调用持久化重放")
