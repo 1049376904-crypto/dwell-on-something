@@ -196,13 +196,16 @@ def register_heartbeat_feature(server_module):
         )
 
     def notify(text):
-        """把主动说的话推到锁屏。推送不可用时静默跳过，不影响心跳本身。"""
+        """把主动说的话推到锁屏。推送不可用时静默跳过，不影响心跳本身。
+
+        标题传空：iOS 用应用名当标题，服务端再写一遍会重复两行。
+        """
         send = getattr(server_module, "send_push", None)
         if not callable(send):
             write(KEY_LAST_PUSH, "推送模块未注册")
             return
         try:
-            result = send("沐", text, url="/", tag="heartbeat")
+            result = send("", text, url="/", tag="heartbeat")
         except Exception as exc:
             write(KEY_LAST_PUSH, f"推送异常: {str(exc)[:120]}")
             return
