@@ -5,6 +5,9 @@
 
 除工具之外，这里还会在每轮请求前构建一份「自动概览」注入 system prompt，
 让模型不必调用工具也能知道妍妍手动写进各个页面的内容。
+
+思考与工具调用除广播之外还会写入 transcript 表（见 transcript_feature），
+这样刷新页面后仍能重放。
 """
 
 import json
@@ -315,6 +318,17 @@ def _clamp(value, low, high, default=0):
 def _cut(text, length):
     text = " ".join(str(text or "").split())
     return text if len(text) <= length else text[:length] + "…"
+
+
+def _record(server, kind, **fields):
+    """写一条 transcript 记录；transcript 模块未注册时静默跳过。"""
+    save = getattr(server, "save_transcript", None)
+    if save is None:
+        return None
+    try:
+        return save(kind, **fields)
+    except Exception:
+        return None
 
 
 def _todo_rows(db, owner="all"):
@@ -857,6 +871,10 @@ def register_agent_tools_feature(server):
                 if assistant_parts:
                     server.broadcast({"type": "assistant", "message": {"content": assistant_parts}})
 
+                # 思考过程入库，刷新后由 renderSaid 重放。
+                if thinking.strip():
+                    _record(server, "think", text=thinking)
+
                 if not calls:
                     final_answer = text.strip()
                     break
@@ -876,6 +894,13 @@ def register_agent_tools_feature(server):
                 })
 
                 for call in calls:
+                    _record(
+                        server, "tool",
+                        name=call["name"],
+                        extra=_json(call["args"]),
+                        call_id=call["id"],
+                    )
+
                     try:
                         result_obj = execute_tool(server, call["name"], call["args"])
                         result = _json(result_obj)
@@ -883,6 +908,14 @@ def register_agent_tools_feature(server):
                     except Exception as exc:
                         result = _json({"ok": False, "error": str(exc)})
                         is_error = True
+
+                    _record(
+                        server, "tool_result",
+                        text=result,
+                        name=call["name"],
+                        call_id=call["id"],
+                        is_error=is_error,
+                    )
 
                     _broadcast_tool_result(server, call["id"], result, is_error)
                     request_messages.append({
