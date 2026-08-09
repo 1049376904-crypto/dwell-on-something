@@ -10,10 +10,12 @@
 * 推送内容只放摘要，最多 80 字。通知会出现在锁屏上，
   别人瞥一眼就看见全文不合适。
 * 订阅端点唯一，重复订阅走 UPSERT，不会堆出一堆重复记录。
+* 自带一个独立的开关面板（/push）。妍妍只有手机，
+  iOS 上没有控制台，订阅必须能靠点按完成。
 
 iOS 限制（Safari 16.4+）：必须先把网页「添加到主屏幕」，
 从主屏图标打开后才允许申请通知权限。直接在 Safari 里访问会失败，
-这不是 bug，是系统行为。
+这不是 bug，是系统行为。面板会检测并直接说明当前处于哪种状态。
 """
 
 import json
@@ -95,7 +97,7 @@ self.addEventListener('notificationclick', (event) => {
 });
 """
 
-# 注入前端的注册脚本。权限申请不自动弹，交给设置页里的按钮触发，
+# 注入前端的注册脚本。权限申请不自动弹，交给面板上的按钮触发，
 # 免得一进门就被系统弹窗拦一次。
 CLIENT_SCRIPT = """
 <script>
@@ -169,6 +171,165 @@ CLIENT_SCRIPT = """
   }
 })();
 </script>
+"""
+
+# 独立面板。刻意不塞进上游那个设置页：那边结构复杂、
+# 字符串补丁很容易打歪，而这个页面只需要能点。
+PANEL_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="content">
+<title>通知设置</title>
+<link rel="manifest" href="/manifest.json">
+<style>
+  :root { --bg:#faf9f5; --fg:#262624; --dim:#8a8780; --line:#e6e3dc; --accent:#3d6b4f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#262624; --fg:#f0eee8; --dim:#9a968e; --line:#3a3a37; --accent:#7fae90; }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; padding: 28px 20px calc(28px + env(safe-area-inset-bottom));
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+    max-width: 560px; margin-inline: auto;
+  }
+  h1 { font-size: 21px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 14px; margin-bottom: 24px; }
+  .card {
+    border: 1px solid var(--line); border-radius: 14px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; }
+  .row span:first-child { color: var(--dim); }
+  .row span:last-child { text-align: right; }
+  button {
+    width: 100%; padding: 14px; margin-top: 10px; font-size: 16px;
+    border: 1px solid var(--line); border-radius: 11px;
+    background: transparent; color: var(--fg); cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; }
+  #log {
+    white-space: pre-wrap; word-break: break-word; font-size: 14px;
+    color: var(--dim); margin-top: 16px; min-height: 3em;
+  }
+  .warn {
+    border-color: #c98a3c; background: rgba(201,138,60,.09);
+    padding: 13px 16px; border-radius: 11px; font-size: 14.5px;
+    border-width: 1px; border-style: solid; margin-bottom: 14px;
+  }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<h1>通知</h1>
+<div class="sub">开启后，沐主动说的话会推到锁屏。</div>
+
+<div id="guard"></div>
+
+<div class="card">
+  <div class="row"><span>浏览器支持</span><span id="s-support">检测中</span></div>
+  <div class="row"><span>主屏模式</span><span id="s-standalone">检测中</span></div>
+  <div class="row"><span>通知权限</span><span id="s-perm">检测中</span></div>
+  <div class="row"><span>已订阅设备</span><span id="s-count">…</span></div>
+  <div class="row"><span>推送库</span><span id="s-lib">…</span></div>
+</div>
+
+<button id="btn-enable" class="primary">开启通知</button>
+<button id="btn-test">发一条测试通知</button>
+<button id="btn-disable">关闭通知</button>
+<button id="btn-beat">让沐现在说句话</button>
+
+<div id="log"></div>
+<div class="sub" style="margin-top:20px"><a href="/">回到应用</a></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (text) => { $('log').textContent = text; };
+
+function refreshLocal() {
+  const P = window.dwellPush || {};
+  $('s-support').textContent = P.supported ? '支持' : '不支持';
+  $('s-standalone').textContent = P.standalone ? '是' : '否（Safari 标签页）';
+  $('s-perm').textContent = window.Notification ? Notification.permission : '不可用';
+
+  // iOS 必须从主屏图标打开才允许申请权限，这一条讲清楚比让她反复试有用。
+  const iOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  if (iOS && !P.standalone) {
+    $('guard').innerHTML = '<div class="warn">iPhone 上需要先把这个网页'
+      + '<b>添加到主屏幕</b>，再从主屏图标打开，系统才允许开启通知。'
+      + '现在是 Safari 标签页，点「开启通知」会失败。</div>';
+    $('btn-enable').disabled = true;
+  }
+}
+
+async function refreshServer() {
+  try {
+    const d = await (await fetch('/api/push/status', { cache: 'no-store' })).json();
+    $('s-count').textContent = d.count;
+    $('s-lib').textContent = d.library_installed ? '已安装' : '未安装';
+  } catch (e) {
+    $('s-count').textContent = '读取失败';
+  }
+}
+
+$('btn-enable').onclick = async () => {
+  log('正在申请权限并订阅…');
+  try {
+    const r = await window.dwellPush.enable();
+    log('订阅成功，当前 ' + r.count + ' 台设备。可以点上面的测试通知了。');
+  } catch (e) {
+    log('失败：' + e.message);
+  }
+  refreshLocal(); refreshServer();
+};
+
+$('btn-test').onclick = async () => {
+  log('正在发送…');
+  try {
+    const d = await (await fetch('/api/push/test', { cache: 'no-store' })).json();
+    log(d.ok
+      ? '已发往 ' + d.sent + ' 台设备。锁屏或下拉通知看看。'
+      : '没发出去：' + (d.error || JSON.stringify(d)));
+  } catch (e) {
+    log('失败：' + e.message);
+  }
+  refreshServer();
+};
+
+$('btn-disable').onclick = async () => {
+  log('正在取消…');
+  try {
+    await window.dwellPush.disable();
+    log('已取消订阅。系统通知权限需要在「设置」里单独关。');
+  } catch (e) {
+    log('失败：' + e.message);
+  }
+  refreshLocal(); refreshServer();
+};
+
+$('btn-beat').onclick = async () => {
+  log('已叫醒它，十几秒后应该会说话…');
+  try {
+    await fetch('/api/heartbeat/test', { cache: 'no-store' });
+    setTimeout(async () => {
+      const d = await (await fetch('/api/heartbeat', { cache: 'no-store' })).json();
+      log('结果：' + (d.last_result || '未知')
+        + (d.last_text ? '\\n它说：' + d.last_text : '')
+        + (d.last_push ? '\\n推送：' + d.last_push : ''));
+    }, 15000);
+  } catch (e) {
+    log('失败：' + e.message);
+  }
+};
+
+refreshLocal();
+refreshServer();
+</script>
+</body>
+</html>
 """
 
 
@@ -305,6 +466,11 @@ def register_push_feature(server_module):
 
     # ── 接口
 
+    def api_push_panel():
+        response = Response(PANEL_HTML, mimetype="text/html")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     def api_push_key():
         public_b64 = read(KEY_VAPID_PUBLIC)
         if not public_b64:
@@ -409,6 +575,7 @@ def register_push_feature(server_module):
         return response
 
     routes = [
+        ("/push", "api_push_panel", api_push_panel, ["GET"]),
         ("/sw.js", "api_service_worker", api_service_worker, ["GET"]),
         ("/manifest.json", "api_manifest", api_manifest, ["GET"]),
         ("/api/push/key", "api_push_key", api_push_key, ["GET"]),
