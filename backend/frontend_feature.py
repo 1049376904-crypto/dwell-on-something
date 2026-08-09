@@ -198,7 +198,9 @@ def _patch_head(html: str, icon_links: str) -> str:
     """补 PWA 清单、图标和主屏标题。
 
     清单是 iOS 的硬性前提：只有「添加到主屏幕」之后才允许申请通知权限。
-    apple-mobile-web-app-title 决定主屏图标下面显示的名字。
+    apple-mobile-web-app-title 决定主屏图标下面显示的名字，
+    刻意用 HOME_SCREEN_NAME 而不是 APP_TITLE：应用内表头保持「沐」，
+    桌面上叫 Luminae，同时避免和 manifest 的 name 相同导致通知重复两行。
     """
     head_bits = []
 
@@ -206,7 +208,8 @@ def _patch_head(html: str, icon_links: str) -> str:
         head_bits.append('  <link rel="manifest" href="/manifest.json">')
     if "apple-mobile-web-app-title" not in html:
         head_bits.append(
-            f'  <meta name="apple-mobile-web-app-title" content="{personalize.APP_TITLE}">'
+            '  <meta name="apple-mobile-web-app-title" content="'
+            + personalize.HOME_SCREEN_NAME + '">'
         )
     if icon_links and "apple-touch-icon" not in html:
         head_bits.append(icon_links.rstrip("\n"))
@@ -313,6 +316,8 @@ def register_frontend_feature(server_module):
             "entrypoint": "run.py",
             "user_name": personalize.USER_NAME,
             "ai_name": personalize.AI_NAME,
+            "home_screen_name": personalize.HOME_SCREEN_NAME,
+            "pwa_name": personalize.PWA_NAME,
             "together_since": personalize.TOGETHER_SINCE,
             # 补丁靠字符串匹配，上游一改就会静默失效；这里如实报告命中情况。
             "patches": {
@@ -326,6 +331,7 @@ def register_frontend_feature(server_module):
                 "apple_icon": "apple-touch-icon" in built,
                 "push_nav": 'id="navPush"' in built,
                 "nav_anchor_found": NAV_WALL_BUTTON in source_text,
+                "home_screen_name": personalize.HOME_SCREEN_NAME in built,
             },
         })
 
