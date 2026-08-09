@@ -148,27 +148,36 @@ def _patch_tool_labels(html: str) -> str:
     return html
 
 
-def _patch_push(html: str, client_script: str) -> str:
-    """挂上 PWA 清单和推送客户端脚本。
+def _patch_head(html: str, icon_links: str) -> str:
+    """补 PWA 清单、图标和主屏标题。
 
     清单是 iOS 的硬性前提：只有「添加到主屏幕」之后才允许申请通知权限。
+    apple-mobile-web-app-title 决定主屏图标下面显示的名字。
     """
-    if not client_script or "window.dwellPush" in html:
-        return html
+    head_bits = []
 
     if 'rel="manifest"' not in html:
-        html = html.replace(
-            "</head>",
-            '  <link rel="manifest" href="/manifest.json">\n</head>',
-            1,
+        head_bits.append('  <link rel="manifest" href="/manifest.json">')
+    if "apple-mobile-web-app-title" not in html:
+        head_bits.append(
+            f'  <meta name="apple-mobile-web-app-title" content="{personalize.APP_TITLE}">'
         )
+    if icon_links and "apple-touch-icon" not in html:
+        head_bits.append(icon_links.rstrip("\n"))
 
-    # 放在 body 结束前，确保注册时页面脚本已就位。
-    html = html.replace("</body>", client_script + "</body>", 1)
+    if head_bits:
+        html = html.replace("</head>", "\n".join(head_bits) + "\n</head>", 1)
     return html
 
 
-def _build_frontend(source: Path, push_script: str = "") -> str:
+def _patch_push(html: str, client_script: str) -> str:
+    """把推送客户端脚本放进页面末尾。"""
+    if not client_script or "window.dwellPush" in html:
+        return html
+    return html.replace("</body>", client_script + "</body>", 1)
+
+
+def _build_frontend(source: Path, push_script: str = "", icon_links: str = "") -> str:
     html = source.read_text(encoding="utf-8")
 
     # 移除演示 fetch 拦截，让请求真正进入后端。
@@ -206,6 +215,7 @@ def _build_frontend(source: Path, push_script: str = "") -> str:
     )
 
     html = _patch_tool_labels(html)
+    html = _patch_head(html, icon_links)
     html = _patch_push(html, push_script)
 
     # 允许空日记正常进入主页。
@@ -220,9 +230,11 @@ def _build_frontend(source: Path, push_script: str = "") -> str:
 
     # 悄悄话提供独立侧栏入口，不依赖日记墙是否已有内容。
     wall_button = '<button class="item" id="navWall"><span class="ic" data-i="pen"></span>日记</button>'
-    whisper_button = wall_button + '\n      <button class="item" id="navWhisper"><span class="ic" data-i="note"></span>悄悄话</button>'
+    extra_buttons = wall_button \
+        + '\n      <button class="item" id="navWhisper"><span class="ic" data-i="note"></span>悄悄话</button>' \
+        + '\n      <a class="item" href="/push"><span class="ic" data-i="note"></span>通知</a>'
     if 'id="navWhisper"' not in html:
-        html = html.replace(wall_button, whisper_button, 1)
+        html = html.replace(wall_button, extra_buttons, 1)
 
     wall_handler = "document.getElementById('navWall').onclick = () => { closeDrawer(); sheets.wall.classList.add('open'); loadWall(); };"
     whisper_handler = wall_handler + "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); sheets.wall.classList.add('open'); renderWhisper(); };"
@@ -240,10 +252,15 @@ def register_frontend_feature(server_module):
         # push_feature 可能还没注册（或注册失败），推送脚本就当不存在。
         return getattr(server_module, "push_client_script", "") or ""
 
+    def icon_links():
+        fn = getattr(server_module, "icon_html_links", None)
+        return fn() if callable(fn) else ""
+
     def index_real():
         if not source.exists():
             return Response("找不到 web/index.html", status=500, mimetype="text/plain")
-        response = Response(_build_frontend(source, push_script()), mimetype="text/html")
+        html = _build_frontend(source, push_script(), icon_links())
+        response = Response(html, mimetype="text/html")
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -252,7 +269,7 @@ def register_frontend_feature(server_module):
 
     def version_real():
         source_text = source.read_text(encoding="utf-8") if source.exists() else ""
-        built = _build_frontend(source, push_script()) if source.exists() else ""
+        built = _build_frontend(source, push_script(), icon_links()) if source.exists() else ""
         return jsonify({
             "ok": True,
             "version": _git_version(repo_root),
@@ -271,6 +288,8 @@ def register_frontend_feature(server_module):
                 "verbof_anchor_found": VERBOF_ANCHOR in source_text,
                 "push_script": "window.dwellPush" in built,
                 "manifest_link": 'rel="manifest"' in built,
+                "apple_icon": "apple-touch-icon" in built,
+                "push_nav": 'href="/push"' in built,
             },
         })
 
