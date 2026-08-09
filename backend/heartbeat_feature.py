@@ -23,6 +23,7 @@
 整体平移八小时——夜里的窗口跑到白天去。这一个函数漏掉一处就前功尽弃。
 """
 
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -86,6 +87,23 @@ NIGHT_OFFSET_HOURS = 12
 
 # 手机上复制粘贴常把 ASCII 连字符换成这些字符，解析前统一归一。
 DASH_VARIANTS = "\u2011\u2010\u2012\u2013\u2014\u2015\uff0d\u2212"
+
+# 沐现在会发表情包（send_sticker），它以 ![名字](/sticker/xxx.gif) 存成一条消息。
+# 锁屏上直接显示这串 markdown 只会让人以为坐坏了，推送前换成人话。
+IMG_MD = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+
+
+def _plain(text):
+    """把 markdown 图片换成可读的占位，供锁屏通知使用。
+
+    alt 里存的就是表情的名字，正好拿来当占位：
+    锁屏上看到「［抱抱］」比看到一串路径强。
+    """
+    def swap(match):
+        name = match.group(1).strip()
+        return f"［{name}］" if name else "［一张图］"
+
+    return " ".join(IMG_MD.sub(swap, str(text or "")).split())
 
 
 def cn_now():
@@ -258,12 +276,17 @@ def register_heartbeat_feature(server_module):
 
         标题传空：iOS 用应用名当标题，服务端再写一遍会重复两行。
         """
+        body = _plain(text)
+        if not body:
+            write(KEY_LAST_PUSH, "正文只有图，没推")
+            return
+
         send = getattr(server_module, "send_push", None)
         if not callable(send):
             write(KEY_LAST_PUSH, "推送模块未注册")
             return
         try:
-            result = send("", text, url="/", tag="heartbeat")
+            result = send("", body, url="/", tag="heartbeat")
         except Exception as exc:
             write(KEY_LAST_PUSH, f"推送异常: {str(exc)[:120]}")
             return
