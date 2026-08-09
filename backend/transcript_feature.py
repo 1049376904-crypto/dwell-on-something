@@ -2,7 +2,7 @@
 
 server.py 的 messages 表只存 her / gu 两种正文，思考和工具调用此前只走广播，
 刷新即丢。这里用独立的 transcript 表记录，再在 /api/messages 响应里按顺序
-并回去，前端 renderSaid 已经能识别 think / tool / tool_result 三种 kind。
+并回去。
 
 刻意不写进 messages 表：api_send 组装上下文时读的是 messages，思考和工具
 记录混进去会被当成 assistant 正文发给网关，污染上下文。
@@ -12,12 +12,18 @@ server.py 的 messages 表只存 her / gu 两种正文，思考和工具调用�
 思考与工具行天然锚定在两者之间。排序键 (anchor, tier, id) 完全确定，不依赖
 时间戳（同一秒内无法区分先后）。
 
+与前端的字段约定（上游 renderSaid 的 tool 分支）：
+    addToolUse({ name: m.text, input: JSON.parse(m.extra), id: tid })
+工具名走 text，入参走 extra 的 JSON 字符串。不要用 name 字段，前端不读。
+返回结果原本被上游写死成空字符串，配套的 frontend_feature 补丁改成读
+m.result / m.is_error，所以这里把结果并进同一条 tool 记录，而不是发送
+独立的 tool_result 条目（renderSaid 没有对应分支，会被静默丢弃）。
+
 注意 upto 字段：前端会把它赋给 /api/poll 的 since，所以它必须是事件流游标，
 不能是 messages 表的 seq（见 event_stream_feature 里的说明）。本模块在
 event_stream 之后注册并接管 api_messages，因此要自己保持这个语义。
 """
 
-import json
 import time
 
 from flask import jsonify, request
@@ -25,6 +31,9 @@ from flask import jsonify, request
 
 # 合成 seq 的偏移量，保证与 messages 表真实 seq 不冲突。
 SYNTH_OFFSET = 1_000_000_000
+
+# 单条工具结果在历史里展示的上限，避免超长 JSON 把页面拖慢。
+MAX_RESULT_CHARS = 4000
 
 
 def register_transcript_feature(server_module):
@@ -82,40 +91,45 @@ def register_transcript_feature(server_module):
                 "SELECT 1 FROM messages WHERE seq<? LIMIT 1", (low,)
             ).fetchone() is not None
 
+        # 先把工具结果按 call_id 收起来，稍后并进对应的 tool 条目。
+        results = {}
+        for row in rows:
+            if row["kind"] == "tool_result" and row["call_id"]:
+                results[row["call_id"]] = row
+
         # 排序键第二位是层级：正文在前，同一锚点下的 transcript 在后。
         items = [((m["seq"], 1, 0), m) for m in base]
 
-        # tool_result 需要指回对应 tool 行的合成 seq；tool 行 id 一定更小，
-        # 按 id 升序遍历时表已经建好。
-        tool_seq_by_call = {}
-
         for row in rows:
-            synth = SYNTH_OFFSET + row["id"]
+            kind = row["kind"]
+
+            # tool_result 已并入 tool 条目，单独发过去前端没有分支会丢掉。
+            if kind == "tool_result":
+                continue
+
             item = {
-                "seq": synth,
-                "kind": row["kind"],
+                "seq": SYNTH_OFFSET + row["id"],
+                "kind": kind,
                 "text": row["text"],
                 "at": row["at"],
             }
 
-            if row["kind"] == "tool":
-                item["name"] = row["name"]
+            if kind == "tool":
+                # 前端从 text 读工具名、从 extra 读入参 JSON。
+                item["text"] = row["name"] or row["text"]
                 item["extra"] = row["extra"]
-                try:
-                    item["input"] = json.loads(row["extra"] or "{}")
-                except (ValueError, TypeError):
-                    item["input"] = {}
-                if row["call_id"]:
-                    tool_seq_by_call[row["call_id"]] = synth
 
-            elif row["kind"] == "tool_result":
-                ref = tool_seq_by_call.get(row["call_id"], 0)
-                # 前端读哪个字段名尚未完全确定，几种常见写法都给上。
-                item["id"] = ref
-                item["ref"] = ref
-                item["tool_use_id"] = row["call_id"]
-                item["content"] = row["text"]
-                item["is_error"] = bool(row["is_error"])
+                result_row = results.get(row["call_id"])
+                if result_row is not None:
+                    payload = result_row["text"] or ""
+                    if len(payload) > MAX_RESULT_CHARS:
+                        payload = payload[:MAX_RESULT_CHARS] + "…（已截断）"
+                    item["result"] = payload
+                    item["is_error"] = bool(result_row["is_error"])
+                else:
+                    # 生成中途断掉的调用没有结果行，如实留空。
+                    item["result"] = ""
+                    item["is_error"] = False
 
             items.append(((row["after_seq"], 2, row["id"]), item))
 
