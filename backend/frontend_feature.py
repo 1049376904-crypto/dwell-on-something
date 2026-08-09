@@ -84,10 +84,63 @@ IMG_RE_PATCHED = (
 )
 
 # 聊天里的图片尺寸。上游给的 240px 在手机上占了大半屏，
-# 一张图就把上下文挤出视野；收到 170px，抬眼能看清、又不抢地方，
-# 想细看点开就是。
+# 一张图就把上下文挤出视野；收到 170px，抬眼能看清、又不抢地方。
 CHATIMG_ORIGINAL = "max-width: min(240px, 70%); border-radius: 14px;"
 CHATIMG_PATCHED = "max-width: min(170px, 52%); border-radius: 14px;"
+
+# 上游 addMe 把整条消息塞进一个气泡，于是图片和跟着的那句话挤在同一块灰底里。
+# 这里把它拆成两步：整行只有图片的自己占一个气泡（而且不要底色，
+# 灰底套在图片外面很脏），其余文字照常成段。
+# 只改显示，不动数据库和上下文——消息在库里仍然是一条。
+ADDME_ORIGINAL = """function addMe(text) {
+  const r = row('me');
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  b.textContent = text;
+  r.appendChild(b);
+  renderRich(b);
+  scroll(true);
+  guEl = null; endThink(); closeGroup();
+}"""
+
+ADDME_PATCHED = """const DWELL_ONLY_IMG = /^!\\[[^\\]]*\\]\\(\\S+\\)$/;
+function addMeOne(text, bare) {
+  const r = row('me');
+  const b = document.createElement('div');
+  b.className = bare ? 'bubble bare' : 'bubble';
+  b.textContent = text;
+  r.appendChild(b);
+  renderRich(b);
+  scroll(true);
+  guEl = null; endThink(); closeGroup();
+}
+function addMe(text) {
+  const lines = String(text == null ? '' : text).split('\\n');
+  let buf = [];
+  const flush = () => {
+    const t = buf.join('\\n').trim();
+    buf = [];
+    if (t) addMeOne(t, false);
+  };
+  let any = false;
+  for (const ln of lines) {
+    const one = ln.trim();
+    if (DWELL_ONLY_IMG.test(one)) { flush(); addMeOne(one, true); any = true; }
+    else buf.push(ln);
+  }
+  flush();
+  // 整条都是空白：还是留一个气泡，别让这条消息凭空消失
+  if (!any && !log.lastElementChild) addMeOne(String(text == null ? '' : text), false);
+}"""
+
+# 图片气泡不要底色和内边距，否则灰框套着图很脏。
+BUBBLE_STYLE = """<style>
+  .row.me .bubble.bare {
+    background: transparent; padding: 0; max-width: 100%;
+  }
+  .row.me .bubble.bare img.chatimg { margin: 0; }
+  .row.me .bubble + .bubble { margin-top: 6px; }
+</style>"""
 
 # 右下角那只宠物：上游只有 <img src="pet/clawd-*.svg">，
 # 那几个 SVG 文件 fork 时没跟过来（上游仓库里也没有），
@@ -231,20 +284,23 @@ def _patch_icons(html: str) -> str:
 
 
 def _patch_images(html: str) -> str:
-    """让 IMG_RE 认站内相对路径，并把聊天图片改小一档。
-
-    上游 IMG_RE 只认 https?:// 开头的绝对地址，我们存的 /media/... 匹配不上，
-    气泡里会原样显示成 ![](/media/…) 这一串字符。
-    """
+    """让 IMG_RE 认站内相对路径，并把聊天图片改小一档。"""
     if "(?:https?:\\/\\/|\\/)" not in html:
         html = html.replace(IMG_RE_ORIGINAL, IMG_RE_PATCHED, 1)
     html = html.replace(CHATIMG_ORIGINAL, CHATIMG_PATCHED, 1)
     return html
 
 
+def _patch_bubbles(html: str) -> str:
+    """把图片和文字拆成各自的气泡。"""
+    if "function addMeOne(" in html:
+        return html
+    return html.replace(ADDME_ORIGINAL, ADDME_PATCHED, 1)
+
+
 def _patch_pet(html: str) -> str:
     """宠物图缺失时整块藏起来，不显示破图框。"""
-    if "onerror" in PET_IMG_PATCHED and PET_IMG_PATCHED in html:
+    if PET_IMG_PATCHED in html:
         return html
     return html.replace(PET_IMG_ORIGINAL, PET_IMG_PATCHED, 1)
 
@@ -297,7 +353,7 @@ def _patch_nav(html: str) -> str:
 
 
 def _patch_head(html: str, icon_links: str) -> str:
-    """补 PWA 清单、图标和主屏标题。
+    """补 PWA 清单、图标、主屏标题和气泡样式。
 
     清单是 iOS 的硬性前提：只有「添加到主屏幕」之后才允许申请通知权限。
     apple-mobile-web-app-title 决定主屏图标下面显示的名字，同时也是
@@ -315,6 +371,8 @@ def _patch_head(html: str, icon_links: str) -> str:
         )
     if icon_links and "apple-touch-icon" not in html:
         head_bits.append(icon_links.rstrip("\n"))
+    if ".bubble.bare" not in html:
+        head_bits.append(BUBBLE_STYLE)
 
     if head_bits:
         html = html.replace("</head>", "\n".join(head_bits) + "\n</head>", 1)
@@ -367,6 +425,7 @@ def _build_frontend(source: Path, push_script: str = "", icon_links: str = "") -
 
     html = _patch_icons(html)
     html = _patch_images(html)
+    html = _patch_bubbles(html)
     html = _patch_pet(html)
     html = _patch_tool_labels(html)
     html = _patch_head(html, icon_links)
@@ -435,7 +494,10 @@ def register_frontend_feature(server_module):
                 "img_re_anchor_found": IMG_RE_ORIGINAL in source_text,
                 "chatimg_resized": CHATIMG_PATCHED in built,
                 "chatimg_anchor_found": CHATIMG_ORIGINAL in source_text,
-                "pet_guarded": "onerror" in built,
+                "bubble_split": "function addMeOne(" in built,
+                "addme_anchor_found": ADDME_ORIGINAL in source_text,
+                "bubble_style": ".bubble.bare" in built,
+                "pet_guarded": PET_IMG_PATCHED in built,
                 "push_script": "window.dwellPush" in built,
                 "cpu_icon": "  cpu: S(" in built,
                 "manifest_link": 'rel="manifest"' in built,
