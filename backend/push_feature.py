@@ -13,9 +13,10 @@
 * 同时支持两条订阅入口：上游设置页里的「手机通知」开关，
   以及本模块自带的面板 /push。两者写进同一张表。
 
-通知标题刻意留空：iOS 在 standalone 模式下已经用应用名（manifest 的 name）
-当标题，服务端再写一遍「沐」会变成「沐 / from 沐 / 正文」三行。
-留空后系统自己补应用名，观感和 iMessage 一致。
+通知标题由 iOS 决定，服务端传空字符串。系统会用两个值拼出通知头部：
+    第一行  manifest 的 name          → personalize.PWA_NAME（予妍）
+    第二行  apple-mobile-web-app-title → personalize.HOME_SCREEN_NAME（Luminae）
+两者相同就会出现「沐 / from 沐 / 正文」的重复观感，所以刻意分开。
 
 私钥不以字符串形式交给 pywebpush。它会先 os.path.isfile 再走
 py_vapid 的字符串分支，而那条分支对 PKCS8 PEM 的处理会抛
@@ -43,6 +44,8 @@ import json
 import time
 
 from flask import Response, jsonify, request
+
+import personalize
 
 
 KEY_VAPID_PRIVATE = "push_vapid_private_pem"
@@ -136,7 +139,7 @@ self.addEventListener('push', (event) => {
   try { payload = event.data ? event.data.json() : {}; } catch (e) {
     payload = { body: event.data ? event.data.text() : '' };
   }
-  // 标题通常为空：让系统用应用名，避免「沐 / from 沐」重复两行。
+  // 标题通常为空：让系统用 manifest 的 name，避免重复两行。
   const title = payload.title || '';
   const options = {
     body: payload.body || '',
@@ -225,6 +228,26 @@ CLIENT_SCRIPT = """
     return saved;
   };
 
+  // 只留当前设备这一条订阅。换过图标或清过数据后，
+  // 旧端点会滞留在库里，导致同一条通知收到两遍。
+  PUSH.onlyMe = async function () {
+    const blocked = PUSH.blockedBy();
+    if (blocked) throw new Error(blocked);
+
+    const reg = await navigator.serviceWorker.getRegistration('/');
+    const sub = reg ? await reg.pushManager.getSubscription() : null;
+
+    const resp = await (await fetch('/api/push/prune', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keep: sub ? sub.endpoint : '' }),
+    })).json();
+
+    // 本机还没订阅的话，顺手订上，免得清完一条不剩。
+    if (!sub) return PUSH.enable();
+    return resp;
+  };
+
   PUSH.disable = async function () {
     if (!PUSH.supported) return { ok: true };
     const reg = await navigator.serviceWorker.getRegistration('/');
@@ -258,7 +281,7 @@ PANEL_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="沐">
+<meta name="apple-mobile-web-app-title" content="__HOME_NAME__">
 <title>通知设置</title>
 <link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png">
@@ -323,6 +346,7 @@ PANEL_TEMPLATE = """<!DOCTYPE html>
 
 <button id="btn-enable" class="primary">开启通知</button>
 <button id="btn-test">发一条测试通知</button>
+<button id="btn-prune">只保留这台设备</button>
 <button id="btn-disable">关闭通知</button>
 <button id="btn-beat">让沐现在说句话</button>
 
@@ -352,6 +376,7 @@ function refreshLocal() {
   // 两道前提分开提示：HTTPS 是硬门槛，主屏幕是 iOS 的额外要求。
   const blocked = P.blockedBy ? P.blockedBy() : '脚本未加载';
   $('btn-enable').disabled = !!blocked;
+  $('btn-prune').disabled = !!blocked;
 
   if (!P.secure) {
     $('guard').innerHTML = '<div class="warn">现在是 <b>HTTP</b> 访问，'
@@ -372,7 +397,8 @@ function refreshLocal() {
 async function refreshServer() {
   try {
     const d = await (await fetch('/api/push/status', { cache: 'no-store' })).json();
-    $('s-count').textContent = d.count;
+    // 多于一台通常是旧端点滞留，会导致同一条通知收到两遍。
+    mark('s-count', d.count <= 1, d.count + (d.count > 1 ? '（有重复）' : ''));
     $('s-lib').textContent = d.library_installed ? '已安装' : '未安装';
   } catch (e) {
     $('s-count').textContent = '读取失败';
@@ -409,6 +435,18 @@ $('btn-test').onclick = async () => {
     log('失败：' + e.message);
   }
   refreshServer();
+};
+
+$('btn-prune').onclick = async () => {
+  log('正在清理…');
+  try {
+    const d = await window.dwellPush.onlyMe();
+    log('清理完成，删掉 ' + (d.removed === undefined ? 0 : d.removed)
+      + ' 条旧订阅，现在 ' + d.count + ' 台设备。');
+  } catch (e) {
+    log('失败：' + e.message);
+  }
+  refreshLocal(); refreshServer();
 };
 
 $('btn-disable').onclick = async () => {
@@ -521,8 +559,8 @@ def register_push_feature(server_module):
     def send_push(title, body, url="/", tag="dwell"):
         """向所有订阅推送一条通知，返回统计结果。
 
-        title 一般传空字符串：iOS 会用应用名当标题，
-        服务端再写一遍会变成「沐 / from 沐」两行。
+        title 一般传空字符串：iOS 会用 manifest 的 name 当标题，
+        服务端再写一遍会重复。
 
         任何一个订阅失败都不影响其他订阅；已作废的端点顺手清掉。
         """
@@ -604,6 +642,7 @@ def register_push_feature(server_module):
         # 面板自带客户端脚本：frontend_feature 的注入只作用于 index.html，
         # 面板是独立页面，之前因此拿不到 window.dwellPush，永远显示「不支持」。
         html = PANEL_TEMPLATE.replace("__CLIENT_SCRIPT__", CLIENT_SCRIPT)
+        html = html.replace("__HOME_NAME__", personalize.HOME_SCREEN_NAME)
         response = Response(html, mimetype="text/html")
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -663,6 +702,30 @@ def register_push_feature(server_module):
             drop_subscription(endpoint)
         return jsonify({"ok": True, "count": len(subscriptions())})
 
+    def api_push_prune():
+        """只留 keep 指定的那条订阅，其余删掉。
+
+        换过主屏图标或清过 Safari 数据后 iOS 会给出新端点，
+        旧端点在苹果返回 410 之前一直有效，同一条通知会收到两遍。
+        """
+        data = request.get_json(force=True, silent=True) or {}
+        keep = str(data.get("keep", "")).strip()
+
+        with get_db() as db:
+            if keep:
+                cur = db.execute(
+                    "DELETE FROM push_subscriptions WHERE endpoint<>?", (keep,)
+                )
+            else:
+                cur = db.execute("DELETE FROM push_subscriptions")
+            removed = cur.rowcount
+
+        return jsonify({
+            "ok": True,
+            "removed": max(0, removed),
+            "count": len(subscriptions()),
+        })
+
     def api_push_status():
         try:
             import pywebpush  # noqa: F401
@@ -689,6 +752,8 @@ def register_push_feature(server_module):
             "key_loadable": key_ok,
             "key_error": key_error,
             "contact": read(KEY_CONTACT, DEFAULT_CONTACT),
+            "pwa_name": personalize.PWA_NAME,
+            "home_screen_name": personalize.HOME_SCREEN_NAME,
             "count": len(rows),
             "devices": [
                 {
@@ -717,14 +782,16 @@ def register_push_feature(server_module):
     def api_manifest():
         """PWA 清单。iOS 要「添加到主屏幕」后才允许推送，这个文件是前提。
 
-        name 同时决定通知的发件人显示，所以只写「沐」。
+        name 同时决定推送通知的标题，所以用 PWA_NAME（予妍）；
+        主屏图标下的文字由页面里的 apple-mobile-web-app-title 决定
+        （Luminae）。两者不同才不会出现重复两行的通知头部。
         """
         entries = getattr(server_module, "icon_manifest_entries", None)
         icons = entries() if callable(entries) else []
 
         manifest = {
-            "name": "沐",
-            "short_name": "沐",
+            "name": personalize.PWA_NAME,
+            "short_name": personalize.PWA_NAME,
             "start_url": "/",
             "scope": "/",
             "display": "standalone",
@@ -744,6 +811,7 @@ def register_push_feature(server_module):
         ("/api/push/status", "api_push_status", api_push_status, ["GET"]),
         ("/api/push/subscribe", "api_push_subscribe", api_push_subscribe, ["POST"]),
         ("/api/push/unsubscribe", "api_push_unsubscribe", api_push_unsubscribe, ["POST"]),
+        ("/api/push/prune", "api_push_prune", api_push_prune, ["POST"]),
         # GET 也接受：手机浏览器直接打开就能测。
         ("/api/push/test", "api_push_test", api_push_test, ["GET", "POST"]),
         # 上游原生开关用的路径，与上面几条共用同一张订阅表。
