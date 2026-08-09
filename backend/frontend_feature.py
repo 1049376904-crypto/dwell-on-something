@@ -108,6 +108,13 @@ def _build_frontend(source: Path) -> str:
         "  box.appendChild(moodRow);",
     )
 
+    # 上游 renderSaid 只认 kind='me'，而后端（和上游自己的演示数据）用的是
+    # kind='her'，导致刷新后妍妍的消息全部不渲染。这里让它同时认两种。
+    html = html.replace(
+        "if (m.kind === 'me') {",
+        "if (m.kind === 'me' || m.kind === 'her') {",
+    )
+
     # 允许空日记正常进入主页。
     html = html.replace(
         "if (!d.ok || !d.bricks.length) throw 0;",
