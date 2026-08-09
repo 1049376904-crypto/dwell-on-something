@@ -58,16 +58,17 @@ NAV_WALL_BUTTON = (
     '<span class="ic" data-i="pen"></span>日记</button>'
 )
 
-# 悄悄话和通知两个入口。都用 button 而不是 a：
+# 悄悄话、通知、模型三个入口。都用 button 而不是 a：
 # 上游 .item 的样式是给 button 写的，用 <a> 会吃到全局链接色，
 # 在侧边栏里显示成一行蓝色带下划线的字，跟旁边几项完全不搭。
-# 通知用 bell 图标，上游 ICONS 里现成有，不跟悄悄话的 note 重复。
 NAV_EXTRA_BUTTONS = (
     NAV_WALL_BUTTON
     + '\n      <button class="item" id="navWhisper">'
       '<span class="ic" data-i="note"></span>悄悄话</button>'
     + '\n      <button class="item" id="navPush">'
       '<span class="ic" data-i="bell"></span>通知</button>'
+    + '\n      <button class="item" id="navModels">'
+      '<span class="ic" data-i="box"></span>模型</button>'
 )
 
 NAV_WALL_HANDLER = (
@@ -80,6 +81,7 @@ NAV_EXTRA_HANDLERS = (
     + "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); "
       "sheets.wall.classList.add('open'); renderWhisper(); };"
     + "\ndocument.getElementById('navPush').onclick = () => { location.href = '/push'; };"
+    + "\ndocument.getElementById('navModels').onclick = () => { location.href = '/models'; };"
 )
 
 
@@ -179,18 +181,36 @@ def _patch_tool_labels(html: str) -> str:
 
 
 def _patch_nav(html: str) -> str:
-    """补悄悄话和通知两个侧边栏入口。"""
-    # 先清掉旧版本用 <a> 写的通知入口，避免重复和蓝色链接残留。
+    """补悄悄话、通知、模型三个侧边栏入口。"""
+    # 清掉早期版本用 <a> 写的通知入口，避免重复和蓝色链接残留。
     html = html.replace(
         '\n      <a class="item" href="/push">'
         '<span class="ic" data-i="note"></span>通知</a>',
         "",
     )
 
-    if 'id="navPush"' not in html:
+    if 'id="navModels"' not in html:
+        # 已经打过一半（有 navPush 没 navModels）时，先还原成原始按钮再统一插入。
+        html = html.replace(
+            NAV_WALL_BUTTON
+            + '\n      <button class="item" id="navWhisper">'
+              '<span class="ic" data-i="note"></span>悄悄话</button>'
+            + '\n      <button class="item" id="navPush">'
+              '<span class="ic" data-i="bell"></span>通知</button>',
+            NAV_WALL_BUTTON,
+        )
         html = html.replace(NAV_WALL_BUTTON, NAV_EXTRA_BUTTONS, 1)
-    if "getElementById('navPush')" not in html:
+
+    if "getElementById('navModels')" not in html:
+        html = html.replace(
+            NAV_WALL_HANDLER
+            + "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); "
+              "sheets.wall.classList.add('open'); renderWhisper(); };"
+            + "\ndocument.getElementById('navPush').onclick = () => { location.href = '/push'; };",
+            NAV_WALL_HANDLER,
+        )
         html = html.replace(NAV_WALL_HANDLER, NAV_EXTRA_HANDLERS, 1)
+
     return html
 
 
@@ -198,9 +218,9 @@ def _patch_head(html: str, icon_links: str) -> str:
     """补 PWA 清单、图标和主屏标题。
 
     清单是 iOS 的硬性前提：只有「添加到主屏幕」之后才允许申请通知权限。
-    apple-mobile-web-app-title 决定主屏图标下面显示的名字，
-    刻意用 HOME_SCREEN_NAME 而不是 APP_TITLE：应用内表头保持「沐」，
-    桌面上叫 Luminae，同时避免和 manifest 的 name 相同导致通知重复两行。
+    apple-mobile-web-app-title 决定主屏图标下面显示的名字，同时也是
+    通知第二行「from X」里的 X——iOS 不给这两处分开，安装时手填的名字
+    优先级最高。
     """
     head_bits = []
 
@@ -317,7 +337,7 @@ def register_frontend_feature(server_module):
             "user_name": personalize.USER_NAME,
             "ai_name": personalize.AI_NAME,
             "home_screen_name": personalize.HOME_SCREEN_NAME,
-            "pwa_name": personalize.PWA_NAME,
+            "push_title": personalize.PUSH_TITLE,
             "together_since": personalize.TOGETHER_SINCE,
             # 补丁靠字符串匹配，上游一改就会静默失效；这里如实报告命中情况。
             "patches": {
@@ -330,8 +350,8 @@ def register_frontend_feature(server_module):
                 "manifest_link": 'rel="manifest"' in built,
                 "apple_icon": "apple-touch-icon" in built,
                 "push_nav": 'id="navPush"' in built,
+                "models_nav": 'id="navModels"' in built,
                 "nav_anchor_found": NAV_WALL_BUTTON in source_text,
-                "home_screen_name": personalize.HOME_SCREEN_NAME in built,
             },
         })
 
