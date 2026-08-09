@@ -83,10 +83,12 @@ IMG_RE_PATCHED = (
     "|(\\/media\\/[^\\s\"'<>)]+?\\.(?:png|jpe?g|gif|webp))/gi;"
 )
 
-# 聊天里的图片尺寸。上游给的 240px 在手机上占了大半屏，
-# 一张图就把上下文挤出视野；收到 170px，抬眼能看清、又不抢地方。
+# 聊天里的图片尺寸。上游给的 240px 在手机上占了大半屏。
+# 这里换成纯像素：原来那个 70%（我改成的 52%）是相对气泡宽度算的，
+# 而拆出来的图片气泡本身又要按内容定宽——两者互相依赖，
+# 结果气泡撑满整行、图片贴在左边缘，看起来像是对面发的。
 CHATIMG_ORIGINAL = "max-width: min(240px, 70%); border-radius: 14px;"
-CHATIMG_PATCHED = "max-width: min(170px, 52%); border-radius: 14px;"
+CHATIMG_PATCHED = "max-width: 190px; border-radius: 14px;"
 
 # 上游 addMe 把整条消息塞进一个气泡，于是图片和跟着的那句话挤在同一块灰底里。
 # 这里把它拆成两步：整行只有图片的自己占一个气泡（而且不要底色，
@@ -130,13 +132,23 @@ function addMe(text) {
   }
   flush();
   // 整条都是空白：还是留一个气泡，别让这条消息凭空消失
-  if (!any && !log.lastElementChild) addMeOne(String(text == null ? '' : text), false);
+  if (!any && !buf.length && !log.lastElementChild) {
+    addMeOne(String(text == null ? '' : text), false);
+  }
 }"""
 
-# 图片气泡不要底色和内边距，否则灰框套着图很脏。
+# 图片气泡：不要底色和内边距（灰框套着图很脏），并且必须靠右。
+# 上游 .row.me 是 flex + justify-content:flex-end，气泡靠 max-width 收窄
+# 才会贴右边；.bare 如果放开到 100%，气泡就撑满整行、图片贴左边缘。
+# 所以这里用 fit-content + margin-left:auto 双保险，两种布局下都靠右。
 BUBBLE_STYLE = """<style>
   .row.me .bubble.bare {
-    background: transparent; padding: 0; max-width: 100%;
+    background: transparent;
+    padding: 0;
+    width: fit-content;
+    max-width: 100%;
+    margin-left: auto;
+    line-height: 0;
   }
   .row.me .bubble.bare img.chatimg { margin: 0; }
   .row.me .bubble + .bubble { margin-top: 6px; }
@@ -287,6 +299,12 @@ def _patch_images(html: str) -> str:
     """让 IMG_RE 认站内相对路径，并把聊天图片改小一档。"""
     if "(?:https?:\\/\\/|\\/)" not in html:
         html = html.replace(IMG_RE_ORIGINAL, IMG_RE_PATCHED, 1)
+    # 早期版本改成过 52%，重新构建时一并收敛到纯像素。
+    html = html.replace(
+        "max-width: min(170px, 52%); border-radius: 14px;",
+        CHATIMG_PATCHED,
+        1,
+    )
     html = html.replace(CHATIMG_ORIGINAL, CHATIMG_PATCHED, 1)
     return html
 
@@ -496,7 +514,7 @@ def register_frontend_feature(server_module):
                 "chatimg_anchor_found": CHATIMG_ORIGINAL in source_text,
                 "bubble_split": "function addMeOne(" in built,
                 "addme_anchor_found": ADDME_ORIGINAL in source_text,
-                "bubble_style": ".bubble.bare" in built,
+                "bubble_style": "margin-left: auto" in built,
                 "pet_guarded": PET_IMG_PATCHED in built,
                 "push_script": "window.dwellPush" in built,
                 "cpu_icon": "  cpu: S(" in built,
