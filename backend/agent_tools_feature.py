@@ -8,6 +8,9 @@
 
 思考与工具调用除广播之外还会写入 transcript 表（见 transcript_feature），
 这样刷新页面后仍能重放。
+
+历史里带图片的消息会经 server.build_multimodal 转成 image_url 片段
+（见 media_feature），转完再发给网关。
 """
 
 import json
@@ -740,6 +743,20 @@ def _broadcast_tool_result(server, call_id, result, is_error=False):
 def register_agent_tools_feature(server):
     """把 server.call_gateway 替换成支持多轮工具调用的版本。"""
 
+    def to_multimodal(messages):
+        """带图片的历史交给 media_feature 转成 image_url 片段。
+
+        模块没注册或转换出错都原样返回：看不见图比聊不了天好。
+        """
+        convert = getattr(server, "build_multimodal", None)
+        if not callable(convert):
+            return messages
+        try:
+            return convert(messages)
+        except Exception as exc:
+            print(f"[dwell] 图片转多模态失败，按纯文本发送: {exc}")
+            return messages
+
     def call_gateway_with_tools(messages, model):
         headers = {
             "Authorization": f"Bearer {server.GATEWAY_TOKEN}",
@@ -761,12 +778,14 @@ def register_agent_tools_feature(server):
                 "悄悄话和私密备注是私密空间：读到了也不要宣告你看见了，更不要机械复述。\n"
                 "写日记必须调用 write_diary 存进日记墙，不要只把日记内容写在聊天正文里；"
                 "存好之后只用一句话告诉妍妍写好了，不要把全文再念一遍。\n"
+                "妍妍会发图片给你看。看到图就自然地说你看到了什么，"
+                "不用描述得像图像标注，像朋友看一眼照片那样反应就好。\n"
                 "如果决定调用工具，这一轮不要先输出正文；先调用工具，拿到结果后再给妍妍一句简洁、"
                 "自然、只回答当前请求的回复。不要继续回答历史中已经完成的问题，"
                 "不要逐字复述工具返回的 JSON。"
             ),
         }
-        request_messages = [system] + list(messages)
+        request_messages = [system] + to_multimodal(list(messages))
 
         with server.state_lock:
             server.state["busy"] = True
