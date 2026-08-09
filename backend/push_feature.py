@@ -13,15 +13,19 @@
 * 同时支持两条订阅入口：上游设置页里的「手机通知」开关，
   以及本模块自带的面板 /push。两者写进同一张表。
 
-上游那条路要求接口长成它期待的样子（见 web/index.html 与
-05-推送 那篇文档）：
+私钥不以字符串形式交给 pywebpush。它会先 os.path.isfile 再走
+py_vapid 的字符串分支，而那条分支对 PKCS8 PEM 的处理会抛
+「Could not deserialize key data」。这里自己 load 成密钥对象再包成
+Vapid 实例传进去，pywebpush 对实例是直接采用的，不做任何解析。
+
+上游那条订阅路径要求接口长成它期待的样子（见 web/index.html）：
     GET  api/pushkey  → {key: "<base64url 公钥>"}
     POST api/subscribe ← 订阅 JSON
 它拿到 key 后直接 atob(key.replace(/-/g,'+').replace(/_/g,'/'))，
-中间不补 padding。Safari 的 atob 对长度不是 4 的倍数的输入会抛
-InvalidCharacterError: The string did not match the expected pattern.
-未压缩 P-256 公钥是 65 字节，base64url 去掉 padding 正好是 87 字符，
-87 % 4 == 3，必然触发这个错误。所以这里返回带 padding 的公钥。
+中间不补 padding。未压缩 P-256 公钥 65 字节，base64url 去 padding
+是 87 字符，87 % 4 == 3，Safari 的 atob 必然抛
+「The string did not match the expected pattern.」
+所以这两条接口返回带 padding 的公钥。
 
 两道前提，顺序不能颠倒：
 1. HTTPS。非安全上下文下浏览器压根不暴露 PushManager，
@@ -40,6 +44,10 @@ from flask import Response, jsonify, request
 KEY_VAPID_PRIVATE = "push_vapid_private_pem"
 KEY_VAPID_PUBLIC = "push_vapid_public_b64"
 KEY_CONTACT = "push_contact"
+
+# VAPID 的 sub 声明。推送服务要求是 mailto: 或 https: 形式，
+# 苹果对格式不合法的会直接回 400。可在 settings 里改成真实邮箱。
+DEFAULT_CONTACT = "mailto:dwell@yanyan081217.buzz"
 
 # 通知正文上限。锁屏上会直接显示，不宜过长。
 MAX_BODY_CHARS = 80
@@ -84,6 +92,33 @@ def _generate_vapid_keys():
         format=serialization.PublicFormat.UncompressedPoint,
     )
     return pem, _b64url_nopad(public_point)
+
+
+def _build_vapid(private_pem: str):
+    """把 PEM 私钥变成 py_vapid 实例。
+
+    pywebpush 只在参数不是 Vapid 实例时才去猜字符串格式，
+    传实例可以完全绕开那段解析。
+    """
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(private_pem.encode("ascii"), password=None)
+
+    # py_vapid 的类名随版本变过，按可用性挑一个。
+    import py_vapid
+
+    for name in ("Vapid02", "Vapid01", "Vapid"):
+        cls = getattr(py_vapid, name, None)
+        if cls is None:
+            continue
+        try:
+            return cls(private_key=key)
+        except TypeError:
+            instance = cls()
+            instance.private_key = key
+            return instance
+
+    raise RuntimeError("py_vapid 里找不到可用的 Vapid 类")
 
 
 SERVICE_WORKER = """/* dwell service worker：只做推送展示和点击跳转，不碰缓存。
@@ -351,7 +386,7 @@ $('btn-test').onclick = async () => {
     const d = await (await fetch('/api/push/test', { cache: 'no-store' })).json();
     log(d.ok
       ? '已发往 ' + d.sent + ' 台设备。锁屏或下拉通知看看。'
-      : '没发出去：' + (d.error || JSON.stringify(d)));
+      : '没发出去：' + (d.error || (d.errors || []).join(' / ') || JSON.stringify(d)));
   } catch (e) {
     log('失败：' + e.message);
   }
@@ -440,6 +475,18 @@ def register_push_feature(server_module):
         # cryptography 缺失等极端情况：不要让整个后端起不来。
         print(f"[dwell] VAPID 密钥生成失败，推送不可用: {exc}")
 
+    # Vapid 实例可复用，构造一次缓存起来。
+    vapid_cache = {}
+
+    def vapid_instance():
+        private_pem = read(KEY_VAPID_PRIVATE)
+        if not private_pem:
+            return None
+        if vapid_cache.get("pem") != private_pem:
+            vapid_cache["pem"] = private_pem
+            vapid_cache["obj"] = _build_vapid(private_pem)
+        return vapid_cache["obj"]
+
     def public_key_padded():
         return _pad_b64(read(KEY_VAPID_PUBLIC))
 
@@ -463,8 +510,11 @@ def register_push_feature(server_module):
         except ImportError:
             return {"ok": False, "error": "未安装 pywebpush，运行 pip3 install pywebpush"}
 
-        private_pem = read(KEY_VAPID_PRIVATE)
-        if not private_pem:
+        try:
+            vapid = vapid_instance()
+        except Exception as exc:
+            return {"ok": False, "error": f"VAPID 私钥加载失败: {exc}"}
+        if vapid is None:
             return {"ok": False, "error": "VAPID 密钥缺失"}
 
         targets = subscriptions()
@@ -478,7 +528,7 @@ def register_push_feature(server_module):
             "tag": tag,
         }, ensure_ascii=False)
 
-        claims = {"sub": read(KEY_CONTACT, "mailto:dwell@localhost")}
+        contact = read(KEY_CONTACT, DEFAULT_CONTACT) or DEFAULT_CONTACT
         sent, removed, errors = 0, 0, []
 
         for row in targets:
@@ -490,8 +540,9 @@ def register_push_feature(server_module):
                 webpush(
                     subscription_info=info,
                     data=payload,
-                    vapid_private_key=private_pem,
-                    vapid_claims=dict(claims),
+                    vapid_private_key=vapid,
+                    # 每次传新 dict：pywebpush 会往里塞 aud/exp，复用会串。
+                    vapid_claims={"sub": contact},
                     timeout=15,
                 )
             except WebPushException as exc:
@@ -500,7 +551,7 @@ def register_push_feature(server_module):
                     drop_subscription(row["endpoint"])
                     removed += 1
                 else:
-                    errors.append(f"{status or '?'}: {str(exc)[:120]}")
+                    errors.append(f"{status or '?'}: {str(exc)[:160]}")
                     with get_db() as db:
                         db.execute(
                             "UPDATE push_subscriptions SET fails=fails+1 WHERE id=?",
@@ -508,7 +559,7 @@ def register_push_feature(server_module):
                         )
                 continue
             except Exception as exc:
-                errors.append(str(exc)[:120])
+                errors.append(f"{type(exc).__name__}: {str(exc)[:160]}")
                 continue
 
             sent += 1
@@ -546,7 +597,7 @@ def register_push_feature(server_module):
     def api_pushkey_upstream():
         """上游设置页里「手机通知」开关用的接口。
 
-        它读 d.key 并直接 atob，不补 padding，所以这里必须返回带 padding 的值。
+        它读 d.key 并直接 atob，不补 padding，所以必须返回带 padding 的值。
         配套文档里读的是 key.pub，两种字段都给上。
         """
         public_b64 = public_key_padded()
@@ -598,6 +649,12 @@ def register_push_feature(server_module):
         except ImportError:
             library = False
 
+        key_ok, key_error = False, ""
+        try:
+            key_ok = vapid_instance() is not None
+        except Exception as exc:
+            key_error = f"{type(exc).__name__}: {exc}"
+
         with get_db() as db:
             rows = db.execute(
                 "SELECT endpoint,agent,created,last_ok,fails "
@@ -608,6 +665,9 @@ def register_push_feature(server_module):
             "ok": True,
             "library_installed": library,
             "has_keys": bool(read(KEY_VAPID_PUBLIC)),
+            "key_loadable": key_ok,
+            "key_error": key_error,
+            "contact": read(KEY_CONTACT, DEFAULT_CONTACT),
             "count": len(rows),
             "devices": [
                 {
