@@ -55,7 +55,7 @@ BRIEF_HELPER = (
 # ICONS 表的锚点，上游第一条。
 ICONS_ANCHOR = "const ICONS = {\n"
 
-# cpu 不在上游那张表里，补一个 feather 风格的。
+# cpu 不在上游那张表里，补一个 feather 风格的（侧边栏「模型」用）。
 EXTRA_ICONS = (
     "  cpu: S('<rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\"/>"
     "<rect x=\"9\" y=\"9\" width=\"6\" height=\"6\"/>"
@@ -67,35 +67,21 @@ EXTRA_ICONS = (
     "<line x1=\"20\" y1=\"14\" x2=\"23\" y2=\"14\"/>"
     "<line x1=\"1\" y1=\"9\" x2=\"4\" y2=\"9\"/>"
     "<line x1=\"1\" y1=\"14\" x2=\"4\" y2=\"14\"/>'),\n"
-    "  paperclip: S('<path d=\"M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19"
-    "a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48\"/>'),\n"
 )
 
-# 上传按钮的样式。上游 .ic 没有全局宽高（只在 .toolline .ic 之类的场景里
-# 单独写过），动态插进去的 SVG 会按父容器铺满——之前那个回形针占了半屏。
-# 这里给按钮和它内部的 svg 都写死尺寸，不依赖上游任何 class。
-UPLOAD_STYLE = """
-<style>
-  #dwellPickBtn {
-    width: 34px; height: 34px; padding: 0; margin: 0;
-    display: inline-flex; align-items: center; justify-content: center;
-    flex: 0 0 auto; border: 0; background: transparent;
-    color: var(--dim); cursor: pointer; border-radius: 50%;
-    -webkit-tap-highlight-color: transparent;
-  }
-  #dwellPickBtn:active { background: rgba(0, 0, 0, .06); }
-  #dwellPickBtn .ic {
-    width: 19px; height: 19px; display: block;
-    flex: 0 0 auto; line-height: 0;
-  }
-  #dwellPickBtn .ic svg { width: 19px; height: 19px; display: block; }
-  #dwellUploadHint {
-    color: var(--dim); font-size: 12.5px; align-self: center;
-    flex: 0 1 auto; min-width: 0; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap;
-  }
-</style>
-"""
+# 上游的图片正则写死了 https?:// 前缀，只认绝对地址。
+# 我们存进消息的是 ![](/media/2026-08/xxx.jpg)，相对路径匹配不上，
+# 于是在气泡里原样显示成一串「乱码」。这里让它也认站内相对路径，
+# 不写死域名——从 IP 访问还是从 HTTPS 域名访问都能显示。
+IMG_RE_ORIGINAL = (
+    "const IMG_RE = /!\\[[^\\]]*\\]\\((https?:\\/\\/[^\\s)]+)\\)"
+    "|(https?:\\/\\/[^\\s\"'<>]+?\\.(?:png|jpe?g|gif|webp)(?:\\?[^\\s\"'<>]*)?)/gi;"
+)
+IMG_RE_PATCHED = (
+    "const IMG_RE = /!\\[[^\\]]*\\]\\(((?:https?:\\/\\/|\\/)[^\\s)]+)\\)"
+    "|(https?:\\/\\/[^\\s\"'<>]+?\\.(?:png|jpe?g|gif|webp)(?:\\?[^\\s\"'<>]*)?)"
+    "|(\\/media\\/[^\\s\"'<>)]+?\\.(?:png|jpe?g|gif|webp))/gi;"
+)
 
 # 侧边栏锚点：上游的「日记」按钮。
 NAV_WALL_BUTTON = (
@@ -116,7 +102,7 @@ NAV_EXTRA_BUTTONS = (
       '<span class="ic" data-i="cpu"></span>模型</button>'
 )
 
-# 旧版本插过的按钮组合，用于重新构建时先还原。
+# 历史版本插过的按钮组合，重新构建时先还原成原始按钮。
 NAV_LEGACY_VARIANTS = (
     NAV_WALL_BUTTON
     + '\n      <button class="item" id="navWhisper">'
@@ -125,6 +111,11 @@ NAV_LEGACY_VARIANTS = (
       '<span class="ic" data-i="bell"></span>通知</button>'
     + '\n      <button class="item" id="navModels">'
       '<span class="ic" data-i="box"></span>模型</button>',
+    NAV_WALL_BUTTON
+    + '\n      <button class="item" id="navWhisper">'
+      '<span class="ic" data-i="note"></span>悄悄话</button>'
+    + '\n      <button class="item" id="navPush">'
+      '<span class="ic" data-i="bell"></span>通知</button>',
 )
 
 NAV_WALL_HANDLER = (
@@ -139,143 +130,6 @@ NAV_EXTRA_HANDLERS = (
     + "\ndocument.getElementById('navPush').onclick = () => { location.href = '/push'; };"
     + "\ndocument.getElementById('navModels').onclick = () => { location.href = '/models'; };"
 )
-
-# 图片上传。刻意不改上游的发送逻辑：上传完把 markdown 插进输入框，
-# 剩下的交给原有的发送流程，图片就跟着文字一起走 /api/send。
-UPLOAD_SCRIPT = """
-<script>
-(function () {
-  const MAX_EDGE = 1600;      // 长边上限
-  const QUALITY = 0.8;        // JPEG 质量
-  const SKIP_UNDER = 300000;  // 小于这个就不压了，省得白转一遍
-
-  function findComposer() {
-    return document.querySelector('#composer textarea')
-      || document.querySelector('textarea#input')
-      || document.querySelector('form textarea')
-      || document.querySelector('textarea');
-  }
-
-  // iPhone 原图四五兆，1.6G 内存的机器连传几张就可能 OOM。
-  async function shrink(file) {
-    if (!/^image\\//.test(file.type)) return null;
-    if (file.type === 'image/gif') return file;   // 动图压了就不动了
-    if (file.size <= SKIP_UNDER) return file;
-
-    const bitmap = await createImageBitmap(file).catch(() => null);
-    if (!bitmap) return file;
-
-    const scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height));
-    if (scale >= 1 && file.size <= 2000000) return file;
-
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.round(bitmap.width * scale);
-    canvas.height = Math.round(bitmap.height * scale);
-    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    bitmap.close && bitmap.close();
-
-    const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', QUALITY));
-    if (!blob || blob.size >= file.size) return file;
-    return new File([blob], 'photo.jpg', { type: 'image/jpeg' });
-  }
-
-  async function upload(file) {
-    const small = await shrink(file);
-    if (!small) return null;
-    const form = new FormData();
-    form.append('file', small, small.name || 'photo.jpg');
-    const resp = await (await fetch('/api/upload', { method: 'POST', body: form })).json();
-    if (!resp.ok) throw new Error(resp.error || '上传失败');
-    return resp;
-  }
-
-  async function handle(files) {
-    const box = findComposer();
-    if (!box) return;
-    const images = [...files].filter((f) => /^image\\//.test(f.type));
-    if (!images.length) return;
-
-    const mark = document.getElementById('dwellUploadHint');
-    if (mark) mark.textContent = '上传中…';
-
-    for (const file of images) {
-      try {
-        const r = await upload(file);
-        if (!r) continue;
-        box.value = (box.value ? box.value.replace(/\\s*$/, '') + '\\n' : '') + r.markdown + '\\n';
-        box.dispatchEvent(new Event('input', { bubbles: true }));
-      } catch (e) {
-        if (mark) mark.textContent = '失败：' + e.message;
-        return;
-      }
-    }
-    if (mark) mark.textContent = '';
-    box.focus();
-  }
-
-  function mount() {
-    const box = findComposer();
-    if (!box || document.getElementById('dwellPick')) return;
-
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*';
-    input.multiple = true;
-    input.id = 'dwellPick';
-    input.style.display = 'none';
-    input.onchange = () => { handle(input.files); input.value = ''; };
-
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.id = 'dwellPickBtn';
-    btn.title = '发图片';
-    btn.setAttribute('aria-label', '发图片');
-    // 尺寸全部交给 UPLOAD_STYLE 里的 #dwellPickBtn 规则，
-    // 不写 inline style，免得跟那边打架。
-    btn.innerHTML = '<span class="ic"></span>';
-    btn.onclick = () => input.click();
-
-    const hint = document.createElement('span');
-    hint.id = 'dwellUploadHint';
-
-    const bar = box.parentElement;
-    bar.appendChild(input);
-    bar.appendChild(btn);
-    bar.appendChild(hint);
-
-    // 上游的图标是启动时按 data-i 统一填充的，动态加的这个要自己画。
-    // 拿不到 ICONS 就退回一个纯文本回形针，总比空白好。
-    const slot = btn.querySelector('.ic');
-    if (window.ICONS && window.ICONS.paperclip) {
-      slot.innerHTML = window.ICONS.paperclip;
-    } else {
-      slot.textContent = '\\uD83D\\uDCCE';
-    }
-
-    // 粘贴和拖拽都接上，手机上主要用选择器，桌面上这两个更顺手。
-    box.addEventListener('paste', (ev) => {
-      const files = ev.clipboardData && ev.clipboardData.files;
-      if (files && files.length) { ev.preventDefault(); handle(files); }
-    });
-    ['dragover', 'drop'].forEach((type) => {
-      box.addEventListener(type, (ev) => {
-        ev.preventDefault();
-        if (type === 'drop' && ev.dataTransfer) handle(ev.dataTransfer.files);
-      });
-    });
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', mount);
-  } else {
-    mount();
-  }
-  // 上游有些界面是后建的，兜底再试几次。
-  setTimeout(mount, 800);
-  setTimeout(mount, 2500);
-})();
-</script>
-"""
 
 
 def _git_version(repo_root: Path) -> str:
@@ -354,17 +208,21 @@ def _apply_personalization(html: str) -> str:
 
 
 def _patch_icons(html: str) -> str:
-    """往 ICONS 表里补几个上游没有的图标，并把表挂到 window 上。"""
+    """往 ICONS 表里补上游没有的图标。"""
     if "  cpu: S(" not in html:
         html = html.replace(ICONS_ANCHOR, ICONS_ANCHOR + EXTRA_ICONS, 1)
-    if "window.ICONS = ICONS;" not in html:
-        # 动态添加的按钮要能自己取图标，所以暴露出来。
-        html = html.replace(
-            "\nfunction basename(p)",
-            "\nwindow.ICONS = ICONS;\nfunction basename(p)",
-            1,
-        )
     return html
+
+
+def _patch_images(html: str) -> str:
+    """让 IMG_RE 认站内相对路径。
+
+    上游只认 https?:// 开头的绝对地址，我们存的 /media/... 匹配不上，
+    气泡里会原样显示成 ![](/media/…) 这一串字符。
+    """
+    if "/media/" in html and "(?:https?:\\/\\/|\\/)" in html:
+        return html
+    return html.replace(IMG_RE_ORIGINAL, IMG_RE_PATCHED, 1)
 
 
 def _patch_tool_labels(html: str) -> str:
@@ -397,17 +255,8 @@ def _patch_nav(html: str) -> str:
     )
 
     if NAV_EXTRA_BUTTONS not in html:
-        # 先把历史版本的按钮组合还原成原始按钮，再统一插入当前版本。
         for legacy in NAV_LEGACY_VARIANTS:
             html = html.replace(legacy, NAV_WALL_BUTTON)
-        html = html.replace(
-            NAV_WALL_BUTTON
-            + '\n      <button class="item" id="navWhisper">'
-              '<span class="ic" data-i="note"></span>悄悄话</button>'
-            + '\n      <button class="item" id="navPush">'
-              '<span class="ic" data-i="bell"></span>通知</button>',
-            NAV_WALL_BUTTON,
-        )
         html = html.replace(NAV_WALL_BUTTON, NAV_EXTRA_BUTTONS, 1)
 
     if "getElementById('navModels')" not in html:
@@ -424,7 +273,7 @@ def _patch_nav(html: str) -> str:
 
 
 def _patch_head(html: str, icon_links: str) -> str:
-    """补 PWA 清单、图标、主屏标题和上传按钮样式。
+    """补 PWA 清单、图标和主屏标题。
 
     清单是 iOS 的硬性前提：只有「添加到主屏幕」之后才允许申请通知权限。
     apple-mobile-web-app-title 决定主屏图标下面显示的名字，同时也是
@@ -442,8 +291,6 @@ def _patch_head(html: str, icon_links: str) -> str:
         )
     if icon_links and "apple-touch-icon" not in html:
         head_bits.append(icon_links.rstrip("\n"))
-    if "#dwellPickBtn" not in html:
-        head_bits.append(UPLOAD_STYLE.strip())
 
     if head_bits:
         html = html.replace("</head>", "\n".join(head_bits) + "\n</head>", 1)
@@ -451,16 +298,9 @@ def _patch_head(html: str, icon_links: str) -> str:
 
 
 def _patch_tail(html: str, push_script: str) -> str:
-    """把推送和图片上传脚本放进页面末尾。"""
-    bits = []
+    """把推送脚本放进页面末尾。"""
     if push_script and "window.dwellPush" not in html:
-        bits.append(push_script)
-    if "dwellPickBtn" not in html or "#dwellPickBtn" in html:
-        # 只有样式没有脚本时也要补上脚本；两者的判据不能共用同一个串。
-        if "getElementById('dwellPick')" not in html:
-            bits.append(UPLOAD_SCRIPT)
-    if bits:
-        html = html.replace("</body>", "".join(bits) + "</body>", 1)
+        html = html.replace("</body>", push_script + "</body>", 1)
     return html
 
 
@@ -502,6 +342,7 @@ def _build_frontend(source: Path, push_script: str = "", icon_links: str = "") -
     )
 
     html = _patch_icons(html)
+    html = _patch_images(html)
     html = _patch_tool_labels(html)
     html = _patch_head(html, icon_links)
     html = _patch_tail(html, push_script)
@@ -565,11 +406,10 @@ def register_frontend_feature(server_module):
                 "tool_result": "m.result || ''" in built,
                 "tool_labels": "case 'write_diary'" in built,
                 "verbof_anchor_found": VERBOF_ANCHOR in source_text,
+                "img_re_patched": "(?:https?:\\/\\/|\\/)" in built,
+                "img_re_anchor_found": IMG_RE_ORIGINAL in source_text,
                 "push_script": "window.dwellPush" in built,
-                "upload_script": "getElementById('dwellPick')" in built,
-                "upload_style": "#dwellPickBtn" in built,
                 "cpu_icon": "  cpu: S(" in built,
-                "icons_exposed": "window.ICONS = ICONS;" in built,
                 "manifest_link": 'rel="manifest"' in built,
                 "apple_icon": "apple-touch-icon" in built,
                 "push_nav": 'id="navPush"' in built,
