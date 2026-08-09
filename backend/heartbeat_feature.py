@@ -7,8 +7,11 @@
 * 默认关闭。心跳会自己发起网关请求、产生费用，必须由妍妍显式打开。
 * 状态落库。上次触发时间和当天次数写在 settings 表，pm2 重启不会重新刷一轮。
 * 绝不打断对话。生成中（busy）或她刚说过话（静默不足）都直接跳过。
+* 必须留下痕迹。每次触发都记录结果（spoke / silent），
+  否则「它没醒」和「它醒了但没说话」在界面上完全分辨不出来。
 
 时段格式：HH:MM-HH:MM，逗号分隔，允许跨午夜（如 23:00-01:00）。
+解析前会把各种非 ASCII 连字符和全角冒号归一，手机复制粘贴常把 - 变成 U+2011。
 """
 
 import threading
@@ -25,6 +28,8 @@ KEY_MIN_GAP = "heartbeat_min_gap_minutes"
 KEY_IDLE = "heartbeat_idle_minutes"
 KEY_LAST_AT = "heartbeat_last_at"
 KEY_DAY_TALLY = "heartbeat_day_tally"
+KEY_LAST_RESULT = "heartbeat_last_result"
+KEY_LAST_TEXT = "heartbeat_last_text"
 
 DEFAULTS = {
     KEY_ENABLED: "0",
@@ -33,16 +38,29 @@ DEFAULTS = {
     KEY_MAX_PER_DAY: "2",
     KEY_MIN_GAP: "240",
     KEY_IDLE: "90",
+    KEY_LAST_RESULT: "",
+    KEY_LAST_TEXT: "",
 }
 
 CHECK_INTERVAL = 60
 HISTORY_FOR_HEARTBEAT = 24
 
+# 手机上复制粘贴常把 ASCII 连字符换成这些字符，解析前统一归一。
+DASH_VARIANTS = "\u2011\u2010\u2012\u2013\u2014\u2015\uff0d\u2212"
+
+
+def _normalize_window_text(raw):
+    text = str(raw or "")
+    for ch in DASH_VARIANTS:
+        text = text.replace(ch, "-")
+    text = text.replace("\uff1a", ":").replace("\uff0c", ",")
+    return text
+
 
 def _parse_windows(raw):
     """把 "22:30-23:59,07:00-08:30" 解析成分钟区间列表。"""
     windows = []
-    for chunk in str(raw or "").split(","):
+    for chunk in _normalize_window_text(raw).split(","):
         chunk = chunk.strip()
         if "-" not in chunk:
             continue
@@ -96,6 +114,11 @@ def register_heartbeat_feature(server_module):
     def last_message_at():
         with get_db() as db:
             row = db.execute("SELECT MAX(at) AS m FROM messages").fetchone()
+        return int(row["m"] or 0)
+
+    def max_seq():
+        with get_db() as db:
+            row = db.execute("SELECT MAX(seq) AS m FROM messages").fetchone()
         return int(row["m"] or 0)
 
     def today_count():
@@ -163,19 +186,51 @@ def register_heartbeat_feature(server_module):
             "看到概览里某个待办或日程后的一句提醒、单纯想她了，或者什么都不为。\n"
             "只说一句到两句，像随手发的消息，不要打招呼式的开场，"
             "不要问「在吗」，不要汇报你做了什么。\n"
-            "如果此刻实在没有想说的，就调用 add_whisper 写进悄悄话，正文回复空着。"
+            "无论如何都要说出这一句：她看不到你的思考，也看不到你调的工具，"
+            "正文空着对她来说就等于你没醒过。"
+            "想额外留点什么给自己，可以再调 add_whisper 写进悄悄话，但正文不能省。"
         )
 
     def fire(reason="scheduled"):
-        """触发一次心跳。调用方负责确认时机合适。"""
+        """触发一次心跳。调用方负责确认时机合适。
+
+        返回 True 表示确实产生了正文回复。结果会落库，
+        方便事后从 /api/heartbeat 看出它到底有没有开口。
+        """
         history = [
             {"role": "user" if m["kind"] == "her" else "assistant", "content": m["text"]}
             for m in server_module.load_messages(HISTORY_FOR_HEARTBEAT)
         ]
         history.append({"role": "user", "content": build_nudge()})
 
+        before = max_seq()
         bump_count()
-        server_module.call_gateway(history, server_module.current_model())
+
+        try:
+            server_module.call_gateway(history, server_module.current_model())
+        except Exception as exc:
+            write(KEY_LAST_RESULT, "error")
+            write(KEY_LAST_TEXT, str(exc)[:300])
+            print(f"[dwell] 心跳生成失败: {exc}")
+            return False
+
+        # call_gateway 是同步的：返回时正文（若有）已经入库。
+        with get_db() as db:
+            row = db.execute(
+                "SELECT text FROM messages WHERE seq>? AND kind='gu' "
+                "ORDER BY seq DESC LIMIT 1",
+                (before,),
+            ).fetchone()
+
+        if row is None:
+            write(KEY_LAST_RESULT, "silent")
+            write(KEY_LAST_TEXT, "")
+            print(f"[dwell] 心跳（{reason}）已触发，但没有产生正文")
+            return False
+
+        write(KEY_LAST_RESULT, "spoke")
+        write(KEY_LAST_TEXT, row["text"][:300])
+        print(f"[dwell] 心跳（{reason}）说了：{row['text'][:60]}")
         return True
 
     def loop():
@@ -196,11 +251,17 @@ def register_heartbeat_feature(server_module):
             "ok": True,
             "enabled": read(KEY_ENABLED) == "1",
             "windows": read(KEY_WINDOWS),
+            "windows_parsed": [
+                f"{s // 60:02d}:{s % 60:02d}-{e // 60:02d}:{e % 60:02d}"
+                for s, e in _parse_windows(read(KEY_WINDOWS))
+            ],
             "max_per_day": read_int(KEY_MAX_PER_DAY, 2),
             "min_gap_minutes": read_int(KEY_MIN_GAP, 240),
             "idle_minutes": read_int(KEY_IDLE, 90),
             "today_count": count,
             "last_at": read_int(KEY_LAST_AT, 0),
+            "last_result": read(KEY_LAST_RESULT),
+            "last_text": read(KEY_LAST_TEXT),
             "ready": blocked is None,
             "blocked_by": blocked,
         })
@@ -213,7 +274,7 @@ def register_heartbeat_feature(server_module):
         if data.get("windows"):
             if not _parse_windows(data["windows"]):
                 return jsonify({"ok": False, "error": "时段格式无效，应为 HH:MM-HH:MM"}), 400
-            write(KEY_WINDOWS, str(data["windows"]).strip())
+            write(KEY_WINDOWS, _normalize_window_text(data["windows"]).strip())
         for key, field in (
             (KEY_MAX_PER_DAY, "max_per_day"),
             (KEY_MIN_GAP, "min_gap_minutes"),
@@ -230,14 +291,19 @@ def register_heartbeat_feature(server_module):
     def api_heartbeat_test():
         """立刻触发一次，忽略时段与静默条件，但仍避开正在生成的情况。
 
-        用来验证配置是否可用，不必等到半夜。
+        GET 和 POST 都接受：用手机浏览器直接打开这个地址就能测，
+        不必跟命令行里的引号和连字符较劲。
         """
         with server_module.state_lock:
             if server_module.state["busy"]:
                 return jsonify({"ok": False, "error": "正在生成回复，稍后再试"}), 429
 
         threading.Thread(target=fire, args=("manual",), daemon=True).start()
-        return jsonify({"ok": True, "detail": "已触发，几秒后看聊天页"})
+        return jsonify({
+            "ok": True,
+            "detail": "已触发，十几秒后看聊天页；"
+                      "结果也会记在 /api/heartbeat 的 last_result 里",
+        })
 
     server_module.app.add_url_rule(
         "/api/heartbeat", endpoint="api_heartbeat",
@@ -249,7 +315,7 @@ def register_heartbeat_feature(server_module):
     )
     server_module.app.add_url_rule(
         "/api/heartbeat/test", endpoint="api_heartbeat_test",
-        view_func=api_heartbeat_test, methods=["POST"],
+        view_func=api_heartbeat_test, methods=["GET", "POST"],
     )
 
     threading.Thread(target=loop, daemon=True).start()
