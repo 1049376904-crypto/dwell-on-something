@@ -16,6 +16,7 @@ from repo_feature import register_repo_feature
 from event_stream_feature import register_event_stream_feature
 from transcript_feature import register_transcript_feature
 from agent_tools_feature import register_agent_tools_feature
+from heartbeat_feature import register_heartbeat_feature
 
 
 register_compat(server)
@@ -35,6 +36,8 @@ register_event_stream_feature(server)
 # 注册，后者依赖 server.save_transcript。
 register_transcript_feature(server)
 register_agent_tools_feature(server)
+# 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具的那一版。
+register_heartbeat_feature(server)
 
 
 if __name__ == "__main__":
@@ -49,4 +52,5 @@ if __name__ == "__main__":
     print("  events  : 可重放游标队列")
     print("  history : 思考与工具调用持久化重放")
     print("  config  : 设置 → 接入 API（地址/令牌/模型名）")
+    print("  beat    : /api/heartbeat（默认关闭）")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
