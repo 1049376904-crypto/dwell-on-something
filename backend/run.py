@@ -20,6 +20,7 @@ from repo_feature import register_repo_feature
 from event_stream_feature import register_event_stream_feature
 from transcript_feature import register_transcript_feature
 from agent_tools_feature import register_agent_tools_feature
+from sticker_feature import register_sticker_feature
 from heartbeat_feature import register_heartbeat_feature
 
 
@@ -48,6 +49,9 @@ register_event_stream_feature(server)
 # 注册，后者依赖 server.save_transcript。
 register_transcript_feature(server)
 register_agent_tools_feature(server)
+# 表情包在 agent_tools 之后：它要往 agent_tools 的 TOOLS 里追两条工具，
+# 并包住 execute_tool 和 build_context_snapshot。
+register_sticker_feature(server)
 # 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具的那一版，
 # 同时依赖 server.send_push 把主动说的话推到锁屏。
 register_heartbeat_feature(server)
@@ -61,7 +65,7 @@ if __name__ == "__main__":
     print(f"  db      : {db_path}")
     print("  frontend: ../web/index.html（动态读取，无需复制）")
     print("  modules : 聊天 / 待办 / 日历 / 悄悄话 / 日记 / 仓库")
-    print("  tools   : 待办 / 日历 / 悄悄话 / 日记 / 摘录")
+    print("  tools   : 待办 / 日历 / 悄悄话 / 日记 / 摘录 / 表情")
     print("  events  : 可重放游标队列")
     print("  history : 思考与工具调用持久化重放")
     print("  config  : 设置 → 接入 API（地址/令牌/模型名）")
@@ -69,5 +73,6 @@ if __name__ == "__main__":
     print("  push    : /push 面板（iOS 需 HTTPS + 添加到主屏幕）")
     print("  models  : /models 面板")
     print("  media   : /api/upload，图片存 data/uploads")
+    print("  sticker : /stickers 面板，原图存 data/stickers")
     print("  icon    : /api/icon/status")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)

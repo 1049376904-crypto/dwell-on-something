@@ -25,7 +25,7 @@ VERBOF_ANCHOR = (
 )
 
 # 自建工具的词条。沿用上游风格：图标名 + 英文动词 + 对象。
-# 动词过去式、对象取具体内容，扫一眼就知道沐刚做了什么。
+# 动词过去式、对象取具体内容，扭一眼就知道沐刚做了什么。
 OUR_VERBS = """    case 'write_diary':           return ['pen', 'Wrote', brief(input.title || input.text)];
     case 'list_diary_entries':    return ['bookOpen', 'Read', 'the diary'];
     case 'delete_diary_entry':    return ['fileText', 'Removed', 'a diary entry'];
@@ -43,6 +43,8 @@ OUR_VERBS = """    case 'write_diary':           return ['pen', 'Wrote', brief(i
     case 'read_day_records':      return ['bookOpen', 'Read', 'her notes'];
     case 'add_whisper':           return ['note', 'Whispered', brief(input.text)];
     case 'read_whispers':         return ['bookOpen', 'Read', 'the whispers'];
+    case 'send_sticker':          return ['smile', 'Sent', brief(input.name)];
+    case 'list_stickers':         return ['smile', 'Looked', 'through the stickers'];
 """
 
 # brief 用来压掉换行、限长，避免日记正文把整行撑开。
@@ -55,7 +57,8 @@ BRIEF_HELPER = (
 # ICONS 表的锚点，上游第一条。
 ICONS_ANCHOR = "const ICONS = {\n"
 
-# cpu 不在上游那张表里，补一个 feather 风格的（侧边栏「模型」用）。
+# cpu 和 smile 不在上游那张表里，补两个 feather 风格的：
+# cpu 给侧边栏「模型」，smile 给「表情」和工具卡片。
 EXTRA_ICONS = (
     "  cpu: S('<rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\"/>"
     "<rect x=\"9\" y=\"9\" width=\"6\" height=\"6\"/>"
@@ -67,12 +70,17 @@ EXTRA_ICONS = (
     "<line x1=\"20\" y1=\"14\" x2=\"23\" y2=\"14\"/>"
     "<line x1=\"1\" y1=\"9\" x2=\"4\" y2=\"9\"/>"
     "<line x1=\"1\" y1=\"14\" x2=\"4\" y2=\"14\"/>'),\n"
+    "  smile: S('<circle cx=\"12\" cy=\"12\" r=\"9\"/>"
+    "<path d=\"M8.5 14.3c.9 1.1 2.1 1.7 3.5 1.7s2.6-.6 3.5-1.7\"/>"
+    "<line x1=\"9\" y1=\"9.6\" x2=\"9\" y2=\"9.9\"/>"
+    "<line x1=\"15\" y1=\"9.6\" x2=\"15\" y2=\"9.9\"/>'),\n"
 )
 
 # 上游的图片正则写死了 https?:// 前缀，只认绝对地址。
 # 我们存进消息的是 ![](/media/2026-08/xxx.jpg)，相对路径匹配不上，
 # 于是在气泡里原样显示成一串「乱码」。这里让它也认站内相对路径，
 # 不写死域名——从 IP 访问还是从 HTTPS 域名访问都能显示。
+# 表情包的 /sticker/… 走的也是这条。
 IMG_RE_ORIGINAL = (
     "const IMG_RE = /!\\[[^\\]]*\\]\\((https?:\\/\\/[^\\s)]+)\\)"
     "|(https?:\\/\\/[^\\s\"'<>]+?\\.(?:png|jpe?g|gif|webp)(?:\\?[^\\s\"'<>]*)?)/gi;"
@@ -170,33 +178,38 @@ NAV_WALL_BUTTON = (
     '<span class="ic" data-i="pen"></span>日记</button>'
 )
 
-# 悄悄话、通知、模型三个入口。都用 button 而不是 a：
+# 悄悄话、通知、模型、表情四个入口。都用 button 而不是 a：
 # 上游 .item 的样式是给 button 写的，用 <a> 会吃到全局链接色，
 # 在侧边栏里显示成一行蓝色带下划线的字，跟旁边几项完全不搭。
+NAV_BTN_WHISPER = (
+    '\n      <button class="item" id="navWhisper">'
+    '<span class="ic" data-i="note"></span>悄悄话</button>'
+)
+NAV_BTN_PUSH = (
+    '\n      <button class="item" id="navPush">'
+    '<span class="ic" data-i="bell"></span>通知</button>'
+)
+NAV_BTN_MODELS = (
+    '\n      <button class="item" id="navModels">'
+    '<span class="ic" data-i="cpu"></span>模型</button>'
+)
+NAV_BTN_STICKERS = (
+    '\n      <button class="item" id="navStickers">'
+    '<span class="ic" data-i="smile"></span>表情</button>'
+)
+
 NAV_EXTRA_BUTTONS = (
-    NAV_WALL_BUTTON
-    + '\n      <button class="item" id="navWhisper">'
-      '<span class="ic" data-i="note"></span>悄悄话</button>'
-    + '\n      <button class="item" id="navPush">'
-      '<span class="ic" data-i="bell"></span>通知</button>'
-    + '\n      <button class="item" id="navModels">'
-      '<span class="ic" data-i="cpu"></span>模型</button>'
+    NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH + NAV_BTN_MODELS + NAV_BTN_STICKERS
 )
 
 # 历史版本插过的按钮组合，重新构建时先还原成原始按钮。
+# （正常路径下源文件总是上游原貌，这里只是防御性的。）
 NAV_LEGACY_VARIANTS = (
-    NAV_WALL_BUTTON
-    + '\n      <button class="item" id="navWhisper">'
-      '<span class="ic" data-i="note"></span>悄悄话</button>'
-    + '\n      <button class="item" id="navPush">'
-      '<span class="ic" data-i="bell"></span>通知</button>'
+    NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH + NAV_BTN_MODELS,
+    NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH
     + '\n      <button class="item" id="navModels">'
       '<span class="ic" data-i="box"></span>模型</button>',
-    NAV_WALL_BUTTON
-    + '\n      <button class="item" id="navWhisper">'
-      '<span class="ic" data-i="note"></span>悄悄话</button>'
-    + '\n      <button class="item" id="navPush">'
-      '<span class="ic" data-i="bell"></span>通知</button>',
+    NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH,
 )
 
 NAV_WALL_HANDLER = (
@@ -204,12 +217,27 @@ NAV_WALL_HANDLER = (
     "sheets.wall.classList.add('open'); loadWall(); };"
 )
 
+NAV_H_WHISPER = (
+    "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); "
+    "sheets.wall.classList.add('open'); renderWhisper(); };"
+)
+NAV_H_PUSH = "\ndocument.getElementById('navPush').onclick = () => { location.href = '/push'; };"
+NAV_H_MODELS = "\ndocument.getElementById('navModels').onclick = () => { location.href = '/models'; };"
+# 表情入口直接开底那个快发面板，而不是跳到管理页：
+# 从侧边栏进来多数时候是想发一张，不是想改名字。
+NAV_H_STICKERS = (
+    "\ndocument.getElementById('navStickers').onclick = () => { closeDrawer(); "
+    "if (window.dwellStickers) window.dwellStickers.open(); "
+    "else location.href = '/stickers'; };"
+)
+
 NAV_EXTRA_HANDLERS = (
-    NAV_WALL_HANDLER
-    + "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); "
-      "sheets.wall.classList.add('open'); renderWhisper(); };"
-    + "\ndocument.getElementById('navPush').onclick = () => { location.href = '/push'; };"
-    + "\ndocument.getElementById('navModels').onclick = () => { location.href = '/models'; };"
+    NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH + NAV_H_MODELS + NAV_H_STICKERS
+)
+
+NAV_LEGACY_HANDLERS = (
+    NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH + NAV_H_MODELS,
+    NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH,
 )
 
 
@@ -344,7 +372,7 @@ def _patch_tool_labels(html: str) -> str:
 
 
 def _patch_nav(html: str) -> str:
-    """补悄悄话、通知、模型三个侧边栏入口。"""
+    """补悄悄话、通知、模型、表情四个侧边栏入口。"""
     # 清掉早期版本用 <a> 写的通知入口，避免重复和蓝色链接残留。
     html = html.replace(
         '\n      <a class="item" href="/push">'
@@ -357,14 +385,9 @@ def _patch_nav(html: str) -> str:
             html = html.replace(legacy, NAV_WALL_BUTTON)
         html = html.replace(NAV_WALL_BUTTON, NAV_EXTRA_BUTTONS, 1)
 
-    if "getElementById('navModels')" not in html:
-        html = html.replace(
-            NAV_WALL_HANDLER
-            + "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); "
-              "sheets.wall.classList.add('open'); renderWhisper(); };"
-            + "\ndocument.getElementById('navPush').onclick = () => { location.href = '/push'; };",
-            NAV_WALL_HANDLER,
-        )
+    if "getElementById('navStickers')" not in html:
+        for legacy in NAV_LEGACY_HANDLERS:
+            html = html.replace(legacy, NAV_WALL_HANDLER)
         html = html.replace(NAV_WALL_HANDLER, NAV_EXTRA_HANDLERS, 1)
 
     return html
@@ -397,14 +420,25 @@ def _patch_head(html: str, icon_links: str) -> str:
     return html
 
 
-def _patch_tail(html: str, push_script: str) -> str:
-    """把推送脚本放进页面末尾。"""
+def _patch_tail(html: str, push_script: str, sticker_script: str) -> str:
+    """把推送和表情包的脚本放进页面末尾。
+
+    表情包那段必须在主页里：它要把尺寸改小、把只装一张表情的气泡去底色，
+    还要往输入区提那个快发按钮。上次推送面板就是因为脚本没进去而永远显示「不支持」。
+    """
     if push_script and "window.dwellPush" not in html:
         html = html.replace("</body>", push_script + "</body>", 1)
+    if sticker_script and "window.dwellStickers" not in html:
+        html = html.replace("</body>", sticker_script + "</body>", 1)
     return html
 
 
-def _build_frontend(source: Path, push_script: str = "", icon_links: str = "") -> str:
+def _build_frontend(
+    source: Path,
+    push_script: str = "",
+    icon_links: str = "",
+    sticker_script: str = "",
+) -> str:
     html = source.read_text(encoding="utf-8")
 
     # 移除演示 fetch 拦截，让请求真正进入后端。
@@ -447,7 +481,7 @@ def _build_frontend(source: Path, push_script: str = "", icon_links: str = "") -
     html = _patch_pet(html)
     html = _patch_tool_labels(html)
     html = _patch_head(html, icon_links)
-    html = _patch_tail(html, push_script)
+    html = _patch_tail(html, push_script, sticker_script)
 
     # 允许空日记正常进入主页。
     html = html.replace(
@@ -472,6 +506,10 @@ def register_frontend_feature(server_module):
         # push_feature 可能还没注册（或注册失败），推送脚本就当不存在。
         return getattr(server_module, "push_client_script", "") or ""
 
+    def sticker_script():
+        # 同理：每次响应时取，所以 sticker_feature 早注册还是晚注册都行。
+        return getattr(server_module, "sticker_client_script", "") or ""
+
     def icon_links():
         fn = getattr(server_module, "icon_html_links", None)
         return fn() if callable(fn) else ""
@@ -479,7 +517,7 @@ def register_frontend_feature(server_module):
     def index_real():
         if not source.exists():
             return Response("找不到 web/index.html", status=500, mimetype="text/plain")
-        html = _build_frontend(source, push_script(), icon_links())
+        html = _build_frontend(source, push_script(), icon_links(), sticker_script())
         response = Response(html, mimetype="text/html")
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -489,7 +527,10 @@ def register_frontend_feature(server_module):
 
     def version_real():
         source_text = source.read_text(encoding="utf-8") if source.exists() else ""
-        built = _build_frontend(source, push_script(), icon_links()) if source.exists() else ""
+        built = (
+            _build_frontend(source, push_script(), icon_links(), sticker_script())
+            if source.exists() else ""
+        )
         return jsonify({
             "ok": True,
             "version": _git_version(repo_root),
@@ -517,12 +558,18 @@ def register_frontend_feature(server_module):
                 "bubble_style": "margin-left: auto" in built,
                 "pet_guarded": PET_IMG_PATCHED in built,
                 "push_script": "window.dwellPush" in built,
+                "sticker_script": "window.dwellStickers" in built,
+                "sticker_labels": "case 'send_sticker'" in built,
                 "cpu_icon": "  cpu: S(" in built,
+                "smile_icon": "  smile: S(" in built,
                 "manifest_link": 'rel="manifest"' in built,
                 "apple_icon": "apple-touch-icon" in built,
                 "push_nav": 'id="navPush"' in built,
                 "models_nav": 'id="navModels"' in built,
+                "stickers_nav": 'id="navStickers"' in built,
+                "stickers_handler": "getElementById('navStickers')" in built,
                 "nav_anchor_found": NAV_WALL_BUTTON in source_text,
+                "nav_handler_anchor_found": NAV_WALL_HANDLER in source_text,
                 "icons_anchor_found": ICONS_ANCHOR in source_text,
             },
         })
