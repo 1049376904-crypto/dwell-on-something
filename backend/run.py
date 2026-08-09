@@ -9,6 +9,7 @@ from compat import register_compat
 from storage_feature import register_storage_feature
 from gateway_config import register_gateway_config
 from models_feature import register_models_feature
+from media_feature import register_media_feature
 from icon_feature import register_icon_feature
 from push_feature import register_push_feature
 from frontend_feature import register_frontend_feature
@@ -29,6 +30,8 @@ db_path = register_storage_feature(server)
 register_gateway_config(server)
 # 模型清单接管 /api/model，要在网关配置之后。
 register_models_feature(server)
+# 图片要在聊天代理之前：agent_tools 需要 server.build_multimodal。
+register_media_feature(server)
 
 # 图标要在推送和前端之前：manifest 和页面 head 都要拿它的链接。
 register_icon_feature(server)
@@ -65,5 +68,6 @@ if __name__ == "__main__":
     print("  beat    : /api/heartbeat（默认关闭）")
     print("  push    : /push 面板（iOS 需 HTTPS + 添加到主屏幕）")
     print("  models  : /models 面板")
+    print("  media   : /api/upload，图片存 data/uploads")
     print("  icon    : /api/icon/status")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
