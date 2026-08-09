@@ -52,6 +52,36 @@ BRIEF_HELPER = (
     "return s.length > n ? s.slice(0, n) + '…' : s; };"
 )
 
+# 侧边栏锚点：上游的「日记」按钮。
+NAV_WALL_BUTTON = (
+    '<button class="item" id="navWall">'
+    '<span class="ic" data-i="pen"></span>日记</button>'
+)
+
+# 悄悄话和通知两个入口。都用 button 而不是 a：
+# 上游 .item 的样式是给 button 写的，用 <a> 会吃到全局链接色，
+# 在侧边栏里显示成一行蓝色带下划线的字，跟旁边几项完全不搭。
+# 通知用 bell 图标，上游 ICONS 里现成有，不跟悄悄话的 note 重复。
+NAV_EXTRA_BUTTONS = (
+    NAV_WALL_BUTTON
+    + '\n      <button class="item" id="navWhisper">'
+      '<span class="ic" data-i="note"></span>悄悄话</button>'
+    + '\n      <button class="item" id="navPush">'
+      '<span class="ic" data-i="bell"></span>通知</button>'
+)
+
+NAV_WALL_HANDLER = (
+    "document.getElementById('navWall').onclick = () => { closeDrawer(); "
+    "sheets.wall.classList.add('open'); loadWall(); };"
+)
+
+NAV_EXTRA_HANDLERS = (
+    NAV_WALL_HANDLER
+    + "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); "
+      "sheets.wall.classList.add('open'); renderWhisper(); };"
+    + "\ndocument.getElementById('navPush').onclick = () => { location.href = '/push'; };"
+)
+
 
 def _git_version(repo_root: Path) -> str:
     try:
@@ -148,6 +178,22 @@ def _patch_tool_labels(html: str) -> str:
     return html
 
 
+def _patch_nav(html: str) -> str:
+    """补悄悄话和通知两个侧边栏入口。"""
+    # 先清掉旧版本用 <a> 写的通知入口，避免重复和蓝色链接残留。
+    html = html.replace(
+        '\n      <a class="item" href="/push">'
+        '<span class="ic" data-i="note"></span>通知</a>',
+        "",
+    )
+
+    if 'id="navPush"' not in html:
+        html = html.replace(NAV_WALL_BUTTON, NAV_EXTRA_BUTTONS, 1)
+    if "getElementById('navPush')" not in html:
+        html = html.replace(NAV_WALL_HANDLER, NAV_EXTRA_HANDLERS, 1)
+    return html
+
+
 def _patch_head(html: str, icon_links: str) -> str:
     """补 PWA 清单、图标和主屏标题。
 
@@ -228,18 +274,7 @@ def _build_frontend(source: Path, push_script: str = "", icon_links: str = "") -
         "const latestDate = boardDates[boardDates.length - 1] || todayStr();",
     )
 
-    # 悄悄话提供独立侧栏入口，不依赖日记墙是否已有内容。
-    wall_button = '<button class="item" id="navWall"><span class="ic" data-i="pen"></span>日记</button>'
-    extra_buttons = wall_button \
-        + '\n      <button class="item" id="navWhisper"><span class="ic" data-i="note"></span>悄悄话</button>' \
-        + '\n      <a class="item" href="/push"><span class="ic" data-i="note"></span>通知</a>'
-    if 'id="navWhisper"' not in html:
-        html = html.replace(wall_button, extra_buttons, 1)
-
-    wall_handler = "document.getElementById('navWall').onclick = () => { closeDrawer(); sheets.wall.classList.add('open'); loadWall(); };"
-    whisper_handler = wall_handler + "\ndocument.getElementById('navWhisper').onclick = () => { closeDrawer(); sheets.wall.classList.add('open'); renderWhisper(); };"
-    if "getElementById('navWhisper').onclick" not in html:
-        html = html.replace(wall_handler, whisper_handler, 1)
+    html = _patch_nav(html)
 
     return html
 
@@ -289,7 +324,8 @@ def register_frontend_feature(server_module):
                 "push_script": "window.dwellPush" in built,
                 "manifest_link": 'rel="manifest"' in built,
                 "apple_icon": "apple-touch-icon" in built,
-                "push_nav": 'href="/push"' in built,
+                "push_nav": 'id="navPush"' in built,
+                "nav_anchor_found": NAV_WALL_BUTTON in source_text,
             },
         })
 
