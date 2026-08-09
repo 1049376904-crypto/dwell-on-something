@@ -13,6 +13,10 @@
 * 同时支持两条订阅入口：上游设置页里的「手机通知」开关，
   以及本模块自带的面板 /push。两者写进同一张表。
 
+通知标题刻意留空：iOS 在 standalone 模式下已经用应用名（manifest 的 name）
+当标题，服务端再写一遍「沐」会变成「沐 / from 沐 / 正文」三行。
+留空后系统自己补应用名，观感和 iMessage 一致。
+
 私钥不以字符串形式交给 pywebpush。它会先 os.path.isfile 再走
 py_vapid 的字符串分支，而那条分支对 PKCS8 PEM 的处理会抛
 「Could not deserialize key data」。这里自己 load 成密钥对象再包成
@@ -132,11 +136,14 @@ self.addEventListener('push', (event) => {
   try { payload = event.data ? event.data.json() : {}; } catch (e) {
     payload = { body: event.data ? event.data.text() : '' };
   }
-  const title = payload.title || '沐';
+  // 标题通常为空：让系统用应用名，避免「沐 / from 沐」重复两行。
+  const title = payload.title || '';
   const options = {
     body: payload.body || '',
     tag: payload.tag || 'dwell',
     renotify: true,
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
     data: { url: payload.url || '/' },
   };
   event.waitUntil(self.registration.showNotification(title, options));
@@ -251,8 +258,10 @@ PANEL_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="沐">
 <title>通知设置</title>
 <link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png">
 <style>
   :root { --bg:#faf9f5; --fg:#262624; --dim:#8a8780; --line:#e6e3dc; --accent:#3d6b4f; }
   @media (prefers-color-scheme: dark) {
@@ -309,6 +318,7 @@ PANEL_TEMPLATE = """<!DOCTYPE html>
   <div class="row"><span>通知权限</span><span id="s-perm">检测中</span></div>
   <div class="row"><span>已订阅设备</span><span id="s-count">…</span></div>
   <div class="row"><span>推送库</span><span id="s-lib">…</span></div>
+  <div class="row"><span>应用图标</span><span id="s-icon">…</span></div>
 </div>
 
 <button id="btn-enable" class="primary">开启通知</button>
@@ -366,6 +376,14 @@ async function refreshServer() {
     $('s-lib').textContent = d.library_installed ? '已安装' : '未安装';
   } catch (e) {
     $('s-count').textContent = '读取失败';
+  }
+  try {
+    const d = await (await fetch('/api/icon/status', { cache: 'no-store' })).json();
+    mark('s-icon', d.cached, d.cached
+      ? (d.pillow ? '已就绪' : '已就绪（未装 Pillow）')
+      : ('未就绪 ' + (d.error || '')));
+  } catch (e) {
+    $('s-icon').textContent = '读取失败';
   }
 }
 
@@ -503,6 +521,9 @@ def register_push_feature(server_module):
     def send_push(title, body, url="/", tag="dwell"):
         """向所有订阅推送一条通知，返回统计结果。
 
+        title 一般传空字符串：iOS 会用应用名当标题，
+        服务端再写一遍会变成「沐 / from 沐」两行。
+
         任何一个订阅失败都不影响其他订阅；已作废的端点顺手清掉。
         """
         try:
@@ -522,7 +543,7 @@ def register_push_feature(server_module):
             return {"ok": False, "error": "还没有任何设备订阅推送"}
 
         payload = json.dumps({
-            "title": title,
+            "title": title or "",
             "body": (body or "")[:MAX_BODY_CHARS],
             "url": url,
             "tag": tag,
@@ -683,7 +704,7 @@ def register_push_feature(server_module):
         })
 
     def api_push_test():
-        result = send_push("沐", "这是一条测试通知，说明推送已经通了。")
+        result = send_push("", "这是一条测试通知，说明推送已经通了。")
         return jsonify(result)
 
     def api_service_worker():
@@ -694,7 +715,13 @@ def register_push_feature(server_module):
         return response
 
     def api_manifest():
-        """PWA 清单。iOS 要「添加到主屏幕」后才允许推送，这个文件是前提。"""
+        """PWA 清单。iOS 要「添加到主屏幕」后才允许推送，这个文件是前提。
+
+        name 同时决定通知的发件人显示，所以只写「沐」。
+        """
+        entries = getattr(server_module, "icon_manifest_entries", None)
+        icons = entries() if callable(entries) else []
+
         manifest = {
             "name": "沐",
             "short_name": "沐",
@@ -703,9 +730,7 @@ def register_push_feature(server_module):
             "display": "standalone",
             "background_color": "#faf9f5",
             "theme_color": "#faf9f5",
-            # 图标资源随 fork 丢了，这里不写 icons：
-            # iOS 会退回用页面截图，比引用 404 路径干净。
-            "icons": [],
+            "icons": icons,
         }
         response = jsonify(manifest)
         response.headers["Cache-Control"] = "no-cache"
