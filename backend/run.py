@@ -8,6 +8,7 @@ import server
 from compat import register_compat
 from storage_feature import register_storage_feature
 from gateway_config import register_gateway_config
+from push_feature import register_push_feature
 from frontend_feature import register_frontend_feature
 from calendar_feature import register_calendar_feature
 from whisper_feature import register_whisper_feature
@@ -25,6 +26,8 @@ db_path = register_storage_feature(server)
 # 网关配置要在聊天代理之前生效。
 register_gateway_config(server)
 
+# 推送要在前端之前：前端需要拿到 push_client_script 注入页面。
+register_push_feature(server)
 register_frontend_feature(server)
 register_calendar_feature(server)
 register_whisper_feature(server)
@@ -36,7 +39,8 @@ register_event_stream_feature(server)
 # 注册，后者依赖 server.save_transcript。
 register_transcript_feature(server)
 register_agent_tools_feature(server)
-# 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具的那一版。
+# 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具的那一版，
+# 同时依赖 server.send_push 把主动说的话推到锁屏。
 register_heartbeat_feature(server)
 
 
@@ -53,4 +57,5 @@ if __name__ == "__main__":
     print("  history : 思考与工具调用持久化重放")
     print("  config  : 设置 → 接入 API（地址/令牌/模型名）")
     print("  beat    : /api/heartbeat（默认关闭）")
+    print("  push    : /api/push/status（iOS 需先添加到主屏幕）")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
