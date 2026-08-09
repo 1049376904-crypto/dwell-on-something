@@ -8,6 +8,7 @@ import server
 from compat import register_compat
 from storage_feature import register_storage_feature
 from gateway_config import register_gateway_config
+from icon_feature import register_icon_feature
 from push_feature import register_push_feature
 from frontend_feature import register_frontend_feature
 from calendar_feature import register_calendar_feature
@@ -26,6 +27,8 @@ db_path = register_storage_feature(server)
 # 网关配置要在聊天代理之前生效。
 register_gateway_config(server)
 
+# 图标要在推送和前端之前：manifest 和页面 head 都要拿它的链接。
+register_icon_feature(server)
 # 推送要在前端之前：前端需要拿到 push_client_script 注入页面。
 register_push_feature(server)
 register_frontend_feature(server)
@@ -57,5 +60,6 @@ if __name__ == "__main__":
     print("  history : 思考与工具调用持久化重放")
     print("  config  : 设置 → 接入 API（地址/令牌/模型名）")
     print("  beat    : /api/heartbeat（默认关闭）")
-    print("  push    : /api/push/status（iOS 需先添加到主屏幕）")
+    print("  push    : /push 面板（iOS 需 HTTPS + 添加到主屏幕）")
+    print("  icon    : /api/icon/status")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
