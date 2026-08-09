@@ -11,6 +11,10 @@ server.py 的 messages 表只存 her / gu 两种正文，思考和工具调用�
 妍妍的消息在一轮开始前就已入库、沐的回复在一轮结束才入库，所以同一轮的
 思考与工具行天然锚定在两者之间。排序键 (anchor, tier, id) 完全确定，不依赖
 时间戳（同一秒内无法区分先后）。
+
+注意 upto 字段：前端会把它赋给 /api/poll 的 since，所以它必须是事件流游标，
+不能是 messages 表的 seq（见 event_stream_feature 里的说明）。本模块在
+event_stream 之后注册并接管 api_messages，因此要自己保持这个语义。
 """
 
 import json
@@ -44,11 +48,6 @@ def register_transcript_feature(server_module):
                 ON transcript (after_seq, id);
         """)
 
-    def max_message_seq():
-        with get_db() as db:
-            row = db.execute("SELECT MAX(seq) AS m FROM messages").fetchone()
-        return int(row["m"] or 0)
-
     def save_transcript(kind, text="", name="", extra="", call_id="", is_error=False):
         """记一条思考或工具记录，锚定在当前最新的正文消息之后。"""
         with get_db() as db:
@@ -68,7 +67,7 @@ def register_transcript_feature(server_module):
     def merged_messages(limit, before):
         base = server_module.load_messages(limit, before)
         if not base:
-            return base
+            return base, False
 
         low = base[0]["seq"]
         high = base[-1]["seq"]
@@ -79,6 +78,9 @@ def register_transcript_feature(server_module):
                 "ORDER BY after_seq,id",
                 (low, high),
             ).fetchall()
+            more = db.execute(
+                "SELECT 1 FROM messages WHERE seq<? LIMIT 1", (low,)
+            ).fetchone() is not None
 
         # 排序键第二位是层级：正文在前，同一锚点下的 transcript 在后。
         items = [((m["seq"], 1, 0), m) for m in base]
@@ -118,10 +120,14 @@ def register_transcript_feature(server_module):
             items.append(((row["after_seq"], 2, row["id"]), item))
 
         items.sort(key=lambda pair: pair[0])
-        return [item for _, item in items]
+        return [item for _, item in items], more
 
     def api_messages_real():
-        limit = int(request.args.get("limit", 400))
+        try:
+            limit = max(1, min(1000, int(request.args.get("limit", 400))))
+        except (TypeError, ValueError):
+            limit = 400
+
         before_raw = request.args.get("before")
         before = None
         if before_raw:
@@ -133,14 +139,16 @@ def register_transcript_feature(server_module):
             if 0 < candidate < SYNTH_OFFSET:
                 before = candidate
 
-        msgs = merged_messages(limit, before)
-        real_seqs = [m["seq"] for m in msgs if m["seq"] < SYNTH_OFFSET]
-        upto = real_seqs[-1] if real_seqs else 0
-        return jsonify({"msgs": msgs, "upto": upto, "more": False})
+        msgs, more = merged_messages(limit, before)
+
+        # upto 必须是事件流游标：前端拿它当 /api/poll 的 since。
+        cursor = getattr(server_module, "event_cursor", None)
+        upto = cursor() if callable(cursor) else 0
+
+        return jsonify({"msgs": msgs, "upto": upto, "more": more})
 
     # /api/messages 与 /api/said 共用 endpoint api_messages。
     server_module.app.view_functions["api_messages"] = api_messages_real
 
-    server_module.max_message_seq = max_message_seq
     server_module.save_transcript = save_transcript
     return save_transcript
