@@ -13,10 +13,14 @@
 * 同时支持两条订阅入口：上游设置页里的「手机通知」开关，
   以及本模块自带的面板 /push。两者写进同一张表。
 
-通知标题由 iOS 决定，服务端传空字符串。系统会用两个值拼出通知头部：
-    第一行  manifest 的 name          → personalize.PWA_NAME（予妍）
-    第二行  apple-mobile-web-app-title → personalize.HOME_SCREEN_NAME（Luminae）
-两者相同就会出现「沐 / from 沐 / 正文」的重复观感，所以刻意分开。
+iOS 通知头部那两行的实测规律：
+    第一行 = showNotification 的 title；留空时系统填应用名
+    第二行 = 固定的 "from " + 应用名，删不掉
+    应用名 = <meta name="apple-mobile-web-app-title">，
+             同时也是主屏图标下的文字。manifest 的 name iOS 不读。
+所以第一行走 personalize.PUSH_TITLE（予妍），
+第二行只能跟应用名一致（沐）。title 传空会让两行都变成应用名，
+出现「沐 / from 沐」的重复观感，因此这里为空时回落到 PUSH_TITLE。
 
 私钥不以字符串形式交给 pywebpush。它会先 os.path.isfile 再走
 py_vapid 的字符串分支，而那条分支对 PKCS8 PEM 的处理会抛
@@ -139,7 +143,8 @@ self.addEventListener('push', (event) => {
   try { payload = event.data ? event.data.json() : {}; } catch (e) {
     payload = { body: event.data ? event.data.text() : '' };
   }
-  // 标题通常为空：让系统用 manifest 的 name，避免重复两行。
+  // 服务端总会给 title（默认「予妍」）；真为空时系统会填应用名，
+  // 那样第一行和第二行会重复成「沐 / from 沐」。
   const title = payload.title || '';
   const options = {
     body: payload.body || '',
@@ -559,8 +564,8 @@ def register_push_feature(server_module):
     def send_push(title, body, url="/", tag="dwell"):
         """向所有订阅推送一条通知，返回统计结果。
 
-        title 一般传空字符串：iOS 会用 manifest 的 name 当标题，
-        服务端再写一遍会重复。
+        title 传空会回落到 personalize.PUSH_TITLE。不要真的发空标题：
+        iOS 会拿应用名填第一行，和第二行的「from 应用名」重复。
 
         任何一个订阅失败都不影响其他订阅；已作废的端点顺手清掉。
         """
@@ -581,7 +586,7 @@ def register_push_feature(server_module):
             return {"ok": False, "error": "还没有任何设备订阅推送"}
 
         payload = json.dumps({
-            "title": title or "",
+            "title": (title or "").strip() or personalize.PUSH_TITLE,
             "body": (body or "")[:MAX_BODY_CHARS],
             "url": url,
             "tag": tag,
@@ -752,7 +757,7 @@ def register_push_feature(server_module):
             "key_loadable": key_ok,
             "key_error": key_error,
             "contact": read(KEY_CONTACT, DEFAULT_CONTACT),
-            "pwa_name": personalize.PWA_NAME,
+            "push_title": personalize.PUSH_TITLE,
             "home_screen_name": personalize.HOME_SCREEN_NAME,
             "count": len(rows),
             "devices": [
@@ -782,16 +787,16 @@ def register_push_feature(server_module):
     def api_manifest():
         """PWA 清单。iOS 要「添加到主屏幕」后才允许推送，这个文件是前提。
 
-        name 同时决定推送通知的标题，所以用 PWA_NAME（予妍）；
-        主屏图标下的文字由页面里的 apple-mobile-web-app-title 决定
-        （Luminae）。两者不同才不会出现重复两行的通知头部。
+        iOS 主屏那套流程实际不读 manifest 的 name，它认页面里的
+        apple-mobile-web-app-title。这里跟着写同一个值，
+        免得在别的浏览器里安装时出现两个名字。
         """
         entries = getattr(server_module, "icon_manifest_entries", None)
         icons = entries() if callable(entries) else []
 
         manifest = {
-            "name": personalize.PWA_NAME,
-            "short_name": personalize.PWA_NAME,
+            "name": personalize.HOME_SCREEN_NAME,
+            "short_name": personalize.HOME_SCREEN_NAME,
             "start_url": "/",
             "scope": "/",
             "display": "standalone",
