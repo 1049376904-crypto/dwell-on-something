@@ -12,10 +12,15 @@
 * 订阅端点唯一，重复订阅走 UPSERT，不会堆出一堆重复记录。
 * 自带一个独立的开关面板（/push）。妍妍只有手机，
   iOS 上没有控制台，订阅必须能靠点按完成。
+  面板把 CLIENT_SCRIPT 内联进自己的 HTML，不依赖 frontend_feature 的注入：
+  那个注入只作用于 index.html，面板是另一个页面。
 
-iOS 限制（Safari 16.4+）：必须先把网页「添加到主屏幕」，
-从主屏图标打开后才允许申请通知权限。直接在 Safari 里访问会失败，
-这不是 bug，是系统行为。面板会检测并直接说明当前处于哪种状态。
+两道前提，顺序不能颠倒：
+1. HTTPS。非安全上下文下浏览器压根不暴露 PushManager，
+   跟是不是主屏模式无关。用 IP 直连 http:// 一定失败。
+2. 添加到主屏幕。iOS（Safari 16.4+）只在 standalone 模式下
+   允许申请通知权限。
+面板会分别检测这两项并如实说明卡在哪一步。
 """
 
 import json
@@ -97,15 +102,17 @@ self.addEventListener('notificationclick', (event) => {
 });
 """
 
-# 注入前端的注册脚本。权限申请不自动弹，交给面板上的按钮触发，
-# 免得一进门就被系统弹窗拦一次。
+# 客户端脚本。同时注入主应用和面板页面，所以不能依赖任何页面独有的元素。
 CLIENT_SCRIPT = """
 <script>
 (function () {
   const PUSH = {
+    // isSecureContext 是硬前提：为 false 时 PushManager 根本不存在。
+    secure: window.isSecureContext === true,
     supported: 'serviceWorker' in navigator && 'PushManager' in window,
     standalone: window.matchMedia('(display-mode: standalone)').matches
       || window.navigator.standalone === true,
+    ios: /iPhone|iPad|iPod/.test(navigator.userAgent),
   };
   window.dwellPush = PUSH;
 
@@ -116,13 +123,21 @@ CLIENT_SCRIPT = """
     return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
   }
 
+  PUSH.blockedBy = function () {
+    if (!PUSH.secure) return '当前不是 HTTPS，浏览器不提供推送能力';
+    if (!PUSH.supported) return '这个浏览器不支持推送';
+    if (PUSH.ios && !PUSH.standalone) return 'iPhone 需要先添加到主屏幕，再从主屏图标打开';
+    return null;
+  };
+
   PUSH.register = async function () {
-    if (!PUSH.supported) throw new Error('这个浏览器不支持推送');
     return navigator.serviceWorker.register('/sw.js', { scope: '/' });
   };
 
   PUSH.enable = async function () {
-    if (!PUSH.supported) throw new Error('这个浏览器不支持推送');
+    const blocked = PUSH.blockedBy();
+    if (blocked) throw new Error(blocked);
+
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') throw new Error('通知权限被拒绝：' + permission);
 
@@ -166,7 +181,7 @@ CLIENT_SCRIPT = """
 
   // 已经授权过的话，静默把 service worker 挂上，
   // 免得换了设备或清过数据后订阅悄悄失效。
-  if (PUSH.supported && window.Notification && Notification.permission === 'granted') {
+  if (!PUSH.blockedBy() && window.Notification && Notification.permission === 'granted') {
     PUSH.enable().catch(() => {});
   }
 })();
@@ -175,12 +190,13 @@ CLIENT_SCRIPT = """
 
 # 独立面板。刻意不塞进上游那个设置页：那边结构复杂、
 # 字符串补丁很容易打歪，而这个页面只需要能点。
-PANEL_HTML = """<!DOCTYPE html>
+# {client_script} 由 api_push_panel 填入，面板不依赖外部注入。
+PANEL_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="apple-mobile-web-app-capable" content="content">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>通知设置</title>
 <link rel="manifest" href="/manifest.json">
 <style>
@@ -190,10 +206,10 @@ PANEL_HTML = """<!DOCTYPE html>
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body {
-    margin: 0; padding: 28px 20px calc(28px + env(safe-area-inset-bottom));
+    margin: 0 auto; padding: 28px 20px calc(28px + env(safe-area-inset-bottom));
     background: var(--bg); color: var(--fg);
     font: 16px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
-    max-width: 560px; margin-inline: auto;
+    max-width: 560px;
   }
   h1 { font-size: 21px; font-weight: 600; margin: 0 0 4px; }
   .sub { color: var(--dim); font-size: 14px; margin-bottom: 24px; }
@@ -204,6 +220,8 @@ PANEL_HTML = """<!DOCTYPE html>
   .row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; }
   .row span:first-child { color: var(--dim); }
   .row span:last-child { text-align: right; }
+  .ok { color: var(--accent); }
+  .bad { color: #c26a4a; }
   button {
     width: 100%; padding: 14px; margin-top: 10px; font-size: 16px;
     border: 1px solid var(--line); border-radius: 11px;
@@ -216,10 +234,11 @@ PANEL_HTML = """<!DOCTYPE html>
     color: var(--dim); margin-top: 16px; min-height: 3em;
   }
   .warn {
-    border-color: #c98a3c; background: rgba(201,138,60,.09);
+    border: 1px solid #c98a3c; background: rgba(201,138,60,.09);
     padding: 13px 16px; border-radius: 11px; font-size: 14.5px;
-    border-width: 1px; border-style: solid; margin-bottom: 14px;
+    margin-bottom: 14px;
   }
+  .warn code { font-size: 13px; word-break: break-all; }
   a { color: var(--accent); }
 </style>
 </head>
@@ -230,6 +249,7 @@ PANEL_HTML = """<!DOCTYPE html>
 <div id="guard"></div>
 
 <div class="card">
+  <div class="row"><span>安全上下文</span><span id="s-secure">检测中</span></div>
   <div class="row"><span>浏览器支持</span><span id="s-support">检测中</span></div>
   <div class="row"><span>主屏模式</span><span id="s-standalone">检测中</span></div>
   <div class="row"><span>通知权限</span><span id="s-perm">检测中</span></div>
@@ -245,23 +265,43 @@ PANEL_HTML = """<!DOCTYPE html>
 <div id="log"></div>
 <div class="sub" style="margin-top:20px"><a href="/">回到应用</a></div>
 
+__CLIENT_SCRIPT__
+
 <script>
 const $ = (id) => document.getElementById(id);
 const log = (text) => { $('log').textContent = text; };
 
+function mark(id, good, text) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = good ? 'ok' : 'bad';
+}
+
 function refreshLocal() {
   const P = window.dwellPush || {};
-  $('s-support').textContent = P.supported ? '支持' : '不支持';
-  $('s-standalone').textContent = P.standalone ? '是' : '否（Safari 标签页）';
+
+  mark('s-secure', P.secure, P.secure ? 'HTTPS' : 'HTTP，不安全');
+  mark('s-support', P.supported, P.supported ? '支持' : '不支持');
+  mark('s-standalone', P.standalone, P.standalone ? '是' : '否（浏览器标签页）');
   $('s-perm').textContent = window.Notification ? Notification.permission : '不可用';
 
-  // iOS 必须从主屏图标打开才允许申请权限，这一条讲清楚比让她反复试有用。
-  const iOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
-  if (iOS && !P.standalone) {
-    $('guard').innerHTML = '<div class="warn">iPhone 上需要先把这个网页'
-      + '<b>添加到主屏幕</b>，再从主屏图标打开，系统才允许开启通知。'
-      + '现在是 Safari 标签页，点「开启通知」会失败。</div>';
-    $('btn-enable').disabled = true;
+  // 两道前提分开提示：HTTPS 是硬门槛，主屏幕是 iOS 的额外要求。
+  const blocked = P.blockedBy ? P.blockedBy() : '脚本未加载';
+  $('btn-enable').disabled = !!blocked;
+
+  if (!P.secure) {
+    $('guard').innerHTML = '<div class="warn">现在是 <b>HTTP</b> 访问，'
+      + '浏览器在非加密页面上不提供推送能力，这跟主屏幕无关。'
+      + '请改用 HTTPS 域名打开这个页面：<br><code>'
+      + 'https://dwell.yanyan081217.buzz/push</code></div>';
+  } else if (P.ios && !P.standalone) {
+    $('guard').innerHTML = '<div class="warn">HTTPS 已就绪。接下来在 Safari 里'
+      + '点分享按钮，选<b>添加到主屏幕</b>，然后从主屏图标打开这个页面，'
+      + '系统才允许开启通知。</div>';
+  } else if (blocked) {
+    $('guard').innerHTML = '<div class="warn">' + blocked + '</div>';
+  } else {
+    $('guard').innerHTML = '';
   }
 }
 
@@ -279,7 +319,7 @@ $('btn-enable').onclick = async () => {
   log('正在申请权限并订阅…');
   try {
     const r = await window.dwellPush.enable();
-    log('订阅成功，当前 ' + r.count + ' 台设备。可以点上面的测试通知了。');
+    log('订阅成功，当前 ' + r.count + ' 台设备。可以点下面的测试通知了。');
   } catch (e) {
     log('失败：' + e.message);
   }
@@ -303,7 +343,7 @@ $('btn-disable').onclick = async () => {
   log('正在取消…');
   try {
     await window.dwellPush.disable();
-    log('已取消订阅。系统通知权限需要在「设置」里单独关。');
+    log('已取消订阅。系统通知权限需要在 iOS 设置里单独关。');
   } catch (e) {
     log('失败：' + e.message);
   }
@@ -467,8 +507,12 @@ def register_push_feature(server_module):
     # ── 接口
 
     def api_push_panel():
-        response = Response(PANEL_HTML, mimetype="text/html")
-        response.headers["Cache-Control"] = "no-store"
+        # 面板自带客户端脚本：frontend_feature 的注入只作用于 index.html，
+        # 面板是独立页面，之前因此拿不到 window.dwellPush，永远显示「不支持」。
+        html = PANEL_TEMPLATE.replace("__CLIENT_SCRIPT__", CLIENT_SCRIPT)
+        response = Response(html, mimetype="text/html")
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
         return response
 
     def api_push_key():
