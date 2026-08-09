@@ -83,6 +83,22 @@ IMG_RE_PATCHED = (
     "|(\\/media\\/[^\\s\"'<>)]+?\\.(?:png|jpe?g|gif|webp))/gi;"
 )
 
+# 聊天里的图片尺寸。上游给的 240px 在手机上占了大半屏，
+# 一张图就把上下文挤出视野；收到 170px，抬眼能看清、又不抢地方，
+# 想细看点开就是。
+CHATIMG_ORIGINAL = "max-width: min(240px, 70%); border-radius: 14px;"
+CHATIMG_PATCHED = "max-width: min(170px, 52%); border-radius: 14px;"
+
+# 右下角那只宠物：上游只有 <img src="pet/clawd-*.svg">，
+# 那几个 SVG 文件 fork 时没跟过来（上游仓库里也没有），
+# 于是 iOS 画出一个蓝色问号的破图框。缺图就藏起来，别让它占着屏幕。
+PET_IMG_ORIGINAL = '<img id="petImg" src="pet/clawd-idle-follow.svg" alt="">'
+PET_IMG_PATCHED = (
+    '<img id="petImg" src="pet/clawd-idle-follow.svg" alt="" '
+    'onerror="this.style.visibility=\'hidden\';'
+    'var p=document.getElementById(\'pet\');if(p)p.style.display=\'none\'">'
+)
+
 # 侧边栏锚点：上游的「日记」按钮。
 NAV_WALL_BUTTON = (
     '<button class="item" id="navWall">'
@@ -215,14 +231,22 @@ def _patch_icons(html: str) -> str:
 
 
 def _patch_images(html: str) -> str:
-    """让 IMG_RE 认站内相对路径。
+    """让 IMG_RE 认站内相对路径，并把聊天图片改小一档。
 
-    上游只认 https?:// 开头的绝对地址，我们存的 /media/... 匹配不上，
+    上游 IMG_RE 只认 https?:// 开头的绝对地址，我们存的 /media/... 匹配不上，
     气泡里会原样显示成 ![](/media/…) 这一串字符。
     """
-    if "/media/" in html and "(?:https?:\\/\\/|\\/)" in html:
+    if "(?:https?:\\/\\/|\\/)" not in html:
+        html = html.replace(IMG_RE_ORIGINAL, IMG_RE_PATCHED, 1)
+    html = html.replace(CHATIMG_ORIGINAL, CHATIMG_PATCHED, 1)
+    return html
+
+
+def _patch_pet(html: str) -> str:
+    """宠物图缺失时整块藏起来，不显示破图框。"""
+    if "onerror" in PET_IMG_PATCHED and PET_IMG_PATCHED in html:
         return html
-    return html.replace(IMG_RE_ORIGINAL, IMG_RE_PATCHED, 1)
+    return html.replace(PET_IMG_ORIGINAL, PET_IMG_PATCHED, 1)
 
 
 def _patch_tool_labels(html: str) -> str:
@@ -343,6 +367,7 @@ def _build_frontend(source: Path, push_script: str = "", icon_links: str = "") -
 
     html = _patch_icons(html)
     html = _patch_images(html)
+    html = _patch_pet(html)
     html = _patch_tool_labels(html)
     html = _patch_head(html, icon_links)
     html = _patch_tail(html, push_script)
@@ -408,6 +433,9 @@ def register_frontend_feature(server_module):
                 "verbof_anchor_found": VERBOF_ANCHOR in source_text,
                 "img_re_patched": "(?:https?:\\/\\/|\\/)" in built,
                 "img_re_anchor_found": IMG_RE_ORIGINAL in source_text,
+                "chatimg_resized": CHATIMG_PATCHED in built,
+                "chatimg_anchor_found": CHATIMG_ORIGINAL in source_text,
+                "pet_guarded": "onerror" in built,
                 "push_script": "window.dwellPush" in built,
                 "cpu_icon": "  cpu: S(" in built,
                 "manifest_link": 'rel="manifest"' in built,
