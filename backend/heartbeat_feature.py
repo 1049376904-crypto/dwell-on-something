@@ -9,6 +9,8 @@
 * 绝不打断对话。生成中（busy）或她刚说过话（静默不足）都直接跳过。
 * 必须留下痕迹。每次触发都记录结果（spoke / silent），
   否则「它没醒」和「它醒了但没说话」在界面上完全分辨不出来。
+* 说了就推送。页面关着的时候心跳等于对着空气说话，
+  所以产生正文后会调 server.send_push 推一条到锁屏。
 
 时段格式：HH:MM-HH:MM，逗号分隔，允许跨午夜（如 23:00-01:00）。
 解析前会把各种非 ASCII 连字符和全角冒号归一，手机复制粘贴常把 - 变成 U+2011。
@@ -30,6 +32,7 @@ KEY_LAST_AT = "heartbeat_last_at"
 KEY_DAY_TALLY = "heartbeat_day_tally"
 KEY_LAST_RESULT = "heartbeat_last_result"
 KEY_LAST_TEXT = "heartbeat_last_text"
+KEY_LAST_PUSH = "heartbeat_last_push"
 
 DEFAULTS = {
     KEY_ENABLED: "0",
@@ -40,6 +43,7 @@ DEFAULTS = {
     KEY_IDLE: "90",
     KEY_LAST_RESULT: "",
     KEY_LAST_TEXT: "",
+    KEY_LAST_PUSH: "",
 }
 
 CHECK_INTERVAL = 60
@@ -191,6 +195,23 @@ def register_heartbeat_feature(server_module):
             "想额外留点什么给自己，可以再调 add_whisper 写进悄悄话，但正文不能省。"
         )
 
+    def notify(text):
+        """把主动说的话推到锁屏。推送不可用时静默跳过，不影响心跳本身。"""
+        send = getattr(server_module, "send_push", None)
+        if not callable(send):
+            write(KEY_LAST_PUSH, "推送模块未注册")
+            return
+        try:
+            result = send("沐", text, url="/", tag="heartbeat")
+        except Exception as exc:
+            write(KEY_LAST_PUSH, f"推送异常: {str(exc)[:120]}")
+            return
+
+        if result.get("ok"):
+            write(KEY_LAST_PUSH, f"已推送到 {result.get('sent', 0)} 台设备")
+        else:
+            write(KEY_LAST_PUSH, str(result.get("error") or result)[:200])
+
     def fire(reason="scheduled"):
         """触发一次心跳。调用方负责确认时机合适。
 
@@ -231,6 +252,7 @@ def register_heartbeat_feature(server_module):
         write(KEY_LAST_RESULT, "spoke")
         write(KEY_LAST_TEXT, row["text"][:300])
         print(f"[dwell] 心跳（{reason}）说了：{row['text'][:60]}")
+        notify(row["text"])
         return True
 
     def loop():
@@ -262,6 +284,7 @@ def register_heartbeat_feature(server_module):
             "last_at": read_int(KEY_LAST_AT, 0),
             "last_result": read(KEY_LAST_RESULT),
             "last_text": read(KEY_LAST_TEXT),
+            "last_push": read(KEY_LAST_PUSH),
             "ready": blocked is None,
             "blocked_by": blocked,
         })
