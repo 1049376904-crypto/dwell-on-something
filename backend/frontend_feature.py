@@ -2,6 +2,9 @@
 
 后端直接读取仓库中的 web/index.html，不再依赖手动复制到 backend/index.html。
 个人化文字集中写在 personalize.py，源文件保持上游原貌。
+
+所有补丁都必须可重复应用：后端每次响应都重新构建一遍 HTML，
+补丁叠加会让页面逐渐损坏。
 """
 
 from pathlib import Path
@@ -14,6 +17,40 @@ import personalize
 
 DEMO_START = "(function () {\n  const T = 1786000000;"
 DEMO_END = "/* ============ 线条图标"
+
+# verbOf 里的锚点：上游第一条 case，我们把自建工具的词条插在它前面。
+VERBOF_ANCHOR = (
+    "    case 'Bash':   return ['terminal', 'Ran', "
+    "input.description || (input.command || '').slice(0, 60)];"
+)
+
+# 自建工具的词条。沿用上游风格：图标名 + 英文动词 + 对象。
+# 动词过去式、对象取具体内容，扫一眼就知道沐刚做了什么。
+OUR_VERBS = """    case 'write_diary':           return ['pen', 'Wrote', brief(input.title || input.text)];
+    case 'list_diary_entries':    return ['bookOpen', 'Read', 'the diary'];
+    case 'delete_diary_entry':    return ['fileText', 'Removed', 'a diary entry'];
+    case 'read_my_diary':         return ['bookOpen', 'Read', 'her diary'];
+    case 'add_favorite_line':     return ['pen', 'Saved', brief(input.text)];
+    case 'read_favorite_lines':   return ['bookOpen', 'Read', 'saved lines'];
+    case 'add_todo':              return ['note', 'Noted', brief(input.text)];
+    case 'list_todos':            return ['note', 'Checked', 'the list'];
+    case 'set_todo_done':         return ['note', 'Ticked', 'an item'];
+    case 'delete_todo':           return ['note', 'Removed', 'an item'];
+    case 'add_calendar_event':    return ['note', 'Scheduled', brief(input.text)];
+    case 'list_calendar_events':  return ['note', 'Checked', 'the calendar'];
+    case 'delete_calendar_event': return ['note', 'Removed', 'an event'];
+    case 'set_mood':              return ['note', 'Logged', brief(input.mood)];
+    case 'read_day_records':      return ['bookOpen', 'Read', 'her notes'];
+    case 'add_whisper':           return ['note', 'Whispered', brief(input.text)];
+    case 'read_whispers':         return ['bookOpen', 'Read', 'the whispers'];
+"""
+
+# brief 用来压掉换行、限长，避免日记正文把整行撑开。
+BRIEF_HELPER = (
+    "  const brief = (s, n) => { s = String(s == null ? '' : s)"
+    ".replace(/\\s+/g, ' ').trim(); n = n || 28; "
+    "return s.length > n ? s.slice(0, n) + '…' : s; };"
+)
 
 
 def _git_version(repo_root: Path) -> str:
@@ -91,6 +128,26 @@ def _apply_personalization(html: str) -> str:
     return html
 
 
+def _patch_tool_labels(html: str) -> str:
+    """给自建工具补 verbOf 词条。
+
+    上游 verbOf 只认 Read / Write / Bash 这类 Claude Code 内置工具，
+    我们的 write_diary、add_whisper 等会掉进 default 分支，
+    直接把函数名摊在屏幕上（“Used add whisper”）。
+    """
+    if "case 'write_diary'" in html:
+        return html
+
+    # 先注入 brief 助手，再插词条；两者都锚在 verbOf 内部。
+    html = html.replace(
+        "function verbOf(name, input) {\n  input = input || {};",
+        "function verbOf(name, input) {\n  input = input || {};\n" + BRIEF_HELPER,
+        1,
+    )
+    html = html.replace(VERBOF_ANCHOR, OUR_VERBS + VERBOF_ANCHOR, 1)
+    return html
+
+
 def _build_frontend(source: Path) -> str:
     html = source.read_text(encoding="utf-8")
 
@@ -109,7 +166,8 @@ def _build_frontend(source: Path) -> str:
     )
 
     # 上游 renderSaid 只认 kind='me'，而后端（和上游自己的演示数据）用的是
-    # kind='her'，导致刷新后妍妍的消息全部不渲染。这里让它同时认两种。
+    # kind='her'，导致刷新后妍妍的消息全部不渲染。先还原再替换，
+    # 保证重复构建不会叠成一长串 || 条件。
     html = html.replace(
         "if (m.kind === 'me' || m.kind === 'her') {",
         "if (m.kind === 'me') {",
@@ -126,6 +184,8 @@ def _build_frontend(source: Path) -> str:
         "markToolDone(tid, false, '');",
         "markToolDone(tid, !!m.is_error, m.result || '');",
     )
+
+    html = _patch_tool_labels(html)
 
     # 允许空日记正常进入主页。
     html = html.replace(
@@ -166,6 +226,8 @@ def register_frontend_feature(server_module):
         return response
 
     def version_real():
+        source_text = source.read_text(encoding="utf-8") if source.exists() else ""
+        built = _build_frontend(source) if source.exists() else ""
         return jsonify({
             "ok": True,
             "version": _git_version(repo_root),
@@ -175,6 +237,14 @@ def register_frontend_feature(server_module):
             "user_name": personalize.USER_NAME,
             "ai_name": personalize.AI_NAME,
             "together_since": personalize.TOGETHER_SINCE,
+            # 补丁靠字符串匹配，上游一改就会静默失效；这里如实报告命中情况。
+            "patches": {
+                "demo_removed": DEMO_START not in built,
+                "her_messages": "m.kind === 'me' || m.kind === 'her'" in built,
+                "tool_result": "m.result || ''" in built,
+                "tool_labels": "case 'write_diary'" in built,
+                "verbof_anchor_found": VERBOF_ANCHOR in source_text,
+            },
         })
 
     server_module.app.view_functions["index"] = index_real
