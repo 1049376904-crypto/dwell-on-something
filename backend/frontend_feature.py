@@ -148,7 +148,27 @@ def _patch_tool_labels(html: str) -> str:
     return html
 
 
-def _build_frontend(source: Path) -> str:
+def _patch_push(html: str, client_script: str) -> str:
+    """挂上 PWA 清单和推送客户端脚本。
+
+    清单是 iOS 的硬性前提：只有「添加到主屏幕」之后才允许申请通知权限。
+    """
+    if not client_script or "window.dwellPush" in html:
+        return html
+
+    if 'rel="manifest"' not in html:
+        html = html.replace(
+            "</head>",
+            '  <link rel="manifest" href="/manifest.json">\n</head>',
+            1,
+        )
+
+    # 放在 body 结束前，确保注册时页面脚本已就位。
+    html = html.replace("</body>", client_script + "</body>", 1)
+    return html
+
+
+def _build_frontend(source: Path, push_script: str = "") -> str:
     html = source.read_text(encoding="utf-8")
 
     # 移除演示 fetch 拦截，让请求真正进入后端。
@@ -186,6 +206,7 @@ def _build_frontend(source: Path) -> str:
     )
 
     html = _patch_tool_labels(html)
+    html = _patch_push(html, push_script)
 
     # 允许空日记正常进入主页。
     html = html.replace(
@@ -215,10 +236,14 @@ def register_frontend_feature(server_module):
     repo_root = Path(__file__).resolve().parent.parent
     source = repo_root / "web" / "index.html"
 
+    def push_script():
+        # push_feature 可能还没注册（或注册失败），推送脚本就当不存在。
+        return getattr(server_module, "push_client_script", "") or ""
+
     def index_real():
         if not source.exists():
             return Response("找不到 web/index.html", status=500, mimetype="text/plain")
-        response = Response(_build_frontend(source), mimetype="text/html")
+        response = Response(_build_frontend(source, push_script()), mimetype="text/html")
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -227,7 +252,7 @@ def register_frontend_feature(server_module):
 
     def version_real():
         source_text = source.read_text(encoding="utf-8") if source.exists() else ""
-        built = _build_frontend(source) if source.exists() else ""
+        built = _build_frontend(source, push_script()) if source.exists() else ""
         return jsonify({
             "ok": True,
             "version": _git_version(repo_root),
@@ -244,6 +269,8 @@ def register_frontend_feature(server_module):
                 "tool_result": "m.result || ''" in built,
                 "tool_labels": "case 'write_diary'" in built,
                 "verbof_anchor_found": VERBOF_ANCHOR in source_text,
+                "push_script": "window.dwellPush" in built,
+                "manifest_link": 'rel="manifest"' in built,
             },
         })
 
