@@ -5,7 +5,7 @@
   它自己会广播 stream_event、存 messages、写 transcript，
   所以前端不需要任何改动，长轮询照常收到。
 * 默认关闭。心跳会自己发起网关请求、产生费用，必须由妍妍显式打开。
-* 状态落库。上次触发时间和当天次数写在 settings 表，pm2 重启不会重新刷一轮。
+* 状态落库。上次触发时间和当夜次数写在 settings 表，pm2 重启不会重新刷一轮。
 * 绝不打断对话。生成中（busy）或她刚说过话（静默不足）都直接跳过。
 * 必须留下痕迹。每次触发都记录结果（spoke / silent），
   否则「它没醒」和「它醒了但没说话」在界面上完全分辨不出来。
@@ -14,11 +14,15 @@
 
 时段格式：HH:MM-HH:MM，逗号分隔，允许跨午夜（如 23:00-01:00）。
 解析前会把各种非 ASCII 连字符和全角冒号归一，手机复制粘贴常把 - 变成 U+2011。
+
+关于时间：所有「现在几点」「算哪一夜」的判断都必须走 cn_now()。
+服务器本地时区可能是 UTC，直接用 datetime.now() 会让整个时段判断
+整体平移八小时——夜里的窗口跑到白天去。这一个函数漏掉一处就前功尽弃。
 """
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from flask import jsonify, request
 
@@ -33,10 +37,11 @@ KEY_DAY_TALLY = "heartbeat_day_tally"
 KEY_LAST_RESULT = "heartbeat_last_result"
 KEY_LAST_TEXT = "heartbeat_last_text"
 KEY_LAST_PUSH = "heartbeat_last_push"
+KEY_LAST_MANUAL = "heartbeat_last_manual_at"
 
 DEFAULTS = {
     KEY_ENABLED: "0",
-    # 睡前和清早各留一个窗口。
+    # 睡前和清早各留一个窗口。这两个窗口属于同一「夜」，共享 max_per_day。
     KEY_WINDOWS: "22:30-23:59,07:00-08:30",
     KEY_MAX_PER_DAY: "2",
     KEY_MIN_GAP: "240",
@@ -44,13 +49,31 @@ DEFAULTS = {
     KEY_LAST_RESULT: "",
     KEY_LAST_TEXT: "",
     KEY_LAST_PUSH: "",
+    KEY_LAST_MANUAL: "0",
 }
 
 CHECK_INTERVAL = 60
 HISTORY_FOR_HEARTBEAT = 24
 
+CN_TZ = timezone(timedelta(hours=8))
+
+# 一「夜」的起点挪到中午：这样 22:30 和次日 07:00 算出来是同一个键，
+# 跨零点不会把计数刷掉。
+NIGHT_OFFSET_HOURS = 12
+
 # 手机上复制粘贴常把 ASCII 连字符换成这些字符，解析前统一归一。
 DASH_VARIANTS = "\u2011\u2010\u2012\u2013\u2014\u2015\uff0d\u2212"
+
+
+def cn_now():
+    """北京时间。所有跟「几点」有关的判断都必须走这里。"""
+    return datetime.now(CN_TZ)
+
+
+def night_key(now=None):
+    """当前属于哪一「夜」。把起点挪到中午，跨零点前后是同一个字符串。"""
+    now = now or cn_now()
+    return (now - timedelta(hours=NIGHT_OFFSET_HOURS)).strftime("%Y-%m-%d")
 
 
 def _normalize_window_text(raw):
@@ -115,9 +138,16 @@ def register_heartbeat_feature(server_module):
         except (TypeError, ValueError):
             return fallback
 
-    def last_message_at():
+    def last_her_at():
+        """妍妍最后一次说话的时间。
+
+        必须限定 kind='her'：算上沐自己的发言，心跳一开口就把静默计时
+        重置了，本来想表达的「她安静了多久」就变成了「谁都没说话多久」。
+        """
         with get_db() as db:
-            row = db.execute("SELECT MAX(at) AS m FROM messages").fetchone()
+            row = db.execute(
+                "SELECT MAX(at) AS m FROM messages WHERE kind='her'"
+            ).fetchone()
         return int(row["m"] or 0)
 
     def max_seq():
@@ -125,22 +155,22 @@ def register_heartbeat_feature(server_module):
             row = db.execute("SELECT MAX(seq) AS m FROM messages").fetchone()
         return int(row["m"] or 0)
 
-    def today_count():
-        """当天已触发次数；日期一变自动归零。"""
+    def night_count():
+        """当夜已触发次数；换一夜自动归零。"""
         raw = read(KEY_DAY_TALLY)
-        today = datetime.now().strftime("%Y-%m-%d")
+        key = night_key()
         if ":" in str(raw):
             day, _, count = str(raw).partition(":")
-            if day == today:
+            if day == key:
                 try:
-                    return today, int(count)
+                    return key, int(count)
                 except ValueError:
-                    return today, 0
-        return today, 0
+                    return key, 0
+        return key, 0
 
     def bump_count():
-        today, count = today_count()
-        write(KEY_DAY_TALLY, f"{today}:{count + 1}")
+        key, count = night_count()
+        write(KEY_DAY_TALLY, f"{key}:{count + 1}")
         write(KEY_LAST_AT, int(time.time()))
 
     def why_not_now():
@@ -152,17 +182,17 @@ def register_heartbeat_feature(server_module):
             if server_module.state["busy"]:
                 return "正在生成回复"
 
-        now = datetime.now()
+        now = cn_now()
         windows = _parse_windows(read(KEY_WINDOWS))
         if not windows:
             return "没有配置有效时段"
         if not _in_windows(windows, now.hour * 60 + now.minute):
             return "不在设定时段内"
 
-        _, count = today_count()
+        _, count = night_count()
         limit = read_int(KEY_MAX_PER_DAY, 2)
         if count >= limit:
-            return f"今天已经主动说过 {count} 次，达到上限 {limit}"
+            return f"这一夜已经主动说过 {count} 次，达到上限 {limit}"
 
         gap_minutes = read_int(KEY_MIN_GAP, 240)
         last = read_int(KEY_LAST_AT, 0)
@@ -170,15 +200,15 @@ def register_heartbeat_feature(server_module):
             return f"距上次心跳不足 {gap_minutes} 分钟"
 
         idle_minutes = read_int(KEY_IDLE, 90)
-        last_msg = last_message_at()
+        last_msg = last_her_at()
         if last_msg and time.time() - last_msg < idle_minutes * 60:
             return f"她刚说过话，静默不足 {idle_minutes} 分钟"
 
         return None
 
     def build_nudge():
-        now = datetime.now()
-        last_msg = last_message_at()
+        now = cn_now()
+        last_msg = last_her_at()
         quiet = int((time.time() - last_msg) / 60) if last_msg else 0
 
         # 以 user 角色送入，但明确标注不是妍妍说的话，
@@ -220,7 +250,13 @@ def register_heartbeat_feature(server_module):
 
         返回 True 表示确实产生了正文回复。结果会落库，
         方便事后从 /api/heartbeat 看出它到底有没有开口。
+
+        手动触发（reason="manual"）不占当夜配额、也不写 last_at：
+        测一下功能通不通，不该把今晚剩下的机会用掉，
+        更不该让接下来四个小时的自动心跳被 min_gap 挡在门外。
         """
+        manual = reason == "manual"
+
         history = [
             {"role": "user" if m["kind"] == "her" else "assistant", "content": m["text"]}
             for m in server_module.load_messages(HISTORY_FOR_HEARTBEAT)
@@ -228,7 +264,12 @@ def register_heartbeat_feature(server_module):
         history.append({"role": "user", "content": build_nudge()})
 
         before = max_seq()
-        bump_count()
+        if manual:
+            write(KEY_LAST_MANUAL, int(time.time()))
+        else:
+            # 计数先写：网关调用失败也算用掉一次，
+            # 否则每 60 秒重试一遍，报错还烧钱。
+            bump_count()
 
         try:
             server_module.call_gateway(history, server_module.current_model())
@@ -270,8 +311,10 @@ def register_heartbeat_feature(server_module):
             time.sleep(CHECK_INTERVAL)
 
     def api_heartbeat_get():
-        _, count = today_count()
+        now = cn_now()
+        key, count = night_count()
         blocked = why_not_now()
+        last_her = last_her_at()
         return jsonify({
             "ok": True,
             "enabled": read(KEY_ENABLED) == "1",
@@ -283,8 +326,17 @@ def register_heartbeat_feature(server_module):
             "max_per_day": read_int(KEY_MAX_PER_DAY, 2),
             "min_gap_minutes": read_int(KEY_MIN_GAP, 240),
             "idle_minutes": read_int(KEY_IDLE, 90),
+            # 时段判断用的是下面这个 cn_time。它和 server_local_time 不一致
+            # 说明服务器不在 UTC+8，以前按本地时区判断的窗口是偏的。
+            "cn_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "server_local_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "night": key,
+            "night_count": count,
             "today_count": count,
             "last_at": read_int(KEY_LAST_AT, 0),
+            "last_manual_at": read_int(KEY_LAST_MANUAL, 0),
+            "her_last_at": last_her,
+            "her_quiet_minutes": int((time.time() - last_her) / 60) if last_her else None,
             "last_result": read(KEY_LAST_RESULT),
             "last_text": read(KEY_LAST_TEXT),
             "last_push": read(KEY_LAST_PUSH),
@@ -328,7 +380,8 @@ def register_heartbeat_feature(server_module):
         return jsonify({
             "ok": True,
             "detail": "已触发，十几秒后看聊天页；"
-                      "结果也会记在 /api/heartbeat 的 last_result 里",
+                      "结果也会记在 /api/heartbeat 的 last_result 里。"
+                      "手动触发不占当夜次数。",
         })
 
     server_module.app.add_url_rule(
