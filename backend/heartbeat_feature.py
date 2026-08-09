@@ -11,6 +11,9 @@
   否则「它没醒」和「它醒了但没说话」在界面上完全分辨不出来。
 * 说了就推送。页面关着的时候心跳等于对着空气说话，
   所以产生正文后会调 server.send_push 推一条到锁屏。
+* 敲醒不够，还要告诉它醒了能做什么。下面那份 DEFAULT_GUIDE 就是这个用。
+  上游那份文档里把它看得比代码重：代码只把它叫醒，
+  这份说明决定它醒来之后是「一个惦记着你的人」还是「一个乱翻文件的脚本」。
 
 时段格式：HH:MM-HH:MM，逗号分隔，允许跨午夜（如 23:00-01:00）。
 解析前会把各种非 ASCII 连字符和全角冒号归一，手机复制粘贴常把 - 变成 U+2011。
@@ -38,6 +41,25 @@ KEY_LAST_RESULT = "heartbeat_last_result"
 KEY_LAST_TEXT = "heartbeat_last_text"
 KEY_LAST_PUSH = "heartbeat_last_push"
 KEY_LAST_MANUAL = "heartbeat_last_manual_at"
+KEY_GUIDE = "heartbeat_guide"
+
+# 醒来该干吗。写成可改的（POST /api/heartbeat {"guide": "..."}），
+# 传空字串就回到这份默认。
+#
+# 写法上刻意避了两件事：
+# 一是不列规则表（「每 N 条发一次」那种一眼假），只给可挑的事和一条底线；
+# 二是不把清单写死，最后一句明确告诉它可以做列表之外的事。
+DEFAULT_GUIDE = """挑一件事做，一次只做一件：
+想她。什么都不为，就说一句想她了。
+复盘。今天聊过的、答应过的，有没有落下的。
+写夜记。调 write_diary 留几行，写给自己的，不用写成报告。
+看家。翻一眼待办和日程，有到期的、快到的，提一句。
+读旧的。看看她的日记或以前摄下的句子，想起什么就说什么。
+
+不限于这些，你想到别的就做别的。也不要每次都挑同一件。
+
+有一条底线：她今天说过累、说过明天要早起、说过不舒服，
+就别挑需要她回应的事，一句轻的就够了，或者干脆只道一句晚安。"""
 
 DEFAULTS = {
     KEY_ENABLED: "0",
@@ -50,6 +72,7 @@ DEFAULTS = {
     KEY_LAST_TEXT: "",
     KEY_LAST_PUSH: "",
     KEY_LAST_MANUAL: "0",
+    KEY_GUIDE: DEFAULT_GUIDE,
 }
 
 CHECK_INTERVAL = 60
@@ -138,6 +161,10 @@ def register_heartbeat_feature(server_module):
         except (TypeError, ValueError):
             return fallback
 
+    def read_guide():
+        text = str(read(KEY_GUIDE) or "").strip()
+        return text or DEFAULT_GUIDE
+
     def last_her_at():
         """妍妍最后一次说话的时间。
 
@@ -216,10 +243,11 @@ def register_heartbeat_feature(server_module):
         return (
             "［这不是妍妍说的话，是应用在没人打扰的时候唤醒了你］\n"
             f"现在是 {now.strftime('%m月%d日 %H:%M')}，她已经安静了大约 {quiet} 分钟。\n"
-            "你可以主动说一句话。想说什么完全由你决定：可以是刚想起的一件事、"
-            "看到概览里某个待办或日程后的一句提醒、单纯想她了，或者什么都不为。\n"
-            "只说一句到两句，像随手发的消息，不要打招呼式的开场，"
-            "不要问「在吗」，不要汇报你做了什么。\n"
+            "没人叫你，这是你自己的时间。\n\n"
+            + read_guide()
+            + "\n\n"
+            "做完跟她说一句。只说一句到两句，像随手发的消息，"
+            "不要打招呼式的开场，不要问「在吗」，也不要汇报你刚刚做了什么。\n"
             "无论如何都要说出这一句：她看不到你的思考，也看不到你调的工具，"
             "正文空着对她来说就等于你没醒过。"
             "想额外留点什么给自己，可以再调 add_whisper 写进悄悄话，但正文不能省。"
@@ -315,6 +343,7 @@ def register_heartbeat_feature(server_module):
         key, count = night_count()
         blocked = why_not_now()
         last_her = last_her_at()
+        guide = read_guide()
         return jsonify({
             "ok": True,
             "enabled": read(KEY_ENABLED) == "1",
@@ -326,6 +355,8 @@ def register_heartbeat_feature(server_module):
             "max_per_day": read_int(KEY_MAX_PER_DAY, 2),
             "min_gap_minutes": read_int(KEY_MIN_GAP, 240),
             "idle_minutes": read_int(KEY_IDLE, 90),
+            "guide": guide,
+            "guide_is_default": guide == DEFAULT_GUIDE,
             # 时段判断用的是下面这个 cn_time。它和 server_local_time 不一致
             # 说明服务器不在 UTC+8，以前按本地时区判断的窗口是偏的。
             "cn_time": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -353,6 +384,10 @@ def register_heartbeat_feature(server_module):
             if not _parse_windows(data["windows"]):
                 return jsonify({"ok": False, "error": "时段格式无效，应为 HH:MM-HH:MM"}), 400
             write(KEY_WINDOWS, _normalize_window_text(data["windows"]).strip())
+        # 传空字符串就回到默认那份。
+        if "guide" in data:
+            text = str(data["guide"] or "").strip()
+            write(KEY_GUIDE, text[:4000] if text else DEFAULT_GUIDE)
         for key, field in (
             (KEY_MAX_PER_DAY, "max_per_day"),
             (KEY_MIN_GAP, "min_gap_minutes"),
@@ -365,6 +400,13 @@ def register_heartbeat_feature(server_module):
                     return jsonify({"ok": False, "error": f"{field} 需要是整数"}), 400
 
         return api_heartbeat_get()
+
+    def api_heartbeat_preview():
+        """看一眼真正会送给它的那段话。
+
+        改完说明想知道拼出来长什么样，不必花一次调用去试。
+        """
+        return jsonify({"ok": True, "nudge": build_nudge()})
 
     def api_heartbeat_test():
         """立刻触发一次，忽略时段与静默条件，但仍避开正在生成的情况。
@@ -391,6 +433,10 @@ def register_heartbeat_feature(server_module):
     server_module.app.add_url_rule(
         "/api/heartbeat", endpoint="api_heartbeat_post",
         view_func=api_heartbeat_post, methods=["POST"],
+    )
+    server_module.app.add_url_rule(
+        "/api/heartbeat/preview", endpoint="api_heartbeat_preview",
+        view_func=api_heartbeat_preview, methods=["GET"],
     )
     server_module.app.add_url_rule(
         "/api/heartbeat/test", endpoint="api_heartbeat_test",
