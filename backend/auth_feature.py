@@ -1,4 +1,4 @@
-"""一道口令闸门。
+"""一道口令闸门，外加一个给命令行用的维护令牌。
 
 ## 为什么需要
 
@@ -18,6 +18,26 @@ PWA 里也只需要输一次，不影响推送和主屏安装。
 cookie 是 "过期时间戳.签名"，签名密钥由一个随机 secret 加上口令哈希
 一起派生。这意味着改口令会让所有已登录设备立刻失效——
 这个副作用是特意要的：口令泄露了，改一次就能把别人踢出去。
+
+## 维护令牌：为什么不是「本机免鉴权」
+
+闸门装上之后，在 VPS 上 curl 任何接口都会被挡，每次维护（手动出报、
+跑备份、测心跳）都得先 POST 一次 /api/auth/login 换 cookie。很烦。
+
+直觉的解法是「remote_addr 是 127.0.0.1 就放行」。**这条不能做。**
+nginx 监听 8070、把请求 proxy_pass 到 127.0.0.1:8888，
+所以公网进来的每一个请求，在 Flask 眼里 remote_addr 都是 127.0.0.1。
+按来源 IP 放行等于把整道闸门废掉——而且表面上看不出来，
+状态接口还会一直报「闸门生效」。
+
+退一步想「那就要求没有 X-Forwarded-For 头」也不行：nginx 默认
+并不添加那个头，要显式写 proxy_set_header 才有。这台机器的 nginx
+到底配没配，我没读过它的 conf，不能拿整站安全去赌一个假设。
+
+所以改成一个随机令牌：启动时生成，存在 data/admin_token（权限 0600）。
+请求带 `X-Dwell-Token` 头（或 `?token=`）就放行。
+能读到那个文件的人已经登上这台机器了，本来就有更高的权限，
+所以这不额外降低安全性；而且它跟来源 IP 无关，从哪儿调都行。
 
 ## 三处刻意的取舍
 
@@ -42,14 +62,17 @@ service worker 注册也不带 cookie 语义保证；拦掉会让安装和推送
 
 15 分钟内错 8 次就锁 15 分钟。存在内存里，重启清零——
 这不是抗大规模爆破的方案，是防止有人慢慢试出四位数字口令。
+令牌不走限速：它是 32 字节随机数，猜不出来。
 """
 
 import base64
 import hashlib
 import hmac
+import os
 import secrets
 import threading
 import time
+from pathlib import Path
 
 from flask import Response, jsonify, redirect, request
 
@@ -57,8 +80,13 @@ from flask import Response, jsonify, redirect, request
 KEY_HASH = "auth_password_hash"
 KEY_SALT = "auth_password_salt"
 KEY_SECRET = "auth_cookie_secret"
+KEY_ADMIN_TOKEN = "auth_admin_token"
 
 COOKIE_NAME = "dwell_auth"
+
+# 命令行维护用的请求头。也接受 ?token=，但那个会进 werkzeug 的访问日志，
+# 优先用头。
+TOKEN_HEADER = "X-Dwell-Token"
 
 # cookie 有效期。手机上不该反复输口令。
 COOKIE_DAYS = 180
@@ -107,6 +135,7 @@ def _derive(password, salt):
 def register_auth_feature(server_module):
     get_db = server_module.get_db
     app = server_module.app
+    token_path = Path(server_module.DB_PATH).parent / "admin_token"
 
     # 失败计数。进程内，重启清零。
     fails = {"count": 0, "first": 0, "locked_until": 0}
@@ -128,6 +157,38 @@ def register_auth_feature(server_module):
             value = secrets.token_hex(32)
             write(KEY_SECRET, value)
         return value
+
+    # ── 维护令牌
+
+    def ensure_admin_token():
+        """维护令牌：库里存一份，磁盘上放一份方便 cat。
+
+        写文件用 0600：这台机器上别的用户读不到。
+        文件丢了会从库里重新写出来，所以可以随便删。
+        """
+        value = read(KEY_ADMIN_TOKEN)
+        if not value:
+            value = secrets.token_urlsafe(32)
+            write(KEY_ADMIN_TOKEN, value)
+        try:
+            if not token_path.exists() or token_path.read_text().strip() != value:
+                token_path.write_text(value + "\n", encoding="ascii")
+            os.chmod(token_path, 0o600)
+        except OSError as exc:
+            print("[dwell] 维护令牌写不进文件（" + str(exc)[:80] + "），可以从库里取")
+        return value
+
+    def token_ok():
+        """请求带了正确的维护令牌吗。
+
+        刻意不看来源 IP：nginx 转发之后所有公网请求的 remote_addr
+        都是 127.0.0.1，按 IP 放行会把整道闸门废掉。
+        """
+        expected = read(KEY_ADMIN_TOKEN)
+        if not expected:
+            return False
+        given = request.headers.get(TOKEN_HEADER) or request.args.get("token") or ""
+        return bool(given) and hmac.compare_digest(str(given), expected)
 
     def configured():
         return bool(read(KEY_HASH)) and bool(read(KEY_SALT))
@@ -228,11 +289,19 @@ def register_auth_feature(server_module):
             return None
         if authed():
             return None
+        # 命令行维护走令牌，不用换 cookie。
+        if token_ok():
+            return None
 
         # 接口给 JSON，页面给跳转。前端 fetch 拿到 HTML 会莫名报错，
         # 401 加一句话更容易看懂。
         if request.path.startswith("/api/"):
-            return jsonify({"ok": False, "error": "未登录", "auth": "required"}), 401
+            return jsonify({
+                "ok": False,
+                "error": "未登录",
+                "auth": "required",
+                "hint": "命令行加 -H '" + TOKEN_HEADER + ": <data/admin_token 里那串>'",
+            }), 401
         return redirect("/auth?next=" + request.path)
 
     # ── 接口
@@ -244,9 +313,13 @@ def register_auth_feature(server_module):
             # 没设口令时闸门是关着的，这一项如实报告。
             "gate_active": configured(),
             "authed": authed() if configured() else True,
+            "by_token": token_ok(),
             "https": is_https(),
             "cookie_days": COOKIE_DAYS,
             "locked_seconds": locked_for(),
+            # 只报路径，不回显令牌本身。
+            "admin_token_file": str(token_path),
+            "admin_token_header": TOKEN_HEADER,
             "open_paths": sorted(OPEN_EXACT) + [p + "*" for p in OPEN_PREFIX],
         })
 
@@ -323,6 +396,22 @@ def register_auth_feature(server_module):
             "detail": "改好了。其他设备需要重新登录。",
         }))
 
+    def api_token_rotate():
+        """换一个维护令牌。旧的立刻失效。
+
+        要么已经登录，要么带着旧令牌，才能调——这一条不在放行名单里，
+        所以闸门本身已经挡过一轮了。
+        """
+        write(KEY_ADMIN_TOKEN, "")
+        value = ensure_admin_token()
+        return jsonify({
+            "ok": True,
+            "detail": "换好了，旧令牌作废",
+            "file": str(token_path),
+            # 这条接口必须过闸门才能调到，回显一次省得再去 cat。
+            "token": value,
+        })
+
     def api_logout():
         response = jsonify({"ok": True})
         response.delete_cookie(COOKIE_NAME, path="/")
@@ -341,14 +430,18 @@ def register_auth_feature(server_module):
         ("/api/auth/login", "api_auth_login", api_login, ["POST"]),
         ("/api/auth/change", "api_auth_change", api_change, ["POST"]),
         ("/api/auth/logout", "api_auth_logout", api_logout, ["POST"]),
+        ("/api/auth/token", "api_auth_token", api_token_rotate, ["POST"]),
     ]
     for rule, endpoint, view, methods in routes:
         app.add_url_rule(rule, endpoint=endpoint, view_func=view, methods=methods)
+
+    ensure_admin_token()
 
     if configured():
         print("[dwell] 访问口令: 已设置，闸门生效")
     else:
         print("[dwell] 访问口令: 还没设！整站对公网敞开，请打开 /auth 设一个")
+    print("[dwell] 维护令牌: " + str(token_path) + "（curl 加 " + TOKEN_HEADER + " 头）")
 
     return authed
 
