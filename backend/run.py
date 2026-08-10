@@ -7,6 +7,7 @@
 import server
 from compat import register_compat
 from storage_feature import register_storage_feature
+from auth_feature import register_auth_feature
 from gateway_config import register_gateway_config
 from models_feature import register_models_feature
 from media_feature import register_media_feature
@@ -31,6 +32,10 @@ from panel_shell import register_panel_shell
 register_compat(server)
 # 存储必须最先固定，否则其余模块会在错误的数据库里建表。
 db_path = register_storage_feature(server)
+# 口令闸门紧跟在存储之后：它要读写 settings，但必须在其余模块之前，
+# 因为 Flask 的 before_request 按注册顺序执行——排在后面的话，
+# 先注册的钩子会在没验身份的情况下先跑一遍。
+register_auth_feature(server)
 # 网关配置要在聊天代理之前生效。
 register_gateway_config(server)
 # 模型清单接管 /api/model，要在网关配置之后。
@@ -98,4 +103,5 @@ if __name__ == "__main__":
     print("  backup  : /backup 面板（默认关闭，只推文本库）")
     print("  panels  : 浮层内打开，配色取自上游 :root（/api/panel/vars）")
     print("  busy    : 原子占位，卡住会自动抢占（/api/busy）")
+    print("  auth    : /auth 设口令；没设之前整站敞开")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
