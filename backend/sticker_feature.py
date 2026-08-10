@@ -549,12 +549,13 @@ def _wire_tools(server_module, send, rows, overview):
 # 上游 renderRich 到底给 img 挂了什么 class 我没核实过，
 # 而 src 里的前缀是我们自己存的，一定在。
 #
-# 两条颜色原则（上一版没做到，面板整片深色加蓝，跟这套暖白的皮完全脱节）：
-# 一是主题色一律从页面上读，不写死；二是不用蓝色，链接和图标都走前景色。
+# 两条颜色原则：主题色一律从页面上读，不写死；不用蓝色，链接和图标都走前景色。
 # 读的办法是往上找第一个不透明的背景色，body 上可能是透明的。
 #
-# 输入区那个按钮不再自己写样式，直接克隆上游的「+」再换掉里面的图标：
-# 底色、圆角、大小、颜色全部自动跟它一致，换主题也不会脱节。
+# 输入区那个按钮：克隆上游的「+」，但样式不在这里写——
+# 上游把外观挂在 #plusBtn 这个 id 选择器上，克隆后 id 一换就全丢，
+# 所以是在 frontend_feature 里把新 id 并进上游那条选择器。
+# 图标同理，交给上游的 fillIcons 去画，不自己拼 SVG。
 CLIENT_SCRIPT = """<style>
   img[src*="/sticker/"] {
     max-width: 112px;
@@ -655,11 +656,16 @@ CLIENT_SCRIPT = """<style>
 (function () {
   var sheet = null, backdrop = null, grid = null;
 
-  var FACE =
+  // 只在 ICONS 表里没有 smile 时用（也就是 frontend_feature 的图标补丁没打上）。
+  // 正常路径下这段用不到，图标由上游 fillIcons 画。
+  var FALLBACK_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+    'stroke-linecap="round" stroke-linejoin="round">' +
     '<circle cx="12" cy="12" r="9"/>' +
-    '<path d="M8.8 14.2c.8.9 1.9 1.4 3.2 1.4s2.4-.5 3.2-1.4"/>' +
-    '<circle cx="9.3" cy="10" r=".95" fill="currentColor" stroke="none"/>' +
-    '<circle cx="14.7" cy="10" r=".95" fill="currentColor" stroke="none"/>';
+    '<path d="M8.5 14.3c.9 1.1 2.1 1.7 3.5 1.7s2.6-.6 3.5-1.7"/>' +
+    '<line x1="9" y1="9.6" x2="9" y2="9.9"/>' +
+    '<line x1="15" y1="9.6" x2="15" y2="9.9"/>' +
+    '</svg>';
 
   // 往上找第一个不透明的背景色。body 上经常是 transparent。
   function solidBg(el) {
@@ -778,25 +784,24 @@ CLIENT_SCRIPT = """<style>
     backdrop.classList.add('open');
   }
 
-  // 克隆上游的「+」按钮，只换里面的图标。
-  // 上一版自己写样式，结果少了那层底色，一个光秃秃的笑脸挂在圆底按钮旁边很突兀。
-  // 克隆之后 class 完全一致，底色圆角大小配色全部自动跟上，换主题也不会脱节。
-  // cloneNode 不会复制 addEventListener 和 onclick 属性挂的处理器，
-  // 但内联 onclick="" 会跟着复制，所以显式清掉。
+  // 克隆上游的「+」按钮，把里面的图标换成笑脸。
+  //
+  // 两件事刻意不在这里做：
+  // 一是不写样式。上游 #plusBtn / #plusBtn .ic 是 id 选择器，
+  //   克隆后 id 一换就全部失效（底色、圆角、36px、居中都没了，
+  //   于是一个光秃秃没对齐的笑脸挂在圆底的「+」旁边）。
+  //   修法在 frontend_feature：把新 id 并进上游那条选择器。
+  // 二是不自己拼 SVG、不量尺寸。上一版在这里 getBoundingClientRect，
+  //   而克隆出来的节点还没进文档，量出来恒等于 0，尺寸和描边
+  //   全落回写死的兜底值。现在保留 <span class="ic">、只改 data-i，
+  //   插进文档后让上游的 fillIcons 自己填——smile 已经补进 ICONS 表。
+  //
+  // cloneNode 不复制 addEventListener 挂的处理器，但内联 onclick="" 会跟着来，
+  // 所以显式清掉，否则点表情会弹出「+」那张 sheet。
   function mount() {
     if (document.getElementById('dwellStickerBtn')) return true;
     var plus = document.getElementById('plusBtn');
     if (!plus || !plus.parentNode) return false;
-
-    // 先量原按钮里的图标，克隆出来的还没进文档，量不到。
-    var size = 20, stroke = 1.6;
-    var osvg = plus.querySelector('svg');
-    if (osvg) {
-      var box = osvg.getBoundingClientRect();
-      if (box.width) size = Math.round(box.width);
-      var sw = parseFloat(getComputedStyle(osvg).strokeWidth);
-      if (sw) stroke = sw;
-    }
 
     var b = plus.cloneNode(true);
     b.id = 'dwellStickerBtn';
@@ -804,27 +809,22 @@ CLIENT_SCRIPT = """<style>
     b.setAttribute('aria-label', '发表情');
     b.title = '发表情';
 
-    var svg =
-      '<svg viewBox="0 0 24 24" width="' + size + '" height="' + size + '" ' +
-      'fill="none" stroke="currentColor" stroke-width="' + stroke + '" ' +
-      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-      FACE + '</svg>';
-
-    // 上游图标可能包在 <span class="ic" data-i="plus"> 里，也可能是裸 svg。
-    // 找得到那层就替换它的内容，顺手把 data-i 改掉，免得重绘时又变回加号。
-    var holder = b.querySelector('.ic') || b.querySelector('svg');
-    if (holder && holder.tagName.toLowerCase() === 'svg') {
-      holder.innerHTML = FACE;
-      holder.setAttribute('viewBox', '0 0 24 24');
-    } else if (holder) {
+    var holder = b.querySelector('.ic');
+    if (holder) {
       holder.setAttribute('data-i', 'smile');
-      holder.innerHTML = svg;
-    } else {
-      b.innerHTML = svg;
+      holder.innerHTML = '';
     }
 
     b.onclick = open;
     plus.parentNode.insertBefore(b, plus.nextSibling);
+
+    // 进文档之后再填图标。
+    if (holder) {
+      if (typeof fillIcons === 'function') { try { fillIcons(b); } catch (e) {} }
+      if (!holder.innerHTML.trim()) holder.innerHTML = FALLBACK_ICON;
+    } else {
+      b.innerHTML = FALLBACK_ICON;
+    }
     return true;
   }
 
@@ -864,9 +864,9 @@ CLIENT_SCRIPT = """<style>
 # 和 /push、/models 一样做成独立页：上游设置页靠字符串补丁插东西，容易打歪。
 # 上传不过 canvas，直接读原字节转 base64——GIF 得保住它的动。
 #
-# 配色跟着主应用那套暖白走（上一版是 #111113 加蓝，完全两码事）。
-# 这是独立文档，读不到主应用的主题变量，所以写死一套暖色，
-# 另外加一段 prefers-color-scheme: dark，系统切深色时自动跟着变。
+# 配色跟着主应用那套暖白走。这是独立文档，读不到主应用的主题变量，
+# 所以写死一套暖色，另外加一段 prefers-color-scheme: dark，
+# 系统切深色时自动跟着变。
 PANEL_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
