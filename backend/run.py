@@ -23,6 +23,7 @@ from agent_tools_feature import register_agent_tools_feature
 from sticker_feature import register_sticker_feature
 from heartbeat_feature import register_heartbeat_feature
 from backup_feature import register_backup_feature
+from panel_shell import register_panel_shell
 
 
 register_compat(server)
@@ -59,6 +60,10 @@ register_heartbeat_feature(server)
 # 备份放在最末：只依赖 get_db 和 DB_PATH，但它的定时线程会读整个库，
 # 等其余模块把表都建完再启动最省事。
 register_backup_feature(server)
+# 面板样式统一：靠 after_request 给 /push /models /stickers /backup
+# 注一段共用样式，颜色从 web/index.html 的 :root 解析。
+# 和注册顺序无关，排在所有面板之后读起来最清楚。
+register_panel_shell(server)
 
 
 if __name__ == "__main__":
@@ -80,4 +85,5 @@ if __name__ == "__main__":
     print("  sticker : /stickers 面板，原图存 data/stickers")
     print("  icon    : /api/icon/status")
     print("  backup  : /backup 面板（默认关闭，只推文本库）")
+    print("  panels  : 配色取自上游 :root（/api/panel/vars 可查）")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
