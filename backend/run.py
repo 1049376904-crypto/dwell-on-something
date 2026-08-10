@@ -22,6 +22,7 @@ from transcript_feature import register_transcript_feature
 from agent_tools_feature import register_agent_tools_feature
 from sticker_feature import register_sticker_feature
 from heartbeat_feature import register_heartbeat_feature
+from wake_feature import register_wake_feature
 from backup_feature import register_backup_feature
 from panel_shell import register_panel_shell
 
@@ -57,11 +58,15 @@ register_sticker_feature(server)
 # 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具的那一版，
 # 同时依赖 server.send_push 把主动说的话推到锁屏。
 register_heartbeat_feature(server)
+# /api/wake 是上游设置页那个开关的后端，要在心跳之后：
+# 它借用 heartbeat_feature 的键名和 night_key()，
+# 也需要那边先把默认值写进 settings。
+register_wake_feature(server)
 # 备份放在最末：只依赖 get_db 和 DB_PATH，但它的定时线程会读整个库，
 # 等其余模块把表都建完再启动最省事。
 register_backup_feature(server)
 # 面板样式统一：靠 after_request 给 /push /models /stickers /backup
-# 注一段共用样式，颜色从 web/index.html 的 :root 解析。
+# 注一段共用样式，并往主页注入承载它们的浮层。
 # 和注册顺序无关，排在所有面板之后读起来最清楚。
 register_panel_shell(server)
 
@@ -78,12 +83,12 @@ if __name__ == "__main__":
     print("  events  : 可重放游标队列")
     print("  history : 思考与工具调用持久化重放")
     print("  config  : 设置 → 接入 API（地址/令牌/模型名）")
-    print("  beat    : /api/heartbeat（默认关闭）")
+    print("  beat    : /api/heartbeat；开关也接进了设置页那一行")
     print("  push    : /push 面板（iOS 需 HTTPS + 添加到主屏幕）")
     print("  models  : /models 面板")
     print("  media   : /api/upload，图片存 data/uploads")
     print("  sticker : /stickers 面板，原图存 data/stickers")
     print("  icon    : /api/icon/status")
     print("  backup  : /backup 面板（默认关闭，只推文本库）")
-    print("  panels  : 配色取自上游 :root（/api/panel/vars 可查）")
+    print("  panels  : 浮层内打开，配色取自上游 :root（/api/panel/vars）")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
