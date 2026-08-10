@@ -10,7 +10,8 @@
 * 必须留下痕迹。每次触发都记录结果（spoke / silent），
   否则「它没醒」和「它醒了但没说话」在界面上完全分辨不出来。
   同理，每次「没触发」也要记下被哪道闸门挡住——不然事后问
-  「昨晚为什么没醒」只能靠猜。
+  「昨晚为什么没醒」只能靠猜。异常同样要落库：只 print 的话
+  从接口上看不见，心跳悄悄失效而没有任何线索。
 * 说了就推送。页面关着的时候心跳等于对着空气说话，
   所以产生正文后会调 server.send_push 推一条到锁屏。
 * 敲醒不够，还要告诉它醒了能做什么。下面那份 DEFAULT_GUIDE 就是这个用。
@@ -28,6 +29,11 @@
 只要她在窗口开始前不久说过话，这一夜就必然全被挡住——
 它得等静默满 idle_minutes，而窗口在那之前已经关了。
 默认值现在是 22:00-01:00 配 45 分钟，留了足够余量。
+
+关于额度的记账：先写计数再调用，一次网络抖动就白吃掉整夜的机会；
+先调用再写计数，失败后每 60 秒重试一遍、报错还烧钱。两个都不好。
+这里的做法是先占后退：写计数 → 调用 → 失败就把计数退回去，
+同时记一个 5 分钟的冷却挡住重试。既不白吃额度，也不狂打网关。
 """
 
 import json
@@ -55,6 +61,11 @@ KEY_GUIDE = "heartbeat_guide"
 KEY_LAST_CHECK_AT = "heartbeat_last_check_at"
 KEY_LAST_BLOCK = "heartbeat_last_block"
 KEY_BLOCK_LOG = "heartbeat_block_log"
+# 失败之后的冷却，以及最近一次异常。异常必须落库，
+# 只写 stdout 的话从接口上完全看不出心跳已经不работает了。
+KEY_COOLDOWN_UNTIL = "heartbeat_cooldown_until"
+KEY_LAST_ERROR = "heartbeat_last_error"
+KEY_LAST_ERROR_AT = "heartbeat_last_error_at"
 
 # 醒来该干吗。写成可改的（POST /api/heartbeat {"guide": "..."}），
 # 传空字串就回到这份默认。
@@ -74,6 +85,10 @@ DEFAULT_GUIDE = """挑一件事做，一次只做一件：
 有一条底线：她今天说过累、说过明天要早起、说过不舒服，
 就别挑需要她回应的事，一句轻的就够了，或者干脆只道一句晚安。"""
 
+# 网关失败后停多久再试。挡住「每 60 秒重试一遍」，
+# 又不至于像退不回额度那样把整夜堵死。
+COOLDOWN_MINUTES = 5
+
 DEFAULTS = {
     KEY_ENABLED: "0",
     # 睡前和清早各留一个窗口。这两个窗口属于同一「夜」，共享 max_per_day。
@@ -91,6 +106,9 @@ DEFAULTS = {
     KEY_LAST_CHECK_AT: "0",
     KEY_LAST_BLOCK: "",
     KEY_BLOCK_LOG: "[]",
+    KEY_COOLDOWN_UNTIL: "0",
+    KEY_LAST_ERROR: "",
+    KEY_LAST_ERROR_AT: "0",
 }
 
 CHECK_INTERVAL = 60
@@ -260,6 +278,31 @@ def register_heartbeat_feature(server_module):
         write(KEY_DAY_TALLY, f"{key}:{count + 1}")
         write(KEY_LAST_AT, int(time.time()))
 
+    def refund_count(previous_last_at):
+        """把刚才占的那一次退回去。
+
+        网关抖一下就吃掉整夜的机会太贵，所以调用失败时退额度。
+        last_at 也要还原，否则 min_gap 会接着挡四个小时。
+        配合 COOLDOWN 用：退了额度但不马上重试。
+        """
+        key, count = night_count()
+        write(KEY_DAY_TALLY, f"{key}:{max(0, count - 1)}")
+        write(KEY_LAST_AT, previous_last_at)
+
+    def note_error(reason, detail=""):
+        """异常落库。
+
+        原来只有 print，pm2 日志里翻得到，但 /api/heartbeat 上看不见——
+        心跳悄悄失效时完全没有线索。
+        """
+        text = (str(reason) + ("：" + str(detail) if detail else ""))[:400]
+        write(KEY_LAST_ERROR, text)
+        write(KEY_LAST_ERROR_AT, int(time.time()))
+        print(f"[dwell] 心跳出错: {text}")
+
+    def start_cooldown(minutes=COOLDOWN_MINUTES):
+        write(KEY_COOLDOWN_UNTIL, int(time.time()) + minutes * 60)
+
     # ── 检查留痕
     #
     # 原来被闸门挡住时一行都不记，于是「昨晚它为什么没醒」事后完全查不了，
@@ -275,6 +318,12 @@ def register_heartbeat_feature(server_module):
         except (ValueError, TypeError):
             return []
 
+    def log_event(text):
+        """往时间线里追一条，不做去重。用于结果和异常这类一次性事件。"""
+        log = read_log()
+        log.append({"at": int(time.time()), "reason": str(text)[:200]})
+        write(KEY_BLOCK_LOG, json.dumps(log[-BLOCK_LOG_LIMIT:], ensure_ascii=False))
+
     def record_check(reason):
         now = int(time.time())
         write(KEY_LAST_CHECK_AT, now)
@@ -283,15 +332,18 @@ def register_heartbeat_feature(server_module):
         if read(KEY_LAST_BLOCK) == text:
             return                      # 情况没变，不重复记
         write(KEY_LAST_BLOCK, text)
-
-        log = read_log()
-        log.append({"at": now, "reason": text})
-        write(KEY_BLOCK_LOG, json.dumps(log[-BLOCK_LOG_LIMIT:], ensure_ascii=False))
+        log_event(text)
 
     def why_not_now():
         """返回不该触发的原因；None 表示可以触发。"""
         if read(KEY_ENABLED) != "1":
             return "心跳未开启"
+
+        # 失败冷却。放在最前面几道之后、真正开销之前。
+        cooldown = read_int(KEY_COOLDOWN_UNTIL, 0)
+        if cooldown and time.time() < cooldown:
+            left = int((cooldown - time.time()) / 60) + 1
+            return f"上次出错了，冷却中，还有约 {left} 分钟"
 
         with server_module.state_lock:
             if server_module.state["busy"]:
@@ -375,6 +427,10 @@ def register_heartbeat_feature(server_module):
         手动触发（reason="manual"）不占当夜配额、也不写 last_at：
         测一下功能通不通，不该把今晚剩下的机会用掉，
         更不该让接下来四个小时的自动心跳被 min_gap 挡在门外。
+
+        额度的记账是「先占后退」：定时触发时先把计数加上（防止
+        60 秒后重复触发），调用失败再退回去并进入冷却。
+        既不会被一次网络抖动吃掉整夜，也不会每分钟重试。
         """
         manual = reason == "manual"
 
@@ -385,19 +441,35 @@ def register_heartbeat_feature(server_module):
         history.append({"role": "user", "content": build_nudge()})
 
         before = max_seq()
+        previous_last_at = read_int(KEY_LAST_AT, 0)
         if manual:
             write(KEY_LAST_MANUAL, int(time.time()))
         else:
-            # 计数先写：网关调用失败也算用掉一次，
-            # 否则每 60 秒重试一遍，报错还烧钱。
             bump_count()
 
         try:
-            server_module.call_gateway(history, server_module.current_model())
+            accepted = server_module.call_gateway(
+                history, server_module.current_model()
+            )
         except Exception as exc:
+            if not manual:
+                refund_count(previous_last_at)
+            start_cooldown()
             write(KEY_LAST_RESULT, "error")
             write(KEY_LAST_TEXT, str(exc)[:300])
-            print(f"[dwell] 心跳生成失败: {exc}")
+            note_error("网关调用失败", exc)
+            log_event(f"出错：{str(exc)[:80]}")
+            return False
+
+        # call_gateway 现在会在占不到位子时返回 False——
+        # 那种情况压根没发请求，不该记成「醒过一次」。
+        if accepted is False:
+            if not manual:
+                refund_count(previous_last_at)
+            write(KEY_LAST_RESULT, "skipped")
+            write(KEY_LAST_TEXT, "")
+            log_event("有别的请求正占着网关，这次跳过")
+            print("[dwell] 心跳想说话但网关被占着，额度已退回")
             return False
 
         # call_gateway 是同步的：返回时正文（若有）已经入库。
@@ -409,13 +481,19 @@ def register_heartbeat_feature(server_module):
             ).fetchone()
 
         if row is None:
+            # 请求确实发出去了，只是没产生正文。额度照扣：
+            # 钱已经花了，退回去会让它立刻再试一次。
             write(KEY_LAST_RESULT, "silent")
             write(KEY_LAST_TEXT, "")
+            log_event("醒了，但没有说出正文")
             print(f"[dwell] 心跳（{reason}）已触发，但没有产生正文")
             return False
 
         write(KEY_LAST_RESULT, "spoke")
         write(KEY_LAST_TEXT, row["text"][:300])
+        # 说成了就把上次的错误清掉，免得界面上一直挂着旧报错。
+        write(KEY_LAST_ERROR, "")
+        log_event(f"说了：{row['text'][:60]}")
         print(f"[dwell] 心跳（{reason}）说了：{row['text'][:60]}")
         notify(row["text"])
         return True
@@ -430,7 +508,11 @@ def register_heartbeat_feature(server_module):
                 if reason is None:
                     fire()
             except Exception as exc:
-                print(f"[dwell] 心跳异常: {exc}")
+                # 不能只 print：那样接口上看不见，心跳静默失效没有线索。
+                note_error(f"检查循环异常 {type(exc).__name__}", exc)
+                log_event(f"循环异常：{type(exc).__name__}")
+                # 循环本身出问题时也冷却一下，避免每分钟刷同一个错。
+                start_cooldown()
             time.sleep(CHECK_INTERVAL)
 
     def stamp(ts):
@@ -445,6 +527,7 @@ def register_heartbeat_feature(server_module):
         windows = _parse_windows(read(KEY_WINDOWS))
         upcoming = _next_open(windows, now)
         last_check = read_int(KEY_LAST_CHECK_AT, 0)
+        cooldown = read_int(KEY_COOLDOWN_UNTIL, 0)
 
         return jsonify({
             "ok": True,
@@ -478,6 +561,11 @@ def register_heartbeat_feature(server_module):
             "last_result": read(KEY_LAST_RESULT),
             "last_text": read(KEY_LAST_TEXT),
             "last_push": read(KEY_LAST_PUSH),
+            # 异常现在落库了。这两个字段非空说明心跳撞过问题，
+            # 不必再去翻 pm2 日志。
+            "last_error": read(KEY_LAST_ERROR),
+            "last_error_at_cn": stamp(read_int(KEY_LAST_ERROR_AT, 0)),
+            "cooldown_until_cn": stamp(cooldown) if cooldown > time.time() else "",
             # 后台线程还活着的证据。这个时间停在很久以前，
             # 说明循环线程挂了，重启后端即可。
             "last_check_at_cn": stamp(last_check),
@@ -505,6 +593,10 @@ def register_heartbeat_feature(server_module):
         if "guide" in data:
             text = str(data["guide"] or "").strip()
             write(KEY_GUIDE, text[:4000] if text else DEFAULT_GUIDE)
+        # 手动清掉冷却，方便出错后立刻重试而不用等五分钟。
+        if data.get("clear_cooldown"):
+            write(KEY_COOLDOWN_UNTIL, 0)
+            write(KEY_LAST_ERROR, "")
         for key, field in (
             (KEY_MAX_PER_DAY, "max_per_day"),
             (KEY_MIN_GAP, "min_gap_minutes"),
