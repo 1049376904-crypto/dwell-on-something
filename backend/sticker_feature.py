@@ -9,7 +9,7 @@ AI 把图片链接写进回话，靠 IMG_RE 渲染成 <img> 就完事——
 GIF 进去出来就只剩第一帧了。表情包大半是动图，不能走那条路。
 
 消息里存的是 markdown，但路径用 /sticker/ 而不是 /media/：
-* 前端靠这个前缀把它画小（见 frontend_feature 里的 STICKER_STYLE）；
+* 前端靠这个前缀把它画小（见下面 CLIENT_SCRIPT）；
 * media_feature 的 MEDIA_PATTERN 只认 /media/，所以表情不会被转成 base64
   塞进上下文——一屏表情包如果都转成图传上去，钱和上下文都烧得很快。
 
@@ -23,7 +23,7 @@ call_gateway 每轮重新取，所以注册顺序不要紧。
 """
 
 import base64
-import os
+import re
 import secrets
 import threading
 import time
@@ -49,10 +49,13 @@ MIME_EXT = {
     "image/webp": ".webp",
 }
 
-EXT_MIME = {
-    ".gif": "image/gif", ".png": "image/png",
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
-}
+# 相机和微信导出的文件名当名字等于没名字。这种一律当空，
+# 改成 表情1 这种可数的占位，让她事后在列表里改。
+JUNK_NAME = re.compile(
+    r"^(img|image|photo|pic|wx|mmexport|微信图片|screenshot|截屏|"
+    r"iaic|gif|jpeg|jpg|png|webp|未命名|untitled)[\s_\-0-9()]*$",
+    re.IGNORECASE,
+)
 
 
 def _clean_name(raw, fallback="表情"):
@@ -65,6 +68,18 @@ def _clean_name(raw, fallback="表情"):
         if ch.isprintable() and ch not in "[]()\n\r\t"
     ).strip()
     return text[:24] or fallback
+
+
+def _looks_like_junk(name):
+    """IMG_0423、微信图片20260810 这类等于没起名。"""
+    text = str(name or "").strip()
+    if not text:
+        return True
+    if JUNK_NAME.match(text):
+        return True
+    # 纯数字或纯十六进制串（时间戳、哈希）也算没名字。
+    compact = text.replace("-", "").replace("_", "").replace(" ", "")
+    return len(compact) >= 6 and all(c in "0123456789abcdefABCDEF" for c in compact)
 
 
 def register_sticker_feature(server_module):
@@ -103,6 +118,8 @@ def register_sticker_feature(server_module):
             "url": f"/sticker/{row['file']}",
             "keywords": row["keywords"],
             "used": row["used"],
+            # 前端据此把没起名的标出来，提醒她改。
+            "unnamed": _looks_like_junk(row["name"]) or row["name"].startswith("表情"),
         }
 
     def unique_name(name, exclude_id=None):
@@ -118,11 +135,17 @@ def register_sticker_feature(server_module):
                 taken = {r["name"] for r in db.execute("SELECT name FROM stickers").fetchall()}
         if name not in taken:
             return name
-        for n in range(2, 100):
+        for n in range(2, 400):
             candidate = f"{name}{n}"
             if candidate not in taken:
                 return candidate
         return f"{name}{secrets.token_hex(2)}"
+
+    def auto_name():
+        """没给名字时用「表情N」，N 顺着现有的往下排。"""
+        with get_db() as db:
+            total = db.execute("SELECT COUNT(*) AS n FROM stickers").fetchone()["n"]
+        return unique_name(f"表情{total + 1}")
 
     def find(query):
         """按名字找一张。依次：完全相等 → 包含 → 关键词命中。
@@ -165,6 +188,47 @@ def register_sticker_feature(server_module):
         tmp.replace(target)
         return target.name
 
+    def decode(raw, mime):
+        """把 data URL 或裸 base64 解成字节。返回 (bytes, mime, 错误说明)。"""
+        raw = str(raw or "")
+        if not raw:
+            return None, mime, "没有图片数据"
+        mime = str(mime or "").lower()
+        if raw.strip().startswith("data:") and "," in raw:
+            head, raw = raw.split(",", 1)
+            if not mime and ":" in head and ";" in head:
+                mime = head.split(":", 1)[1].split(";", 1)[0].lower()
+        if mime not in MIME_EXT:
+            return None, mime, "只收 png / jpg / gif / webp"
+        try:
+            binary = base64.b64decode(raw, validate=False)
+        except Exception:
+            return None, mime, "图片数据读不出来"
+        if not binary:
+            return None, mime, "图片是空的"
+        if len(binary) > MAX_STICKER_BYTES:
+            return None, mime, f"这张 {len(binary) // 1024} KB，超过 4MB 了"
+        return binary, mime, None
+
+    def insert(binary, mime, name, keywords=""):
+        chosen = auto_name() if _looks_like_junk(name) else unique_name(_clean_name(name))
+        stored = store(binary, mime)
+        with get_db() as db:
+            cur = db.execute(
+                "INSERT INTO stickers (name,file,keywords,at) VALUES (?,?,?,?)",
+                (chosen, stored, _clean_name(keywords, fallback="")[:60], int(time.time())),
+            )
+            new_id = cur.lastrowid
+        return {
+            "id": new_id, "name": chosen,
+            "url": f"/sticker/{stored}", "bytes": len(binary),
+        }
+
+    def room_left():
+        with get_db() as db:
+            total = db.execute("SELECT COUNT(*) AS n FROM stickers").fetchone()["n"]
+        return MAX_STICKERS - total
+
     # ── 发送
 
     def send(query, who="gu"):
@@ -197,15 +261,17 @@ def register_sticker_feature(server_module):
         """塞进系统提示词的那一段。
 
         上游文档里两条坑都写在这里了：发完不解释，以及不要定时发。
+        名字像「表情7」的不报给它——那种名字它没法判断该不该发。
         """
-        items = rows("used")
+        items = [r for r in rows("used") if not _looks_like_junk(r["name"])]
+        items = [r for r in items if not re.fullmatch(r"表情\d+", r["name"])]
         if not items:
             return ""
         names = "、".join(r["name"] for r in items[:NAMES_IN_PROMPT])
         more = "（还有更多，用 list_stickers 看全部）" if len(items) > NAMES_IN_PROMPT else ""
         return (
             f"【表情包】你可以调 send_sticker 发表情，参数就是名字。现有：{names}{more}\n"
-            "聊着聊想到了就甄一张，跟发微信表情一样自然，"
+            "聊着聊着想到了就甩一张，跟发微信表情一样自然，"
             "不要固定频率、不要每次都发。发完不要解释图里是什么，"
             "也不要说「我发了一个表情」——正常人发表情不配旁白。"
             "妍妍发的表情在历史里长成 ![名字](/sticker/…)，你看名字就知道她发了哪张。"
@@ -214,51 +280,47 @@ def register_sticker_feature(server_module):
     # ── 接口
 
     def api_list():
-        return jsonify({"ok": True, "items": [as_dict(r) for r in rows()]})
+        return jsonify({
+            "ok": True,
+            "items": [as_dict(r) for r in rows()],
+            "room": room_left(),
+        })
 
     def api_add():
+        """加表情。单张传 data，多张传 items:[{data,media_type,name}]。
+
+        批量走一个请求：一次一个来回、逐张弹框问名字，
+        传二十张就要点二十次，实测很折磨。
+        """
         data = request.get_json(force=True, silent=True) or {}
-        raw = str(data.get("data") or "")
-        if not raw:
-            return jsonify({"ok": False, "error": "没有图片数据"}), 400
+        batch = data.get("items")
 
-        mime = str(data.get("media_type") or "").lower()
-        if raw.strip().startswith("data:") and "," in raw:
-            head, raw = raw.split(",", 1)
-            if not mime and ":" in head and ";" in head:
-                mime = head.split(":", 1)[1].split(";", 1)[0].lower()
-        if mime not in MIME_EXT:
-            return jsonify({"ok": False, "error": "只收 png / jpg / gif / webp"}), 400
+        if not isinstance(batch, list):
+            batch = [{
+                "data": data.get("data"),
+                "media_type": data.get("media_type"),
+                "name": data.get("name"),
+                "keywords": data.get("keywords", ""),
+            }]
 
-        try:
-            binary = base64.b64decode(raw, validate=False)
-        except Exception:
-            return jsonify({"ok": False, "error": "图片数据读不出来"}), 400
-        if not binary:
-            return jsonify({"ok": False, "error": "图片是空的"}), 400
-        if len(binary) > MAX_STICKER_BYTES:
-            return jsonify({
-                "ok": False,
-                "error": f"这张 {len(binary) // 1024} KB，超过 4MB 了",
-            }), 413
+        added, failed = [], []
+        for item in batch:
+            if not isinstance(item, dict):
+                continue
+            if room_left() <= 0:
+                failed.append({"name": item.get("name") or "", "error": f"最多 {MAX_STICKERS} 张"})
+                continue
+            binary, mime, error = decode(item.get("data"), item.get("media_type"))
+            if error:
+                failed.append({"name": item.get("name") or "", "error": error})
+                continue
+            added.append(insert(binary, mime, item.get("name"), item.get("keywords", "")))
 
-        with get_db() as db:
-            total = db.execute("SELECT COUNT(*) AS n FROM stickers").fetchone()["n"]
-        if total >= MAX_STICKERS:
-            return jsonify({"ok": False, "error": f"最多 {MAX_STICKERS} 张，先删几张"}), 400
-
-        name = unique_name(_clean_name(data.get("name")))
-        keywords = _clean_name(data.get("keywords", ""), fallback="")[:60]
-        stored = store(binary, mime)
-        with get_db() as db:
-            cur = db.execute(
-                "INSERT INTO stickers (name,file,keywords,at) VALUES (?,?,?,?)",
-                (name, stored, keywords, int(time.time())),
-            )
-            new_id = cur.lastrowid
+        if not added and failed:
+            return jsonify({"ok": False, "error": failed[0]["error"], "failed": failed}), 400
         return jsonify({
-            "ok": True, "id": new_id, "name": name,
-            "url": f"/sticker/{stored}", "bytes": len(binary),
+            "ok": True, "added": added, "failed": failed,
+            "count": len(added), "room": room_left(),
         })
 
     def api_update():
@@ -364,6 +426,7 @@ def register_sticker_feature(server_module):
             p.stat().st_size for p in folder.glob("*")
             if p.is_file() and not p.name.endswith(".part")
         )
+        named = [r["name"] for r in items if not _looks_like_junk(r["name"])]
         return jsonify({
             "ok": True,
             "dir": str(folder),
@@ -371,7 +434,10 @@ def register_sticker_feature(server_module):
             "bytes": size,
             "max": MAX_STICKERS,
             "names": [r["name"] for r in items],
-            "in_prompt": min(len(items), NAMES_IN_PROMPT),
+            # 没起名的不报给模型，这里如实说有几张还等着改名。
+            "named": len(named),
+            "unnamed": len(items) - len(named),
+            "in_prompt": min(len(named), NAMES_IN_PROMPT),
         })
 
     def panel():
@@ -478,20 +544,26 @@ def _wire_tools(server_module, send, rows, overview):
 
 # ── 注入主页的那段：尺寸、气泡、快发面板
 #
-# 尺寸用属性选择器 img[src*="/sticker/"] 而不是加 class：
-# 上游那个 renderRich 到底给 img 挂了什么 class 我没核实过，
+# 尺寸用属性选择器 img[src*="/sticker/"]，不加 class：
+# 上游 renderRich 到底给 img 挂了什么 class 我没核实过，
 # 而 src 里的前缀是我们自己存的，一定在。
+#
+# 上一版这里写了 !important，然后在面板里又用 max-width:none !important
+# 把上限拿掉、改用 grid 的列宽约束——列宽一旦没按预期生效，
+# 图片就彻底没有上限了，于是撑满整行。这一版：聊天里的规则不用 !important
+# （靠选择器权重压过 .chatimg 就够），面板里的尺寸写死像素并带 !important，
+# 任何一层布局失效都不会让图变大。
 #
 # 气泡去底色必须靠 JS：CSS 选不中「只装了一张表情的气泡」。
 # :has() 能写，但旧一点的 Safari 不支持，而手机上没法开控制台查。
 CLIENT_SCRIPT = """<style>
   img[src*="/sticker/"] {
-    max-width: 112px !important;
-    max-height: 112px !important;
-    width: auto !important;
-    height: auto !important;
+    max-width: 112px;
+    max-height: 112px;
+    width: auto;
+    height: auto;
     border-radius: 10px;
-    margin: 0 !important;
+    margin: 0;
   }
   .bubble.stickeronly {
     background: transparent !important;
@@ -510,40 +582,82 @@ CLIENT_SCRIPT = """<style>
     background: transparent; color: var(--dim, #8a8a8a); cursor: pointer;
   }
   #dwellStickerBtn svg { width: 20px; height: 20px; display: block; }
+
+  /* 点空白处也能关掉。 */
+  #dwellStickerBackdrop {
+    position: fixed; inset: 0; z-index: 9998;
+    background: rgba(0,0,0,.32);
+    opacity: 0; pointer-events: none; transition: opacity .2s ease;
+  }
+  #dwellStickerBackdrop.open { opacity: 1; pointer-events: auto; }
+
   #dwellStickerSheet {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999;
-    max-height: 46vh; overflow-y: auto;
-    padding: 12px 14px calc(14px + env(safe-area-inset-bottom));
-    background: rgba(28,28,30,.94);
+    display: flex; flex-direction: column;
+    max-height: 52vh;
+    background: rgba(28,28,30,.96);
     -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
     border-radius: 16px 16px 0 0;
-    box-shadow: 0 -6px 30px rgba(0,0,0,.35);
+    box-shadow: 0 -6px 30px rgba(0,0,0,.4);
     transform: translateY(102%); transition: transform .22s ease;
   }
   #dwellStickerSheet.open { transform: translateY(0); }
+
+  /* 头部固定，不跟着列表滚走——关闭键必须一直看得见。 */
   #dwellStickerSheet .head {
+    flex: 0 0 auto;
     display: flex; align-items: center; justify-content: space-between;
-    font-size: 13px; color: #9b9b9f; margin-bottom: 10px;
+    padding: 6px 8px 6px 16px;
+    border-bottom: 1px solid rgba(255,255,255,.08);
   }
-  #dwellStickerSheet .head a { color: #9b9b9f; text-decoration: none; }
+  #dwellStickerSheet .head .t { font-size: 15px; font-weight: 600; color: #ececf1; }
+  #dwellStickerSheet .head .r { display: flex; align-items: center; gap: 4px; }
+  #dwellStickerSheet .head button,
+  #dwellStickerSheet .head a {
+    font: inherit; font-size: 14px;
+    min-width: 44px; min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0 10px; border: 0; border-radius: 10px;
+    background: transparent; color: #7fb2ff; text-decoration: none; cursor: pointer;
+  }
+  #dwellStickerSheet .head .x { color: #ececf1; font-size: 22px; line-height: 1; }
+
+  #dwellStickerSheet .body {
+    flex: 1 1 auto; overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 12px 14px calc(16px + env(safe-area-inset-bottom));
+  }
+
+  /* 固定像素的格子。上一版用 grid + 百分比 + aspect-ratio，
+     列宽没生效时图片就没了上限。这版每一格宽高都写死。 */
   #dwellStickerSheet .grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 10px;
+    display: flex; flex-wrap: wrap; gap: 12px;
   }
-  #dwellStickerSheet .grid button {
-    padding: 0; border: 0; background: transparent; cursor: pointer; line-height: 0;
+  #dwellStickerSheet .grid .cell {
+    width: 76px; flex: 0 0 76px;
+    padding: 0; border: 0; background: transparent; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
   }
-  #dwellStickerSheet .grid img {
-    width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: 8px;
-    max-width: none !important; max-height: none !important;
+  #dwellStickerSheet .grid .cell img {
+    width: 72px !important; height: 72px !important;
+    max-width: 72px !important; max-height: 72px !important;
+    object-fit: contain; border-radius: 10px;
+    background: rgba(255,255,255,.05);
+    display: block;
   }
+  #dwellStickerSheet .grid .cell span {
+    font-size: 11px; line-height: 1.3; color: #9b9b9f;
+    max-width: 76px; text-align: center;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #dwellStickerSheet .grid .cell:disabled { opacity: .45; }
   #dwellStickerSheet .empty { font-size: 13px; color: #9b9b9f; line-height: 1.7; }
 </style>
 <script>
 (function () {
-  var sheet = null, grid = null, loaded = false;
+  var sheet = null, backdrop = null, grid = null, loaded = false;
 
-  // 只装了一张表情的气泡去掩底色。灵感来自图片那轮：
-  // 灰框套着图很脏，表情更明显。
+  // 只装了一张表情的气泡去掉底色。灰框套着图很脏，表情更明显。
   function strip(root) {
     var imgs = (root || document).querySelectorAll('img[src*="/sticker/"]');
     for (var i = 0; i < imgs.length; i++) {
@@ -558,21 +672,31 @@ CLIENT_SCRIPT = """<style>
 
   function build() {
     if (sheet) return;
+
+    backdrop = document.createElement('div');
+    backdrop.id = 'dwellStickerBackdrop';
+    backdrop.onclick = close;
+    document.body.appendChild(backdrop);
+
     sheet = document.createElement('div');
     sheet.id = 'dwellStickerSheet';
     sheet.innerHTML =
-      '<div class="head"><span>表情</span>' +
-      '<span><a href="/stickers">管理</a>' +
-      '<a href="#" data-close style="margin-left:16px">关闭</a></span></div>' +
-      '<div class="grid"></div>';
+      '<div class="head">' +
+      '<span class="t">表情</span>' +
+      '<span class="r"><a href="/stickers">管理</a>' +
+      '<button type="button" class="x" data-close aria-label="关闭">\\u00d7</button></span>' +
+      '</div>' +
+      '<div class="body"><div class="grid"></div></div>';
     document.body.appendChild(sheet);
+
     grid = sheet.querySelector('.grid');
-    sheet.querySelector('[data-close]').onclick = function (e) {
-      e.preventDefault(); close();
-    };
+    sheet.querySelector('[data-close]').onclick = close;
   }
 
-  function close() { if (sheet) sheet.classList.remove('open'); }
+  function close() {
+    if (sheet) sheet.classList.remove('open');
+    if (backdrop) backdrop.classList.remove('open');
+  }
 
   function load() {
     fetch('/api/stickers').then(function (r) { return r.json(); }).then(function (d) {
@@ -581,22 +705,29 @@ CLIENT_SCRIPT = """<style>
       if (!items.length) {
         var tip = document.createElement('div');
         tip.className = 'empty';
-        tip.innerHTML = '还一张都没有。去 <a href="/stickers" style="color:#7fb2ff">管理页</a> 传几张，' +
-                        '每张起个名字——名字就是沐挑图的依据。';
+        tip.innerHTML = '还一张都没有。去 <a href="/stickers" style="color:#7fb2ff">管理页</a> 传几张。';
         grid.appendChild(tip);
         loaded = true;
         return;
       }
       items.forEach(function (it) {
-        var b = document.createElement('button');
-        b.type = 'button';
-        b.setAttribute('aria-label', it.name);
+        var cell = document.createElement('button');
+        cell.type = 'button';
+        cell.className = 'cell';
+        cell.setAttribute('aria-label', '发送 ' + it.name);
+
         var img = document.createElement('img');
         img.src = it.url;
-        img.alt = it.name;
-        b.appendChild(img);
-        b.onclick = function () { pick(it, b); };
-        grid.appendChild(b);
+        img.alt = '';
+        cell.appendChild(img);
+
+        // 名字写在图下面：一屏十几张缩略图，光看图分不清哪个是哪个。
+        var label = document.createElement('span');
+        label.textContent = it.name;
+        cell.appendChild(label);
+
+        cell.onclick = function () { pick(it, cell); };
+        grid.appendChild(cell);
       });
       loaded = true;
     }).catch(function () {
@@ -622,12 +753,14 @@ CLIENT_SCRIPT = """<style>
 
   function open() {
     build();
-    if (!loaded) load();
+    // 每次打开都重新拉：在管理页加完表情回来，不该还是旧的那几张。
+    load();
     sheet.classList.add('open');
+    backdrop.classList.add('open');
   }
 
   // 按钮插在上游那个「+」旁边。尺寸写死：上游的 .ic 没有全局宽高，
-  // 上次那个回形针就是因为这个铺满了整个容器。
+  // 之前那个回形针就是因为这个铺满了整个容器。
   function mount() {
     if (document.getElementById('dwellStickerBtn')) return true;
     var plus = document.getElementById('plusBtn');
@@ -676,10 +809,14 @@ CLIENT_SCRIPT = """<style>
 """
 
 
-# ── 管理页：传图、起名、改名、删。
+# ── 管理页：传图、改名、删。
 #
 # 和 /push、/models 一样做成独立页：上游设置页靠字符串补丁插东西，容易打歪。
 # 上传不过 canvas，直接读原字节转 base64——GIF 得保住它的动。
+#
+# 上一版每传一张弹一次 prompt 问名字，传二十张点二十次。这版改成：
+# 选完直接全部传上去（一个请求），名字先用文件名、认不出就叫「表情N」，
+# 然后在下面列表里想改哪张改哪张。没起名的标出来。
 PANEL_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -688,54 +825,60 @@ PANEL_HTML = """<!doctype html>
 <title>表情包</title>
 <style>
   :root { color-scheme: dark; }
+  * { -webkit-tap-highlight-color: transparent; }
   body {
-    margin: 0; padding: 22px 18px calc(40px + env(safe-area-inset-bottom));
+    margin: 0; padding: 20px 16px calc(40px + env(safe-area-inset-bottom));
     background: #111113; color: #ececf1;
-    font: 15px/1.65 -apple-system, "SF Pro Text", system-ui, sans-serif;
+    font: 15px/1.6 -apple-system, "SF Pro Text", system-ui, sans-serif;
   }
   h1 { font-size: 19px; font-weight: 600; margin: 0 0 4px; }
-  .sub { color: #8e8e93; font-size: 13px; margin-bottom: 22px; }
+  .sub { color: #8e8e93; font-size: 13px; margin-bottom: 18px; }
   .sub a { color: #7fb2ff; }
-  .card {
-    background: #1c1c1e; border-radius: 14px; padding: 16px; margin-bottom: 14px;
-  }
+  .card { background: #1c1c1e; border-radius: 14px; padding: 14px; margin-bottom: 14px; }
   label.file {
-    display: block; text-align: center; padding: 22px 12px;
+    display: block; text-align: center; padding: 20px 12px;
     border: 1px dashed #3a3a3c; border-radius: 12px; color: #9b9b9f; font-size: 14px;
   }
   input[type=file] { display: none; }
-  .row {
+
+  .item {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 0; border-bottom: 1px solid #2c2c2e;
   }
-  .row:last-child { border-bottom: 0; }
-  .row img {
-    width: 56px; height: 56px; object-fit: contain; border-radius: 8px;
-    background: #26262a; flex: 0 0 56px;
+  .item:last-child { border-bottom: 0; }
+  /* 尺寸写死，不用百分比：布局失效时也不会撑开。 */
+  .item img {
+    width: 60px !important; height: 60px !important;
+    max-width: 60px !important; max-height: 60px !important;
+    object-fit: contain; border-radius: 8px;
+    background: #26262a; flex: 0 0 60px;
   }
-  .row .fields { flex: 1; min-width: 0; }
-  .row input[type=text] {
-    width: 100%; box-sizing: border-box; margin-bottom: 6px;
+  .item .fields { flex: 1 1 auto; min-width: 0; }
+  .item input[type=text] {
+    width: 100%; box-sizing: border-box;
     background: #26262a; border: 1px solid #3a3a3c; border-radius: 8px;
-    color: #ececf1; padding: 7px 9px; font-size: 14px;
+    color: #ececf1; padding: 8px 9px; font-size: 15px;
   }
-  .row input.kw { margin-bottom: 0; font-size: 13px; color: #b6b6bb; }
-  .acts { display: flex; flex-direction: column; gap: 6px; flex: 0 0 62px; }
-  button {
-    font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 8px;
-    border: 1px solid #3a3a3c; background: #26262a; color: #ececf1; cursor: pointer;
+  .item input.todo { border-color: #6b5a2a; background: #2a2620; }
+  .item input.kw {
+    margin-top: 6px; font-size: 13px; color: #b6b6bb; padding: 6px 9px;
   }
-  button.warn { color: #ff6b6b; border-color: #4a2a2a; }
-  button:disabled { opacity: .5; }
-  #msg { min-height: 22px; font-size: 13px; color: #8e8e93; margin: 6px 0 0; }
-  .count { font-size: 13px; color: #8e8e93; margin-bottom: 10px; }
+  .item .del {
+    flex: 0 0 auto; min-width: 44px; min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 20px; color: #ff6b6b;
+    border: 0; background: transparent; cursor: pointer;
+  }
+  #msg { min-height: 20px; font-size: 13px; color: #8e8e93; margin: 8px 0 0; }
+  #msg.warn { color: #ffb86b; }
+  .count { font-size: 13px; color: #8e8e93; margin-bottom: 6px; }
+  .hint { font-size: 12px; color: #6f6f75; margin: 0 0 10px; }
 </style>
 </head>
 <body>
 <h1>表情包</h1>
 <div class="sub">
-  名字就是索引。起得具体一点（「猫猫抱抱」比「IMG_01」好得多），
-  沐就是靠这个挑图的。关键词可以不填。
+  名字就是沐挑图的依据，起得具体一点（「猫猫抱抱」比「表情3」有用得多）。
   <a href="/">回聊天</a>
 </div>
 
@@ -749,6 +892,7 @@ PANEL_HTML = """<!doctype html>
 
 <div class="card">
   <div class="count" id="count">读取中…</div>
+  <p class="hint">改完名字点一下别处就存了。橙色框的还没起名，沐看不到这些。</p>
   <div id="list"></div>
 </div>
 
@@ -757,64 +901,84 @@ var msg = document.getElementById('msg');
 var list = document.getElementById('list');
 var count = document.getElementById('count');
 
-function say(text) { msg.textContent = text || ''; }
+function say(text, warn) {
+  msg.textContent = text || '';
+  msg.className = warn ? 'warn' : '';
+}
 
 function load() {
   fetch('/api/stickers').then(function (r) { return r.json(); }).then(function (d) {
     var items = (d && d.items) || [];
-    count.textContent = items.length ? ('共 ' + items.length + ' 张') : '还一张都没有。';
+    var todo = items.filter(function (x) { return x.unnamed; }).length;
+    count.textContent = items.length
+      ? ('共 ' + items.length + ' 张' + (todo ? '，' + todo + ' 张还没起名' : ''))
+      : '还一张都没有。';
     list.innerHTML = '';
     items.forEach(render);
-  });
+  }).catch(function () { count.textContent = '读不到列表。'; });
 }
 
 function render(it) {
   var row = document.createElement('div');
-  row.className = 'row';
+  row.className = 'item';
 
   var img = document.createElement('img');
   img.src = it.url;
-  img.alt = it.name;
+  img.alt = '';
 
   var fields = document.createElement('div');
   fields.className = 'fields';
+
   var name = document.createElement('input');
   name.type = 'text';
   name.value = it.name;
+  name.placeholder = '起个名字';
+  name.className = it.unnamed ? 'todo' : '';
   name.setAttribute('aria-label', '名字');
+
   var kw = document.createElement('input');
   kw.type = 'text';
   kw.className = 'kw';
   kw.value = it.keywords || '';
   kw.placeholder = '关键词，逗号分隔（可空）';
   kw.setAttribute('aria-label', '关键词');
+
+  // 失焦即存。加个「保存」按钮只是多一次点击。
+  function save() {
+    if (name.value === it.name && kw.value === (it.keywords || '')) return;
+    post('/api/sticker/update', { id: it.id, name: name.value, keywords: kw.value })
+      .then(function (d) {
+        if (d && d.ok) {
+          it.name = name.value;
+          it.keywords = kw.value;
+          name.className = '';
+          say('存好了');
+          load();
+        }
+      });
+  }
+  name.onblur = save;
+  kw.onblur = save;
+  name.onkeydown = function (e) { if (e.key === 'Enter') name.blur(); };
+  kw.onkeydown = function (e) { if (e.key === 'Enter') kw.blur(); };
+
   fields.appendChild(name);
   fields.appendChild(kw);
 
-  var acts = document.createElement('div');
-  acts.className = 'acts';
-  var save = document.createElement('button');
-  save.textContent = '保存';
-  save.onclick = function () {
-    save.disabled = true;
-    post('/api/sticker/update', { id: it.id, name: name.value, keywords: kw.value })
-      .then(function () { save.disabled = false; say('改好了'); load(); });
-  };
   var del = document.createElement('button');
-  del.className = 'warn';
-  del.textContent = '删除';
+  del.className = 'del';
+  del.type = 'button';
+  del.textContent = '\\u00d7';
+  del.setAttribute('aria-label', '删除 ' + it.name);
   del.onclick = function () {
-    if (!confirm('删掉1「' + it.name + '」？聊天记录里已经发过的不会消失。')) return;
+    if (!confirm('删掉「' + it.name + '」？聊天记录里已经发过的不会消失。')) return;
     del.disabled = true;
-    post('/api/sticker/delete', { id: it.id })
-      .then(function () { say('删了'); load(); });
+    post('/api/sticker/delete', { id: it.id }).then(function () { say('删了'); load(); });
   };
-  acts.appendChild(save);
-  acts.appendChild(del);
 
   row.appendChild(img);
   row.appendChild(fields);
-  row.appendChild(acts);
+  row.appendChild(del);
   list.appendChild(row);
 }
 
@@ -824,9 +988,25 @@ function post(url, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   }).then(function (r) { return r.json(); }).then(function (d) {
-    if (d && d.ok === false) say(d.error || '出错了');
+    if (d && d.ok === false) say(d.error || '出错了', true);
     return d;
-  }).catch(function () { say('请求失败'); });
+  }).catch(function () { say('请求失败', true); });
+}
+
+function readOne(file) {
+  return new Promise(function (resolve) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      // 直接送原字节。不过 canvas：GIF 过一遭就只剩第一帧了。
+      resolve({
+        data: String(reader.result || ''),
+        media_type: file.type,
+        name: file.name.replace(/\\.[^.]+$/, '')
+      });
+    };
+    reader.onerror = function () { resolve(null); };
+    reader.readAsDataURL(file);
+  });
 }
 
 document.getElementById('pick').onchange = function (e) {
@@ -834,28 +1014,23 @@ document.getElementById('pick').onchange = function (e) {
   e.target.value = '';
   if (!files.length) return;
 
-  var index = 0;
-  function next() {
-    if (index >= files.length) { say('传完了'); load(); return; }
-    var file = files[index++];
-    say('上传 ' + index + '/' + files.length + '：' + file.name);
+  say('读取 ' + files.length + ' 张…');
 
-    var reader = new FileReader();
-    reader.onload = function () {
-      // 直接送原字节。不过 canvas：GIF 过一遭就只剩第一帧了。
-      var data = String(reader.result || '');
-      var stem = file.name.replace(/\\.[^.]+$/, '');
-      var name = prompt('给这张起个名字', stem) || stem;
-      post('/api/sticker/add', {
-        name: name,
-        media_type: file.type,
-        data: data
-      }).then(next);
-    };
-    reader.onerror = function () { say('读不了 ' + file.name); next(); };
-    reader.readAsDataURL(file);
-  }
-  next();
+  // 一次读完一次传完。名字先用文件名，认不出的后端会给「表情N」，
+  // 然后在下面列表里改——比每张弹一次输入框省事得多。
+  Promise.all(files.map(readOne)).then(function (all) {
+    var items = all.filter(function (x) { return x; });
+    if (!items.length) { say('一张都没读出来', true); return; }
+
+    say('上传中…');
+    post('/api/sticker/add', { items: items }).then(function (d) {
+      if (!d) return;
+      var bad = (d.failed || []).length;
+      say('传好 ' + (d.count || 0) + ' 张' + (bad ? '，' + bad + ' 张没成' : '') +
+          '。下面改名字。', bad > 0);
+      load();
+    });
+  });
 };
 
 load();
