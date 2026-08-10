@@ -11,6 +11,19 @@
 这五个字段一次普通 HTTP 请求就能拿到，不需要常驻进程、不占内存。
 那个带 Docker 容器的 MCP 是「一起听」、控制播放、登录账号才需要的东西。
 
+## 注册接口的坑
+
+`/api/music` 在 server.py 里已经有一个 stub（返回 `{"ok": false}`），
+它的 endpoint 名就叫 `api_music`。直接 add_url_rule 会撞上：
+
+    AssertionError: View function mapping is overwriting
+    an existing endpoint function: api_music
+
+而这个异常发生在 import 期，整个后端起不来——表现是全站 502，
+跟音乐功能本身看不出关系。所以凡是上游已有的路径，一律走
+`view_functions[名字] = 新函数` 替换，不要 add_url_rule。
+下面 _mount 那个小函数把这件事统一了：已存在就替换，不存在才新增。
+
 ## 数据来源
 
 网易云的老公开接口，要带 UA 和 Referer，不然直接被挡：
@@ -125,6 +138,23 @@ def _parse_song(song):
         "pic": pic,
         "sec": _duration_seconds(song),
     }
+
+
+def _mount(server_module, rule, endpoint, view, methods):
+    """注册一条接口，端点已存在就替换而不是新增。
+
+    上游 server.py 有一堆 stub（/api/music、/api/news、/api/health…），
+    endpoint 名和我们想用的一样。直接 add_url_rule 会在 import 期抛
+    AssertionError，整个后端起不来、全站 502——排查时完全看不出
+    跟哪个功能有关。这里统一处理：撞上就替换那个视图函数。
+    """
+    if endpoint in server_module.app.view_functions:
+        server_module.app.view_functions[endpoint] = view
+        return "replaced"
+    server_module.app.add_url_rule(
+        rule, endpoint=endpoint, view_func=view, methods=methods
+    )
+    return "added"
 
 
 def register_music_feature(server_module):
@@ -296,15 +326,16 @@ def register_music_feature(server_module):
             "detail_api": DETAIL_URL.format(id="<id>"),
         })
 
-    routes = [
-        ("/api/music", "api_music", api_music, ["GET"]),
-        ("/api/music/search", "api_music_search", api_music_search, ["GET"]),
-        ("/api/music/status", "api_music_status", api_music_status, ["GET"]),
-    ]
-    for rule, endpoint, view, methods in routes:
-        server_module.app.add_url_rule(
-            rule, endpoint=endpoint, view_func=view, methods=methods
-        )
+    # /api/music 是上游已有的 stub，走替换；另两条是新路径。
+    _mount(server_module, "/api/music", "api_music", api_music, ["GET"])
+    _mount(
+        server_module, "/api/music/search", "api_music_search",
+        api_music_search, ["GET"],
+    )
+    _mount(
+        server_module, "/api/music/status", "api_music_status",
+        api_music_status, ["GET"],
+    )
 
     _wire_tools(server_module, search)
 
