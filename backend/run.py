@@ -22,6 +22,7 @@ from transcript_feature import register_transcript_feature
 from agent_tools_feature import register_agent_tools_feature
 from sticker_feature import register_sticker_feature
 from heartbeat_feature import register_heartbeat_feature
+from backup_feature import register_backup_feature
 
 
 register_compat(server)
@@ -55,6 +56,9 @@ register_sticker_feature(server)
 # 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具的那一版，
 # 同时依赖 server.send_push 把主动说的话推到锁屏。
 register_heartbeat_feature(server)
+# 备份放在最末：只依赖 get_db 和 DB_PATH，但它的定时线程会读整个库，
+# 等其余模块把表都建完再启动最省事。
+register_backup_feature(server)
 
 
 if __name__ == "__main__":
@@ -75,4 +79,5 @@ if __name__ == "__main__":
     print("  media   : /api/upload，图片存 data/uploads")
     print("  sticker : /stickers 面板，原图存 data/stickers")
     print("  icon    : /api/icon/status")
+    print("  backup  : /backup 面板（默认关闭，只推文本库）")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
