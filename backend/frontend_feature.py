@@ -76,6 +76,24 @@ EXTRA_ICONS = (
     "<line x1=\"15\" y1=\"9.6\" x2=\"15\" y2=\"9.9\"/>'),\n"
 )
 
+# 输入区那个「发表情」按钮的样式。
+#
+# 上游把「+」的外观全挂在 id 选择器上：
+#   #plusBtn { width: 36px; height: 36px; border-radius: 50%;
+#              background: var(--panel); flex: none;
+#              display: flex; align-items: center; justify-content: center; }
+#   #plusBtn .ic { width: 17px; height: 17px; }
+# 表情按钮虽然是克隆出来的，但 id 换成了 dwellStickerBtn，
+# 上面这两条一条都不生效——底色、圆角、36px 见方、图标居中全丢，
+# 于是它在圆底的「+」旁边显示成一个光秃秃、还没对齐的笑脸。
+#
+# 这里不另抄一份数值，而是把新 id 并进上游原本那条选择器，
+# 两个按钮共用同一条规则：上游哪天把 36px 改成 40px 或换了底色变量，
+# 表情按钮跟着变，不会又脱节。
+PLUSBTN_ANCHOR = "#plusBtn {"
+PLUSBTN_IC_ANCHOR = "#plusBtn .ic {"
+
+
 # 上游的图片正则写死了 https?:// 前缀，只认绝对地址。
 # 我们存进消息的是 ![](/media/2026-08/xxx.jpg)，相对路径匹配不上，
 # 于是在气泡里原样显示成一串「乱码」。这里让它也认站内相对路径，
@@ -323,6 +341,23 @@ def _patch_icons(html: str) -> str:
     return html
 
 
+def _patch_plus_button(html: str) -> str:
+    """让表情按钮共用上游「+」那条样式规则。
+
+    上游 #plusBtn / #plusBtn .ic 是 id 选择器，换了 id 就全部失效。
+    把新 id 并进选择器而不是另抄一份数值，两个按钮永远长得一样。
+    """
+    if "#dwellStickerBtn" in html:
+        return html
+    html = html.replace(
+        PLUSBTN_IC_ANCHOR, "#plusBtn .ic, #dwellStickerBtn .ic {", 1
+    )
+    html = html.replace(
+        PLUSBTN_ANCHOR, "#plusBtn, #dwellStickerBtn {", 1
+    )
+    return html
+
+
 def _patch_images(html: str) -> str:
     """让 IMG_RE 认站内相对路径，并把聊天图片改小一档。"""
     if "(?:https?:\\/\\/|\\/)" not in html:
@@ -476,6 +511,7 @@ def _build_frontend(
     )
 
     html = _patch_icons(html)
+    html = _patch_plus_button(html)
     html = _patch_images(html)
     html = _patch_bubbles(html)
     html = _patch_pet(html)
@@ -560,6 +596,12 @@ def register_frontend_feature(server_module):
                 "push_script": "window.dwellPush" in built,
                 "sticker_script": "window.dwellStickers" in built,
                 "sticker_labels": "case 'send_sticker'" in built,
+                # 表情按钮的底色和居中全靠这条：它是 false 就说明
+                # 上游那条 #plusBtn 规则改了写法，按钮会变成裸图标。
+                "sticker_btn_css": "#plusBtn, #dwellStickerBtn {" in built,
+                "sticker_btn_icon_css": "#dwellStickerBtn .ic {" in built,
+                "plusbtn_anchor_found": PLUSBTN_ANCHOR in source_text,
+                "plusbtn_ic_anchor_found": PLUSBTN_IC_ANCHOR in source_text,
                 "cpu_icon": "  cpu: S(" in built,
                 "smile_icon": "  smile: S(" in built,
                 "manifest_link": 'rel="manifest"' in built,
