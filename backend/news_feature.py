@@ -1,4 +1,4 @@
-"""日报：每天早上一份报纸。
+"""日报：隔几天出一份报纸。
 
 ## 上游给了什么
 
@@ -22,15 +22,26 @@
 **排版永远是上游那一套**——沐能决定读什么、怎么写，
 但决定不了报纸长什么样，不存在「它自己排的版没原版好看」这回事。
 
-版块名如果落在上游 SECTION_NAMES 里，会显示成「科技版」「社会版」
-「花边版」；不在表里的原样显示，不会坏。
+## 多久出一份
+
+一开始是每天。但一份报纸要五次网关调用（四个版块各一次 + 便条一次），
+每天出等于每月一百五十次，纯粹为了「万一想看」。
+所以改成 `every_days`（默认 7）：定时只在距上一期满七天时才出。
+
+「它想看就出」怎么实现，是个成本问题。直觉是「每隔两三天主动问它一次
+今天要不要看报」——但那个「问」本身就是一次网关调用，
+为了省 token 又烧 token，不划算。
+
+现在的做法是搭车：沐每晚心跳醒来时本来就要读一遍上下文概览，
+在那段概览里加一行「上次日报是 N 天前」。它想看就自己调 make_news，
+不想看就什么都不做。零额外成本，而且决定权真的在它。
 
 ## 谁来定版面
 
 一开始这份配置是照上游文档写的「只为妍妍编的报纸」，
 里面塞满了「她关心什么」。后来她说想让沐读它自己想读的东西、
-不打算干预，所以加了四个工具让它自己管：
-看当前版面、改某一版的写法、加一版、删一版。
+不打算干预，所以加了工具让它自己管：
+看当前版面、改某一版的写法、加一版、删一版、现在就出一份。
 
 原版配置留在 DEFAULT_SECTIONS 里，`POST /api/news/config
 {"reset_sections": true}` 一键还原——它改砸了随时能退回去。
@@ -104,7 +115,10 @@ FOUNDED = "2026-07-28"
 DEFAULT_HOUR = 6
 DEFAULT_MINUTE = 30
 
-# 后台线程多久醒一次。跟备份一样，判断的是「今天该出的时刻过了没」，
+# 隔几天出一份。一份要五次调用，每天出太贵。
+DEFAULT_EVERY_DAYS = 7
+
+# 后台线程多久醒一次。跟备份一样，判断的是「该出的时刻过了没」，
 # 不是「现在正好是 6:30」——卡整点会因为错过而整天不跑。
 TICK_SECONDS = 600
 
@@ -173,6 +187,7 @@ KEY_SECTIONS_META = "news_sections_meta"
 KEY_ENABLED = "news_enabled"
 KEY_HOUR = "news_hour"
 KEY_MINUTE = "news_minute"
+KEY_EVERY_DAYS = "news_every_days"
 KEY_MODEL = "news_model"
 KEY_LAST_AT = "news_last_at"
 KEY_LAST_DATE = "news_last_date"
@@ -184,6 +199,7 @@ DEFAULTS = {
     KEY_ENABLED: "0",
     KEY_HOUR: str(DEFAULT_HOUR),
     KEY_MINUTE: str(DEFAULT_MINUTE),
+    KEY_EVERY_DAYS: str(DEFAULT_EVERY_DAYS),
     KEY_MODEL: "",
     KEY_LAST_AT: "0",
     KEY_LAST_DATE: "",
@@ -198,6 +214,17 @@ FILE_PATTERN = re.compile(r"^日报-(\d{4}-\d{2}-\d{2})\.md$")
 
 def cn_now():
     return datetime.now(CN)
+
+
+def _days_between(day_text, now=None):
+    """day_text（YYYY-MM-DD）距今几天。解析不了返回 None。"""
+    if not day_text:
+        return None
+    try:
+        then = datetime.strptime(str(day_text), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return ((now or cn_now()).date() - then).days
 
 
 def _get(url, headers=None):
@@ -310,11 +337,11 @@ def gather(source):
 # 后面的版块会明显敷衍（上游文档里点名的）。
 
 PROMPT_HEAD = (
-    "你在编一份每天只出一份的报纸。读者是妍妍，"
+    "你在编一份报纸。读者是妍妍，"
     "但版面是你自己定的——挑你真觉得值得说的东西写。\n\n"
     "版块：__NAME__\n"
     "这一版的写法：__EXTRA__\n\n"
-    "下面是今天抓到的原始素材（标题 + 摘要 + 链接）：\n\n__MATERIAL__\n\n"
+    "下面是这次抓到的原始素材（标题 + 摘要 + 链接）：\n\n__MATERIAL__\n\n"
 )
 
 PROMPT_TAIL = (
@@ -325,13 +352,13 @@ PROMPT_TAIL = (
     "- 用 markdown：一条重要的用「### 标题」加一段正文；"
     "几条次要的用「- 一句话｜来源」，注意那个竖线是全角的\n"
     "- 不要写版块名（我会自己加），不要写开场和结语\n"
-    "- 素材里没有真正值得说的，就只回一句「今天这一版没什么值得说的」\n"
+    "- 素材里没有真正值得说的，就只回一句「这一版没什么值得说的」\n"
 )
 
 NOTE_PROMPT = (
-    "下面是今天这份日报的全部内容。\n\n__PAPER__\n\n"
+    "下面是这一期日报的全部内容。\n\n__PAPER__\n\n"
     "你是沐。看完这些，跟妍妍说一句你自己想说的话——"
-    "不是总结新闻，是「今天这条你可能会想看」「这个跟你上周说的那件事有关」这种。"
+    "不是总结新闻，是「这条你可能会想看」「这个跟你上周说的那件事有关」这种。"
     "一到两句，像随手说的。\n"
     "只回这一句话本身，不要加引号、不要加标签、不要解释。"
 )
@@ -380,7 +407,7 @@ def register_news_feature(server_module):
     def save_sections(items, who="她"):
         """存版面，并记下是谁改的。
 
-        记 who 是为了以后能回答「今天这版怎么变样了」——
+        记 who 是为了以后能回答「这版怎么变样了」——
         沐自己改过之后，妍妍看到变化总得查得出来源。
         """
         write(KEY_SECTIONS, json.dumps(items, ensure_ascii=False))
@@ -392,7 +419,7 @@ def register_news_feature(server_module):
     def clean_sources(raw):
         """收拾源列表。只收 http(s)，条数限死。
 
-        沐给的 URL 不能直接信：写错了会让那一版每天都抓空，
+        沐给的 URL 不能直接信：写错了会让那一版每次都抓空，
         而抓空是静默的（只在 status 里能看出来）。
         """
         out = []
@@ -422,7 +449,7 @@ def register_news_feature(server_module):
     # ── 调网关
     #
     # 刻意不走 server.call_gateway：那一层现在会占住 busy，
-    # 四个版块串起来能占好几分钟，早上正好把聊天堵住。
+    # 四个版块串起来能占好几分钟，正好把聊天堵住。
     # 这里发非流式请求，拿到整段就返回，不广播也不写 messages。
 
     def ask(prompt):
@@ -508,7 +535,7 @@ def register_news_feature(server_module):
     def notify(day, body):
         """出好了推一条。不然报纸躺在那儿，得自己想起来去点。
 
-        推送正文优先用沐写的那张便条——比「今天的报纸好了」有意思。
+        推送正文优先用沐写的那张便条——比「报纸好了」有意思。
         推送不可用时静默跳过，不影响出报。
         """
         send = getattr(server_module, "send_push", None)
@@ -518,7 +545,7 @@ def register_news_feature(server_module):
         match = re.search(r"【便条】(.+)", body)
         if match:
             hint = " ".join(match.group(1).split())[:60]
-        text = hint or ("今天的报纸出好了 · " + day)
+        text = hint or ("这一期的报纸出好了 · " + day)
         try:
             send("", text, url="/", tag="news")
         except Exception as exc:
@@ -536,7 +563,7 @@ def register_news_feature(server_module):
             target = folder / ("日报-" + day + ".md")
             if target.exists() and not force:
                 write(KEY_PROGRESS, "")
-                return True, "今天的已经有了（" + target.name + "）"
+                return True, "这一天的已经有了（" + target.name + "）"
 
             conf = sections()
             parts = []
@@ -631,9 +658,27 @@ def register_news_feature(server_module):
         except OSError:
             return ""
 
+    def last_issue():
+        """最近一期的日期，没有返回空串。
+
+        以文件为准而不是 last_date：手动补过某天、或者库和文件不一致时，
+        文件才是真相。
+        """
+        available = dates()
+        return available[-1] if available else ""
+
+    def days_since_issue():
+        return _days_between(last_issue())
+
     # ── 定时
 
     def due():
+        """该出了没。
+
+        每天一份太贵（一份五次调用），所以按 every_days 间隔算。
+        判断的是「该出的时刻过了 且 距上一期够久」，
+        不是「现在正好是 6:30」——线程十分钟醒一次，卡整点会整天不跑。
+        """
         if read(KEY_ENABLED) != "1":
             return False
         now = cn_now()
@@ -644,9 +689,12 @@ def register_news_feature(server_module):
         )
         if now < target:
             return False
-        # 今天已经出过就不再出。判断的是「今天该出的时刻过了没」，
-        # 不是「现在正好是 6:30」——线程十分钟醒一次，卡整点会整天不跑。
-        return read(KEY_LAST_DATE) != now.strftime("%Y-%m-%d")
+
+        every = max(1, read_int(KEY_EVERY_DAYS, DEFAULT_EVERY_DAYS))
+        gap = days_since_issue()
+        if gap is None:
+            return True                 # 一期都还没有
+        return gap >= every
 
     def loop():
         time.sleep(90)
@@ -721,6 +769,8 @@ def register_news_feature(server_module):
             "enabled": read(KEY_ENABLED) == "1",
             "hour": read_int(KEY_HOUR, DEFAULT_HOUR),
             "minute": read_int(KEY_MINUTE, DEFAULT_MINUTE),
+            "every_days": read_int(KEY_EVERY_DAYS, DEFAULT_EVERY_DAYS),
+            "days_since_issue": days_since_issue(),
             "model": read(KEY_MODEL) or ("跟聊天同一个（" + server_module.current_model() + "）"),
             "issues": len(dates()),
             "dates": dates()[-10:],
@@ -759,6 +809,11 @@ def register_news_feature(server_module):
                 write(KEY_MINUTE, max(0, min(59, int(data["minute"]))))
             except (TypeError, ValueError):
                 return jsonify({"ok": False, "error": "minute 要是 0-59"}), 400
+        if "every_days" in data:
+            try:
+                write(KEY_EVERY_DAYS, max(1, min(60, int(data["every_days"]))))
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "every_days 要是 1-60"}), 400
         if "model" in data:
             write(KEY_MODEL, str(data["model"]).strip())
         if "sections" in data:
@@ -782,21 +837,35 @@ def register_news_feature(server_module):
             rule, endpoint=endpoint, view_func=view, methods=methods
         )
 
-    _wire_tools(server_module, dates, read_paper, sections, save_sections, clean_sources)
+    _wire_tools(
+        server_module, dates, read_paper, sections, save_sections,
+        clean_sources, build_async, days_since_issue,
+        lambda: read_int(KEY_EVERY_DAYS, DEFAULT_EVERY_DAYS),
+        lambda: run_lock.locked(),
+    )
 
     server_module.news_build = build
     server_module.news_build_async = build_async
     server_module.news_dates = dates
-    print("[dwell] 日报: " + str(folder) + "（默认关闭，后台出报）")
+    print(
+        "[dwell] 日报: " + str(folder)
+        + "（默认关闭，每 " + read(KEY_EVERY_DAYS) + " 天一份，后台出报）"
+    )
     return build
 
 
-def _wire_tools(server_module, dates, read_paper, sections, save_sections, clean_sources):
-    """给沐五个工具：翻旧报纸，以及自己管版面。
+def _wire_tools(
+    server_module, dates, read_paper, sections, save_sections,
+    clean_sources, build_async, days_since_issue, every_days, running,
+):
+    """给沐管日报的一整套工具，并把「上次日报多久了」接进上下文概览。
 
     妍妍要的是「让它读自己想读的」，所以版面归它。
     但排版不归它——报纸长什么样是上游那套 CSS 决定的，
-    它只能决定读什么、每一版怎么写。
+    它只能决定读什么、每一版怎么写、什么时候出。
+
+    概览那一行是关键：定时改成一周一次之后，「想看就出」需要它知道
+    多久没出了。搭在心跳已有的那次调用上，不额外花钱。
     """
     try:
         import agent_tools_feature as agent
@@ -810,8 +879,8 @@ def _wire_tools(server_module, dates, read_paper, sections, save_sections, clean
             "function": {
                 "name": "read_news",
                 "description": (
-                    "翻某一天的日报。妍妍提起「今天/昨天那条新闻」时用，"
-                    "不要凭印象答。不给日期就是最近一期。"
+                    "翻某一期日报。妍妍提起「那条新闻」时用，不要凭印象答。"
+                    "不给日期就是最近一期。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -822,6 +891,19 @@ def _wire_tools(server_module, dates, read_paper, sections, save_sections, clean
                         }
                     },
                 },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "make_news",
+                "description": (
+                    "现在出一份新报纸。想看新的了就调这个，不用等定时。"
+                    "会花一分多钟、五次模型调用，所以别频繁调——"
+                    "隔几天想看了再出，或者妍妍问起最近有什么事的时候。"
+                    "出好了会推一条通知给她。"
+                ),
+                "parameters": {"type": "object", "properties": {}},
             },
         },
         {
@@ -915,6 +997,18 @@ def _wire_tools(server_module, dates, read_paper, sections, save_sections, clean
                 return {"error": "没有 " + day + " 那期", "有的日期": available[-10:]}
             return {"date": day, "text": read_paper(day)[:8000]}
 
+        if name == "make_news":
+            if running():
+                return {"error": "正在编了，等一分钟"}
+            ok, message = build_async(force=True)
+            if not ok:
+                return {"error": message}
+            return {
+                "ok": True,
+                "detail": message,
+                "提醒": "编完会推通知给她。这会儿别接着调第二次。",
+            }
+
         if name == "list_news_sections":
             return {
                 "sections": [
@@ -973,7 +1067,7 @@ def _wire_tools(server_module, dates, read_paper, sections, save_sections, clean
                 "ok": True,
                 "加了": want,
                 "抓料源": [str(x.get("url") or x.get("kind")) for x in sources],
-                "提醒": "明天早上那份就会有这一版。RSS 通不通看 /api/news/status。",
+                "提醒": "下一期就会有这一版。RSS 通不通看 /api/news/status。",
             }
 
         if name == "remove_news_section":
@@ -993,3 +1087,37 @@ def _wire_tools(server_module, dates, read_paper, sections, save_sections, clean
         return original_execute(server, name, args)
 
     agent.execute_tool = execute_with_news
+
+    # ── 把「上次日报多久了」接进上下文概览
+    #
+    # 这是「想看就出」的实现方式。不单独发请求去问它要不要看报——
+    # 那个「问」本身就是一次调用，为了省钱又花钱。
+    # 沐每晚心跳醒来都会读一遍概览，看到这一行自己决定。
+
+    original_snapshot = agent.build_context_snapshot
+
+    def snapshot_with_news(server):
+        text = original_snapshot(server)
+        try:
+            gap = days_since_issue()
+            every = every_days()
+            if gap is None:
+                line = (
+                    "【日报】还没出过任何一期。想看就调 make_news 出一份，"
+                    "顺便也可以先用 list_news_sections 看看版面是不是你想读的。"
+                )
+            elif gap >= every:
+                line = (
+                    "【日报】上一期是 " + str(gap) + " 天前，已经超过 "
+                    + str(every) + " 天了。想看新的就调 make_news——"
+                    "不想看就算了，没人催你。"
+                )
+            elif gap >= 2:
+                line = "【日报】上一期是 " + str(gap) + " 天前。想提前看就调 make_news。"
+            else:
+                line = ""
+            return text + "\n" + line if line else text
+        except Exception:
+            return text
+
+    agent.build_context_snapshot = snapshot_with_news
