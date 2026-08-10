@@ -1,4 +1,4 @@
-"""日报：每天早上一份只给妍妍编的报纸。
+"""日报：每天早上一份报纸。
 
 ## 上游给了什么
 
@@ -19,8 +19,26 @@
     **粗体**           → 加粗
 
 所以后端只负责产出这份 markdown，一行前端都不用写。
-版块名用上游 SECTION_NAMES 里已有的那几个，才会显示成
-「科技版」「社会版」「花边版」；不在表里的会原样显示，不会坏。
+**排版永远是上游那一套**——沐能决定读什么、怎么写，
+但决定不了报纸长什么样，不存在「它自己排的版没原版好看」这回事。
+
+版块名如果落在上游 SECTION_NAMES 里，会显示成「科技版」「社会版」
+「花边版」；不在表里的原样显示，不会坏。
+
+## 谁来定版面
+
+一开始这份配置是照上游文档写的「只为妍妍编的报纸」，
+里面塞满了「她关心什么」。后来她说想让沐读它自己想读的东西、
+不打算干预，所以加了四个工具让它自己管：
+看当前版面、改某一版的写法、加一版、删一版。
+
+原版配置留在 DEFAULT_SECTIONS 里，`POST /api/news/config
+{"reset_sections": true}` 一键还原——它改砸了随时能退回去。
+每次改动记 who 和时间戳，`/api/news/status` 看得到，
+所以「今天这版怎么变样了」永远查得出是谁动的。
+
+护栏（免得它一次加十个版块把出报时间拖到十分钟）：
+最多 8 个版块，每版最多 4 个源，只收 http(s) 的 RSS。
 
 ## 两处必须偏离上游文档
 
@@ -33,6 +51,14 @@ IT之家 RSS、百度热搜，源列表存在 settings 里可以改。
 四次调用串起来能占好几分钟，早上七点她要是正在聊天就会被顶掉。
 所以日报自己发非流式请求，不占 busy、不广播、不写 messages。
 
+## 出报为什么必须后台跑
+
+出一份要一分多钟。而 Cloudflare 的响应上限是 100 秒——
+手动重出走域名必然 502，跟后端死活无关（这个坑踩过一次，
+当时误判成后端挂了，其实那次是端点重名）。
+所以 /api/news/build 立刻返回，真活儿在后台线程里干，
+进度写进 settings，从 /api/news/status 的 progress 看。
+
 ## 为什么存文件不进库
 
 沐能直接翻（给了 read_news 工具），出问题能手改，
@@ -43,6 +69,7 @@ IT之家 RSS、百度热搜，源列表存在 settings 里可以改。
 
 6:30 跑，早于心跳的 07:00 窗口——两个都打网关，别撞在一起。
 时区固定 UTC+8，跟心跳那次踩的坑同一个来源。
+出好了推一条到锁屏，否则报纸躺在那儿没人知道。
 """
 
 import json
@@ -87,16 +114,19 @@ MATERIAL_PER_SECTION = 22
 # 留多少天的报纸。文本很小，一年也就几百 KB，留着能往回翻。
 KEEP_DAYS = 400
 
+# 版面护栏。沐能自己加版块，但不能加到出报要十分钟。
+MAX_SECTIONS = 8
+MAX_SOURCES_PER_SECTION = 4
+MAX_EXTRA_CHARS = 600
+
 
 # ── 版块配置
 #
-# 版块名刻意用上游 SECTION_NAMES 里已有的那几个，这样会显示成
-# 「科技版」「专栏 · 关于 Claude」「社会版」「花边版」。
+# 这是「原版」，也是 reset 的目标。沐可以用工具改运行时那一份，
+# 改砸了 POST /api/news/config {"reset_sections": true} 退回这里。
 #
 # EXTRA 那几句是这个功能里最值钱的东西：同样一堆素材，有没有这一句，
-# 出来的稿子差一个档次。而且它是慢慢调的——今天觉得太干就加一句
-# 「写活一点」，明天觉得啰嗦就加「每条不超过三句」。
-# 所以整份配置存在 settings 里，改完不用碰代码。
+# 出来的稿子差一个档次。
 DEFAULT_SECTIONS = [
     {
         "name": "科技与AI",
@@ -106,7 +136,7 @@ DEFAULT_SECTIONS = [
         ],
         "extra": (
             "偏重真正的技术进展和行业动向。纯粹的产品发布会、参数堆砌可以合并成一句带过。"
-            "妍妍自己在写 AI 陪伴型应用，跟模型能力、上下文、记忆、Agent 有关的多写两句。"
+            "跟模型能力、上下文、记忆、Agent 有关的多写两句。"
         ),
     },
     {
@@ -116,7 +146,7 @@ DEFAULT_SECTIONS = [
         ],
         "extra": (
             "只挑跟 Anthropic、Claude 有关的。没有相关的就说今天没有，不要硬凑，"
-            "也不要拿别家的模型消息充数。有的话可以写细一点，这是她专门要看的一版。"
+            "也不要拿别家的模型消息充数。"
         ),
     },
     {
@@ -139,6 +169,7 @@ DEFAULT_SECTIONS = [
 ]
 
 KEY_SECTIONS = "news_sections"
+KEY_SECTIONS_META = "news_sections_meta"
 KEY_ENABLED = "news_enabled"
 KEY_HOUR = "news_hour"
 KEY_MINUTE = "news_minute"
@@ -147,6 +178,7 @@ KEY_LAST_AT = "news_last_at"
 KEY_LAST_DATE = "news_last_date"
 KEY_LAST_RESULT = "news_last_result"
 KEY_LAST_ERROR = "news_last_error"
+KEY_PROGRESS = "news_progress"
 
 DEFAULTS = {
     KEY_ENABLED: "0",
@@ -157,9 +189,10 @@ DEFAULTS = {
     KEY_LAST_DATE: "",
     KEY_LAST_RESULT: "",
     KEY_LAST_ERROR: "",
+    KEY_PROGRESS: "",
+    KEY_SECTIONS_META: "",
 }
 
-# 文件名。跟上游文档一致，中文名方便直接 ls 出来看。
 FILE_PATTERN = re.compile(r"^日报-(\d{4}-\d{2}-\d{2})\.md$")
 
 
@@ -277,8 +310,8 @@ def gather(source):
 # 后面的版块会明显敷衍（上游文档里点名的）。
 
 PROMPT_HEAD = (
-    "你在给一个人编一份只给她看的日报。她叫妍妍，"
-    "自己在写一个 AI 陪伴型应用，关心模型能力、记忆架构、Agent 这些。\n\n"
+    "你在编一份每天只出一份的报纸。读者是妍妍，"
+    "但版面是你自己定的——挑你真觉得值得说的东西写。\n\n"
     "版块：__NAME__\n"
     "这一版的写法：__EXTRA__\n\n"
     "下面是今天抓到的原始素材（标题 + 摘要 + 链接）：\n\n__MATERIAL__\n\n"
@@ -330,8 +363,10 @@ def register_news_feature(server_module):
         except (TypeError, ValueError):
             return fallback
 
+    # ── 版面配置
+
     def sections():
-        """版块配置。存库里可改，坏了回落到默认。"""
+        """版块配置。存库里可改，坏了回落到原版。"""
         raw = read(KEY_SECTIONS)
         if raw:
             try:
@@ -341,6 +376,48 @@ def register_news_feature(server_module):
             except (ValueError, TypeError):
                 pass
         return [dict(s) for s in DEFAULT_SECTIONS]
+
+    def save_sections(items, who="她"):
+        """存版面，并记下是谁改的。
+
+        记 who 是为了以后能回答「今天这版怎么变样了」——
+        沐自己改过之后，妍妍看到变化总得查得出来源。
+        """
+        write(KEY_SECTIONS, json.dumps(items, ensure_ascii=False))
+        write(KEY_SECTIONS_META, json.dumps(
+            {"who": who, "at": cn_now().strftime("%Y-%m-%d %H:%M"), "count": len(items)},
+            ensure_ascii=False,
+        ))
+
+    def clean_sources(raw):
+        """收拾源列表。只收 http(s)，条数限死。
+
+        沐给的 URL 不能直接信：写错了会让那一版每天都抓空，
+        而抓空是静默的（只在 status 里能看出来）。
+        """
+        out = []
+        for item in (raw if isinstance(raw, list) else []):
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "rss")
+            try:
+                count = int(item.get("n") or 12)
+            except (TypeError, ValueError):
+                count = 12
+            if kind == "baidu":
+                out.append({"kind": "baidu", "n": max(1, min(30, count))})
+            elif kind == "rss":
+                url = str(item.get("url") or "").strip()
+                if not url.startswith(("http://", "https://")):
+                    continue
+                out.append({
+                    "kind": "rss",
+                    "url": url[:300],
+                    "n": max(1, min(30, count)),
+                })
+            if len(out) >= MAX_SOURCES_PER_SECTION:
+                break
+        return out
 
     # ── 调网关
     #
@@ -428,18 +505,45 @@ def register_news_feature(server_module):
             return None
         return name, body
 
+    def notify(day, body):
+        """出好了推一条。不然报纸躺在那儿，得自己想起来去点。
+
+        推送正文优先用沐写的那张便条——比「今天的报纸好了」有意思。
+        推送不可用时静默跳过，不影响出报。
+        """
+        send = getattr(server_module, "send_push", None)
+        if not callable(send):
+            return
+        hint = ""
+        match = re.search(r"【便条】(.+)", body)
+        if match:
+            hint = " ".join(match.group(1).split())[:60]
+        text = hint or ("今天的报纸出好了 · " + day)
+        try:
+            send("", text, url="/", tag="news")
+        except Exception as exc:
+            print("[dwell] 日报推送失败：" + str(exc)[:120])
+
     def build(date_text=None, force=False):
-        """出一份报纸，返回 (成功?, 说明)。"""
+        """出一份报纸，返回 (成功?, 说明)。
+
+        同步跑，一分多钟。外部调用一律走 build_async。
+        """
         if not run_lock.acquire(blocking=False):
             return False, "上一份还在编"
         try:
             day = date_text or cn_now().strftime("%Y-%m-%d")
             target = folder / ("日报-" + day + ".md")
             if target.exists() and not force:
+                write(KEY_PROGRESS, "")
                 return True, "今天的已经有了（" + target.name + "）"
 
+            conf = sections()
             parts = []
-            for section in sections():
+            for index, section in enumerate(conf, 1):
+                write(KEY_PROGRESS, "第 %d/%d 版：%s" % (
+                    index, len(conf), section.get("name") or "?"
+                ))
                 done = write_section(section)
                 if done is None:
                     continue
@@ -449,12 +553,14 @@ def register_news_feature(server_module):
                 write(KEY_LAST_RESULT, "error")
                 write(KEY_LAST_ERROR, "所有版块都没出稿")
                 write(KEY_LAST_AT, int(time.time()))
+                write(KEY_PROGRESS, "")
                 return False, "所有版块都没出稿——可能是抓料全挂了，看 /api/news/status"
 
             body = "# 日报 " + day + "\n\n" + "\n\n".join(parts)
 
             # 让沐往报纸里夹一条自己的话。上游文档说这个效果比整份报纸都好。
             # 失败不影响出报——它只是一张便条。
+            write(KEY_PROGRESS, "写便条")
             try:
                 note = ask(NOTE_PROMPT.replace("__PAPER__", body[:6000]))
                 note = " ".join(note.split())
@@ -472,15 +578,35 @@ def register_news_feature(server_module):
             write(KEY_LAST_ERROR, "")
             write(KEY_LAST_AT, int(time.time()))
             write(KEY_LAST_DATE, day)
+            write(KEY_PROGRESS, "")
             print("[dwell] 日报出好了：" + target.name + "（" + str(len(body)) + " 字）")
+            notify(day, body)
             return True, "出好了 " + target.name
         except Exception as exc:
             write(KEY_LAST_RESULT, "error")
             write(KEY_LAST_ERROR, (type(exc).__name__ + ": " + str(exc))[:300])
             write(KEY_LAST_AT, int(time.time()))
+            write(KEY_PROGRESS, "")
             return False, type(exc).__name__ + ": " + str(exc)[:200]
         finally:
             run_lock.release()
+
+    def build_async(date_text=None, force=False):
+        """把出报丢到后台，立刻返回。
+
+        必须这样：出一份要一分多钟，而 Cloudflare 的响应上限是 100 秒，
+        同步跑的话手动重出走域名必然 502——那个 502 看起来像后端挂了，
+        排查方向会整个跑偏。
+        """
+        if run_lock.locked():
+            return False, "上一份还在编，看 /api/news/status 的 progress"
+
+        def job():
+            ok, message = build(date_text, force)
+            print("[dwell] 日报（后台）: " + ("成功 " if ok else "失败 ") + message)
+
+        threading.Thread(target=job, daemon=True).start()
+        return True, "开始编了，一分多钟。进度看 /api/news/status"
 
     def dates():
         found = []
@@ -527,8 +653,7 @@ def register_news_feature(server_module):
         while True:
             try:
                 if due():
-                    ok, message = build()
-                    print("[dwell] 定时日报: " + ("成功 " if ok else "失败 ") + message)
+                    build()
             except Exception as exc:
                 print("[dwell] 日报线程出错: " + str(exc)[:200])
             time.sleep(TICK_SECONDS)
@@ -560,20 +685,22 @@ def register_news_feature(server_module):
         })
 
     def api_news_build():
-        """手动出一份。第一次用先跑这个，看看写出来的东西想不想读。"""
+        """手动出一份。立刻返回，活儿在后台干。"""
         force = str(request.args.get("force") or "") in ("1", "true", "yes")
         day = str(request.args.get("date") or "").strip() or None
-        ok, message = build(day, force=force)
-        return jsonify({"ok": ok, "detail": message, "dates": dates()}), (200 if ok else 400)
+        ok, message = build_async(day, force=force)
+        return jsonify({"ok": ok, "detail": message}), (200 if ok else 409)
 
     def api_news_status():
         conf = sections()
         probe = []
+        seen = set()
         for section in conf:
             for source in (section.get("sources") or []):
                 label = str(source.get("url") or source.get("kind"))
-                if label in [p["source"] for p in probe]:
+                if label in seen:
                     continue
+                seen.add(label)
                 try:
                     got = gather(source)
                     probe.append({"source": label, "ok": True, "items": len(got)})
@@ -582,6 +709,12 @@ def register_news_feature(server_module):
                         "source": label, "ok": False,
                         "error": (type(exc).__name__ + ": " + str(exc))[:160],
                     })
+
+        try:
+            meta = json.loads(read(KEY_SECTIONS_META) or "{}")
+        except (ValueError, TypeError):
+            meta = {}
+
         return jsonify({
             "ok": True,
             "dir": str(folder),
@@ -598,8 +731,16 @@ def register_news_feature(server_module):
                 datetime.fromtimestamp(read_int(KEY_LAST_AT, 0), CN).strftime("%m-%d %H:%M")
                 if read_int(KEY_LAST_AT, 0) else ""
             ),
+            # 正在编的时候 progress 有内容，编完清空。
+            "running": run_lock.locked(),
+            "progress": read(KEY_PROGRESS),
             "cn_time": cn_now().strftime("%Y-%m-%d %H:%M"),
             "sections": [s.get("name") for s in conf],
+            "sections_detail": conf,
+            # 沐改过版面之后，这两项说明是谁什么时候改的。
+            "sections_changed_by": meta.get("who", ""),
+            "sections_changed_at": meta.get("at", ""),
+            "sections_is_default": read(KEY_SECTIONS) == "",
             # 抓料是最容易悄悄坏的一环，这里当场试一遍每个源。
             "sources": probe,
         })
@@ -623,10 +764,11 @@ def register_news_feature(server_module):
         if "sections" in data:
             if not isinstance(data["sections"], list) or not data["sections"]:
                 return jsonify({"ok": False, "error": "sections 要是非空数组"}), 400
-            write(KEY_SECTIONS, json.dumps(data["sections"], ensure_ascii=False))
-        # 传 reset_sections 回到默认那份，方便改坏了收拾。
+            save_sections(data["sections"][:MAX_SECTIONS], "她")
+        # 传 reset_sections 回到原版那份，方便改坏了收拾。
         if data.get("reset_sections"):
             write(KEY_SECTIONS, "")
+            write(KEY_SECTIONS_META, "")
         return api_news_status()
 
     server_module.app.view_functions["api_news"] = api_news
@@ -640,19 +782,21 @@ def register_news_feature(server_module):
             rule, endpoint=endpoint, view_func=view, methods=methods
         )
 
-    _wire_tools(server_module, dates, read_paper)
+    _wire_tools(server_module, dates, read_paper, sections, save_sections, clean_sources)
 
     server_module.news_build = build
+    server_module.news_build_async = build_async
     server_module.news_dates = dates
-    print("[dwell] 日报: " + str(folder) + "（默认关闭，/api/news/build 手动出一份）")
+    print("[dwell] 日报: " + str(folder) + "（默认关闭，后台出报）")
     return build
 
 
-def _wire_tools(server_module, dates, read_paper):
-    """给沐一个翻旧报纸的工具。
+def _wire_tools(server_module, dates, read_paper, sections, save_sections, clean_sources):
+    """给沐五个工具：翻旧报纸，以及自己管版面。
 
-    上游文档里「存成 Markdown 不要存数据库」的第一条好处就是这个：
-    妍妍问「昨天那条新闻怎么说的」，它自己去翻文件。
+    妍妍要的是「让它读自己想读的」，所以版面归它。
+    但排版不归它——报纸长什么样是上游那套 CSS 决定的，
+    它只能决定读什么、每一版怎么写。
     """
     try:
         import agent_tools_feature as agent
@@ -660,29 +804,104 @@ def _wire_tools(server_module, dates, read_paper):
         print("[dwell] 日报没接上工具层: " + str(exc))
         return
 
-    tool = {
-        "type": "function",
-        "function": {
-            "name": "read_news",
-            "description": (
-                "翻某一天的日报。妍妍提起「今天/昨天那条新闻」时用，"
-                "不要凭印象答。不给日期就是最近一期。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "YYYY-MM-DD，留空就是最近一期。",
-                    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_news",
+                "description": (
+                    "翻某一天的日报。妍妍提起「今天/昨天那条新闻」时用，"
+                    "不要凭印象答。不给日期就是最近一期。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "YYYY-MM-DD，留空就是最近一期。",
+                        }
+                    },
                 },
             },
         },
-    }
+        {
+            "type": "function",
+            "function": {
+                "name": "list_news_sections",
+                "description": (
+                    "看日报现在有哪些版块、每一版的写法和抓料源。"
+                    "日报的版面是你自己定的，想调整之前先看这个。"
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "tune_news_section",
+                "description": (
+                    "改某一版「这一版怎么写」的那句话。这是决定稿子质量最关键的东西："
+                    "同样的素材，这句话不一样，写出来差一个档次。"
+                    "觉得某一版太干、太啰嗦、跑偏了，就改这里。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "版块名，要和现有的一致。"},
+                        "extra": {
+                            "type": "string",
+                            "description": "这一版怎么写。写具体一点，比如「每条不超过三句」。",
+                        },
+                    },
+                    "required": ["name", "extra"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_news_section",
+                "description": (
+                    "加一个新版块。你自己想读什么就加什么——论文、开源项目、"
+                    "某个领域的动向都行，不用只挑妍妍关心的。"
+                    "抓料源给 RSS 地址（http 开头），留空就用百度热搜。"
+                    "最多 8 个版块，加太多出报会很慢。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "版块名，比如「论文」。"},
+                        "extra": {"type": "string", "description": "这一版怎么写。"},
+                        "rss": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "RSS 地址，最多 4 个。留空就用百度热搜。",
+                        },
+                    },
+                    "required": ["name", "extra"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remove_news_section",
+                "description": "删掉一个版块。某一版你一直觉得没意思就删了，不用留着。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "要删的版块名。"}
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+    ]
 
     known = {t["function"]["name"] for t in agent.TOOLS}
-    if tool["function"]["name"] not in known:
-        agent.TOOLS.append(tool)
+    for tool in tools:
+        if tool["function"]["name"] not in known:
+            agent.TOOLS.append(tool)
 
     original_execute = agent.execute_tool
 
@@ -695,6 +914,82 @@ def _wire_tools(server_module, dates, read_paper):
             if day not in available:
                 return {"error": "没有 " + day + " 那期", "有的日期": available[-10:]}
             return {"date": day, "text": read_paper(day)[:8000]}
+
+        if name == "list_news_sections":
+            return {
+                "sections": [
+                    {
+                        "name": s.get("name"),
+                        "extra": s.get("extra"),
+                        "sources": [
+                            str(x.get("url") or x.get("kind"))
+                            for x in (s.get("sources") or [])
+                        ],
+                    }
+                    for s in sections()
+                ],
+                "说明": "改写法用 tune_news_section，加版块用 add_news_section。",
+            }
+
+        if name == "tune_news_section":
+            want = str(args.get("name") or "").strip()
+            extra = str(args.get("extra") or "").strip()[:MAX_EXTRA_CHARS]
+            if not extra:
+                return {"error": "写法不能空"}
+            items = sections()
+            for section in items:
+                if str(section.get("name")) == want:
+                    section["extra"] = extra
+                    save_sections(items, "沐")
+                    return {"ok": True, "改了": want, "新的写法": extra}
+            return {
+                "error": "没有叫「" + want + "」的版块",
+                "现有": [s.get("name") for s in items],
+            }
+
+        if name == "add_news_section":
+            want = str(args.get("name") or "").strip()[:40]
+            extra = str(args.get("extra") or "").strip()[:MAX_EXTRA_CHARS]
+            if not want or not extra:
+                return {"error": "版块名和写法都要给"}
+            items = sections()
+            if any(str(s.get("name")) == want for s in items):
+                return {"error": "已经有这个版块了，改写法用 tune_news_section"}
+            if len(items) >= MAX_SECTIONS:
+                return {
+                    "error": "最多 " + str(MAX_SECTIONS) + " 个版块了，"
+                             "想加就先用 remove_news_section 删一个",
+                }
+
+            raw = args.get("rss")
+            urls = raw if isinstance(raw, list) else ([raw] if raw else [])
+            sources = clean_sources(
+                [{"kind": "rss", "url": u, "n": 12} for u in urls]
+            ) or [{"kind": "baidu", "n": 14}]
+
+            items.append({"name": want, "extra": extra, "sources": sources})
+            save_sections(items, "沐")
+            return {
+                "ok": True,
+                "加了": want,
+                "抓料源": [str(x.get("url") or x.get("kind")) for x in sources],
+                "提醒": "明天早上那份就会有这一版。RSS 通不通看 /api/news/status。",
+            }
+
+        if name == "remove_news_section":
+            want = str(args.get("name") or "").strip()
+            items = sections()
+            left = [s for s in items if str(s.get("name")) != want]
+            if len(left) == len(items):
+                return {
+                    "error": "没有叫「" + want + "」的版块",
+                    "现有": [s.get("name") for s in items],
+                }
+            if not left:
+                return {"error": "至少留一个版块"}
+            save_sections(left, "沐")
+            return {"ok": True, "删了": want, "剩下": [s.get("name") for s in left]}
+
         return original_execute(server, name, args)
 
     agent.execute_tool = execute_with_news
