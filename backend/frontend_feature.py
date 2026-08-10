@@ -57,8 +57,8 @@ BRIEF_HELPER = (
 # ICONS 表的锚点，上游第一条。
 ICONS_ANCHOR = "const ICONS = {\n"
 
-# cpu 和 smile 不在上游那张表里，补两个 feather 风格的：
-# cpu 给侧边栏「模型」，smile 给「表情」和工具卡片。
+# cpu / smile / archive 都不在上游那张表里，补三个 feather 风格的：
+# cpu 给侧边栏「模型」，smile 给「表情」和工具卡片，archive 给「备份」。
 EXTRA_ICONS = (
     "  cpu: S('<rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\"/>"
     "<rect x=\"9\" y=\"9\" width=\"6\" height=\"6\"/>"
@@ -74,6 +74,9 @@ EXTRA_ICONS = (
     "<path d=\"M8.5 14.3c.9 1.1 2.1 1.7 3.5 1.7s2.6-.6 3.5-1.7\"/>"
     "<line x1=\"9\" y1=\"9.6\" x2=\"9\" y2=\"9.9\"/>"
     "<line x1=\"15\" y1=\"9.6\" x2=\"15\" y2=\"9.9\"/>'),\n"
+    "  archive: S('<path d=\"M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8\"/>"
+    "<rect x=\"2\" y=\"3\" width=\"20\" height=\"5\" rx=\"1\"/>"
+    "<line x1=\"10\" y1=\"12\" x2=\"14\" y2=\"12\"/>'),\n"
 )
 
 # 输入区那个「发表情」按钮的样式。
@@ -196,7 +199,7 @@ NAV_WALL_BUTTON = (
     '<span class="ic" data-i="pen"></span>日记</button>'
 )
 
-# 悄悄话、通知、模型、表情四个入口。都用 button 而不是 a：
+# 悄悄话、通知、模型、表情、备份五个入口。都用 button 而不是 a：
 # 上游 .item 的样式是给 button 写的，用 <a> 会吃到全局链接色，
 # 在侧边栏里显示成一行蓝色带下划线的字，跟旁边几项完全不搭。
 NAV_BTN_WHISPER = (
@@ -215,14 +218,20 @@ NAV_BTN_STICKERS = (
     '\n      <button class="item" id="navStickers">'
     '<span class="ic" data-i="smile"></span>表情</button>'
 )
+NAV_BTN_BACKUP = (
+    '\n      <button class="item" id="navBackup">'
+    '<span class="ic" data-i="archive"></span>备份</button>'
+)
 
 NAV_EXTRA_BUTTONS = (
-    NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH + NAV_BTN_MODELS + NAV_BTN_STICKERS
+    NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH + NAV_BTN_MODELS
+    + NAV_BTN_STICKERS + NAV_BTN_BACKUP
 )
 
 # 历史版本插过的按钮组合，重新构建时先还原成原始按钮。
 # （正常路径下源文件总是上游原貌，这里只是防御性的。）
 NAV_LEGACY_VARIANTS = (
+    NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH + NAV_BTN_MODELS + NAV_BTN_STICKERS,
     NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH + NAV_BTN_MODELS,
     NAV_WALL_BUTTON + NAV_BTN_WHISPER + NAV_BTN_PUSH
     + '\n      <button class="item" id="navModels">'
@@ -248,12 +257,15 @@ NAV_H_STICKERS = (
     "if (window.dwellStickers) window.dwellStickers.open(); "
     "else location.href = '/stickers'; };"
 )
+NAV_H_BACKUP = "\ndocument.getElementById('navBackup').onclick = () => { location.href = '/backup'; };"
 
 NAV_EXTRA_HANDLERS = (
-    NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH + NAV_H_MODELS + NAV_H_STICKERS
+    NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH + NAV_H_MODELS
+    + NAV_H_STICKERS + NAV_H_BACKUP
 )
 
 NAV_LEGACY_HANDLERS = (
+    NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH + NAV_H_MODELS + NAV_H_STICKERS,
     NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH + NAV_H_MODELS,
     NAV_WALL_HANDLER + NAV_H_WHISPER + NAV_H_PUSH,
 )
@@ -407,7 +419,7 @@ def _patch_tool_labels(html: str) -> str:
 
 
 def _patch_nav(html: str) -> str:
-    """补悄悄话、通知、模型、表情四个侧边栏入口。"""
+    """补悄悄话、通知、模型、表情、备份五个侧边栏入口。"""
     # 清掉早期版本用 <a> 写的通知入口，避免重复和蓝色链接残留。
     html = html.replace(
         '\n      <a class="item" href="/push">'
@@ -420,7 +432,7 @@ def _patch_nav(html: str) -> str:
             html = html.replace(legacy, NAV_WALL_BUTTON)
         html = html.replace(NAV_WALL_BUTTON, NAV_EXTRA_BUTTONS, 1)
 
-    if "getElementById('navStickers')" not in html:
+    if "getElementById('navBackup')" not in html:
         for legacy in NAV_LEGACY_HANDLERS:
             html = html.replace(legacy, NAV_WALL_HANDLER)
         html = html.replace(NAV_WALL_HANDLER, NAV_EXTRA_HANDLERS, 1)
@@ -604,12 +616,15 @@ def register_frontend_feature(server_module):
                 "plusbtn_ic_anchor_found": PLUSBTN_IC_ANCHOR in source_text,
                 "cpu_icon": "  cpu: S(" in built,
                 "smile_icon": "  smile: S(" in built,
+                "archive_icon": "  archive: S(" in built,
                 "manifest_link": 'rel="manifest"' in built,
                 "apple_icon": "apple-touch-icon" in built,
                 "push_nav": 'id="navPush"' in built,
                 "models_nav": 'id="navModels"' in built,
                 "stickers_nav": 'id="navStickers"' in built,
                 "stickers_handler": "getElementById('navStickers')" in built,
+                "backup_nav": 'id="navBackup"' in built,
+                "backup_handler": "getElementById('navBackup')" in built,
                 "nav_anchor_found": NAV_WALL_BUTTON in source_text,
                 "nav_handler_anchor_found": NAV_WALL_HANDLER in source_text,
                 "icons_anchor_found": ICONS_ANCHOR in source_text,
