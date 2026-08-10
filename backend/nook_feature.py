@@ -27,6 +27,18 @@
 * `chapter` 返回里必须有 `index`（数字），前端用 `typeof d.index !== 'number'`
   判断这一节是不是读不出来。
 
+## slug 和书名是两件事
+
+书名可以随时改，slug 一律不动。
+
+原因：slug 进了文件路径（data/books/<slug>/）、进了 nook_progress 和
+nook_annos 的每一行、也进了前端的 URL。跟着改名一起变的话，
+已有的划线和进度立刻变成孤儿——而且是静默的，界面上只会显示
+「这本书没有划线」，查都不知道从哪查。
+
+所以 meta.json 里的 title 是「显示的名字」，slug 是「身份」。
+改名只动前者。
+
 ## 端点重名
 
 `/api/nook/books` 在 server.py 里有个 stub，endpoint 名就叫 `api_nook`。
@@ -81,6 +93,10 @@ MAX_ANCHOR = 200
 
 MAX_NOTE = 2000
 
+# 书名和章节名的长度上限。
+MAX_TITLE = 80
+MAX_CH_TITLE = 60
+
 # 给模型看的正文长度上限。一章几千字，截断了它也能读出味道。
 MAX_TEXT_FOR_AI = 6000
 
@@ -106,14 +122,22 @@ def stamp(ts):
     return datetime.fromtimestamp(int(ts), CN).strftime("%m-%d %H:%M")
 
 
+def clean_title(raw, fallback=""):
+    """收拾用户给的名字。控制字符和路径分隔符一律去掉。"""
+    text = UNSAFE.sub("", str(raw or ""))
+    text = " ".join(text.split()).strip().strip(".")
+    return text[:MAX_TITLE] or fallback
+
+
 def make_slug(title, taken):
     """从书名派生一个能进路径也能进 URL 的 slug。
 
     中文照用（前端会 encodeURIComponent，文件系统也认），
     只把危险字符去掉。撞了就加后缀。
+
+    注意：slug 定下来就不再改了，改书名不动它。
     """
-    base = UNSAFE.sub("", str(title or "")).strip().strip(".")
-    base = " ".join(base.split())[:40] or ("book-" + secrets.token_hex(3))
+    base = clean_title(title)[:40] or ("book-" + secrets.token_hex(3))
     slug = base
     n = 2
     while slug in taken:
@@ -137,15 +161,11 @@ def split_chapters(text):
     for index, line in enumerate(lines):
         match = HEADING.match(line.strip())
         if match:
-            marks.append((index, match.group(1).strip()[:60]))
+            marks.append((index, match.group(1).strip()[:MAX_CH_TITLE]))
             continue
         match = CHAPTER_LINE.match(line)
         if match and len(line.strip()) <= 40:
-            title = line.strip()
-            extra = match.group(1).strip()
-            if extra:
-                title = title
-            marks.append((index, title[:60]))
+            marks.append((index, line.strip()[:MAX_CH_TITLE]))
 
     chapters = []
     if len(marks) >= 2:
@@ -249,6 +269,15 @@ def register_nook_feature(server_module):
         data.setdefault("chapters", [])
         return data
 
+    def write_meta(slug, meta):
+        folder = book_dir(slug)
+        if folder is None or not folder.is_dir():
+            return False
+        tmp = folder / "meta.json.part"
+        tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(folder / "meta.json")
+        return True
+
     def all_books():
         found = []
         for folder in sorted(root.iterdir()) if root.is_dir() else []:
@@ -303,7 +332,7 @@ def register_nook_feature(server_module):
         (folder / "meta.json").write_text(
             json.dumps(
                 {
-                    "title": " ".join(str(title or slug).split())[:80],
+                    "title": clean_title(title, slug),
                     "chapters": entries,
                     "added": int(time.time()),
                 },
@@ -312,6 +341,44 @@ def register_nook_feature(server_module):
             encoding="utf-8",
         )
         return slug, len(entries)
+
+    def rename_book(slug, title):
+        """改书名。只动 meta.json 里的 title，slug 不动。
+
+        slug 在文件路径、nook_progress、nook_annos 和前端 URL 里都用着，
+        跟着改名一起变会让已有的划线和进度变成孤儿，而且是静默的。
+        """
+        meta = read_meta(slug)
+        if meta is None:
+            return False, "没这本书"
+        name = clean_title(title)
+        if not name:
+            return False, "书名不能空"
+        meta["title"] = name
+        if not write_meta(slug, meta):
+            return False, "写不进去"
+        return True, name
+
+    def rename_chapter(slug, index, title):
+        """改某一节的名字。切章猜出来的名字有时候很难看。"""
+        meta = read_meta(slug)
+        if meta is None:
+            return False, "没这本书"
+        chapters = meta.get("chapters") or []
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return False, "第几节要是数字"
+        if not 0 <= index < len(chapters):
+            return False, "没有第 " + str(index) + " 节"
+        name = clean_title(title)[:MAX_CH_TITLE]
+        if not name:
+            return False, "名字不能空"
+        chapters[index]["title"] = name
+        meta["chapters"] = chapters
+        if not write_meta(slug, meta):
+            return False, "写不进去"
+        return True, name
 
     def drop_book(slug):
         folder = book_dir(slug)
@@ -488,7 +555,7 @@ def register_nook_feature(server_module):
         """传一本书。手机上只能这样：读成文本 POST 上来。"""
         data = request.get_json(force=True, silent=True) or {}
         text = str(data.get("text") or "")
-        title = str(data.get("title") or "").strip()
+        title = clean_title(data.get("title"))
         if len(text.strip()) < 200:
             return jsonify({"ok": False, "error": "内容太短，不像一本书"}), 400
         if not title:
@@ -496,12 +563,43 @@ def register_nook_feature(server_module):
         slug, count = save_book(title, text)
         return jsonify({"ok": True, "slug": slug, "chapters": count})
 
+    def api_rename():
+        """改书名，或者改某一节的名字。
+
+        传 chapter 就是改那一节，不传就是改书名。
+        两种都只动 meta.json，slug 不变——划线和进度都挂在 slug 上。
+        """
+        data = request.get_json(force=True, silent=True) or {}
+        slug = str(data.get("slug") or "").strip()
+        title = data.get("title")
+
+        if "chapter" in data and data.get("chapter") is not None:
+            ok, detail = rename_chapter(slug, data.get("chapter"), title)
+        else:
+            ok, detail = rename_book(slug, title)
+
+        if not ok:
+            return jsonify({"ok": False, "error": detail}), 400
+        return jsonify({"ok": True, "title": detail, "books": all_books()})
+
     def api_delete():
         data = request.get_json(force=True, silent=True) or {}
         slug = str(data.get("slug") or "").strip()
         if not drop_book(slug):
             return jsonify({"ok": False, "error": "没这本书"}), 404
         return jsonify({"ok": True, "books": all_books()})
+
+    def api_chapters(slug):
+        """某本书的章节名列表。传书面板用来改节名。"""
+        meta = read_meta(slug)
+        if meta is None:
+            return jsonify({"ok": False, "error": "没这本书"}), 404
+        return jsonify({
+            "ok": True,
+            "slug": slug,
+            "title": meta.get("title") or slug,
+            "chapters": [c.get("title", "") for c in meta.get("chapters", [])],
+        })
 
     def api_status():
         books = all_books()
@@ -547,7 +645,9 @@ def register_nook_feature(server_module):
             "api_nook_anno_reply", api_anno_reply, ["POST"],
         ),
         ("/api/nook/upload", "api_nook_upload", api_upload, ["POST"]),
+        ("/api/nook/rename", "api_nook_rename", api_rename, ["POST"]),
         ("/api/nook/delete", "api_nook_delete", api_delete, ["POST"]),
+        ("/api/nook/chapters/<slug>", "api_nook_chapters", api_chapters, ["GET"]),
         ("/api/nook/status", "api_nook_status", api_status, ["GET"]),
     ]
     for rule, endpoint, view, methods in routes:
@@ -567,7 +667,7 @@ def _wire_tools(
     server_module, all_books, read_meta, chapter_text,
     annos_of, add_anno, add_reply, her_open_marks, progress_map,
 ):
-    """给沐四个工具，并把「她划了几处还没回」接进上下文概览。
+    """给沐五个工具，并把「她划了几处还没回」接进上下文概览。
 
     上游文档第六节那四条规矩写进了工具描述，其中第一条最要紧：
     不要每一条都回。她划线多半只是「这句好」，不是在问你——
@@ -738,8 +838,8 @@ def _wire_tools(
                 }
             # 全部：按书按节聚合，避免一次吐太多。
             out = []
+            where = progress_map()
             for book in all_books():
-                where = (progress_map().get(book["slug"]) or {}).get("ch", 0)
                 for index in range(len(book["chapters"])):
                     marks = annos_of(book["slug"], index)
                     if marks:
@@ -753,7 +853,13 @@ def _wire_tools(
                         })
                     if len(out) >= 20:
                         break
-            return {"划线": out, "她读到": where if out else 0}
+            return {
+                "划线": out,
+                "她读到": {
+                    b["slug"]: (where.get(b["slug"]) or {}).get("ch", 0)
+                    for b in all_books()
+                },
+            }
 
         if name == "reply_to_mark":
             try:
@@ -820,9 +926,7 @@ def _wire_tools(
             if reading:
                 line += "，她在读：" + "、".join(reading[:3])
             if rows:
-                quotes = "；".join(
-                    (r["anchor"] or "")[:24] for r in rows
-                )
+                quotes = "；".join((r["anchor"] or "")[:24] for r in rows)
                 line += (
                     "。她划了 " + str(len(her_open_marks(50)))
                     + " 处你还没回过，最近几处：" + quotes
@@ -839,6 +943,9 @@ def _wire_tools(
 # ── 传书面板
 #
 # 妍妍没有电脑，书只能从手机传。选一个 txt/md，前端读成文本 POST 上来。
+# 书名和节名都是点一下就能改（失焦即存，跟表情包管理页一个手感）——
+# 改的只是显示的名字，slug 不动，所以划线和进度不会丢。
+#
 # 配色照上游 :root 写死一份（跟登录页一样）：这个页面要在书架空着的时候
 # 也能打开，不该依赖别的模块。
 PANEL_HTML = """<!doctype html>
@@ -876,9 +983,10 @@ PANEL_HTML = """<!doctype html>
   input[type=text] {
     width: 100%; background: var(--panel); border: 1px solid transparent;
     border-radius: 14px; color: var(--text); padding: 11px 13px;
-    font-size: 16px; font-family: inherit; margin-bottom: 10px;
+    font-size: 16px; font-family: inherit;
   }
   input::placeholder { color: var(--dim); }
+  #title { margin-bottom: 10px; }
   button {
     font: inherit; font-size: 15px; min-height: 44px; padding: 0 18px;
     border: 1px solid transparent; border-radius: 999px;
@@ -886,18 +994,23 @@ PANEL_HTML = """<!doctype html>
   }
   button.go { background: var(--accent); color: #fff; }
   button:disabled { opacity: .45; }
-  .item {
-    display: flex; align-items: center; gap: 12px;
-    padding: 12px 0; border-bottom: 1px solid var(--line);
-  }
+  .item { padding: 12px 0; border-bottom: 1px solid var(--line); }
   .item:last-child { border-bottom: 0; }
-  .item .t { flex: 1; min-width: 0; }
-  .item .t b { font-weight: 600; }
-  .item .t small { display: block; color: var(--dim); font-size: 12.5px; }
-  .item .del {
+  .row { display: flex; align-items: center; gap: 10px; }
+  .row .grow { flex: 1; min-width: 0; }
+  .item small { display: block; color: var(--dim); font-size: 12.5px; margin-top: 4px; }
+  .item .icon {
     min-width: 44px; min-height: 44px; background: transparent;
-    color: var(--dim); font-size: 20px; border: 0;
+    color: var(--dim); font-size: 18px; border: 0; padding: 0;
   }
+  .chapters { margin-top: 10px; padding-left: 2px; display: none; }
+  .chapters.open { display: block; }
+  .chapters .cr { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .chapters .n {
+    flex: none; width: 30px; text-align: right;
+    color: var(--dim); font-size: 12.5px;
+  }
+  .chapters input { font-size: 14px; padding: 8px 11px; }
   #msg { min-height: 22px; font-size: 13px; color: var(--dim); margin: 10px 0 0; }
   #msg.warn { color: var(--accent); }
   .note { font-size: 12.5px; color: var(--dim); line-height: 1.75; margin: 10px 0 0; }
@@ -916,13 +1029,15 @@ PANEL_HTML = """<!doctype html>
   </label>
   <p class="note">
     会自动切章：先找「第一章」这类标题，找不到就按长度切。
-    切得不好可以删掉重传。
   </p>
   <p id="msg"></p>
 </div>
 
 <div class="card">
   <h2>已有的</h2>
+  <p class="note" style="margin:0 0 10px">
+    书名点一下就能改，改完点别处就存了。名字改了划线和进度都还在。
+  </p>
   <div id="list">读取中…</div>
 </div>
 
@@ -931,6 +1046,115 @@ var msg = document.getElementById('msg');
 var titleEl = document.getElementById('title');
 
 function say(t, warn) { msg.textContent = t || ''; msg.className = warn ? 'warn' : ''; }
+
+function post(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d && d.ok === false) say(d.error || '出错了', true);
+    return d;
+  }).catch(function () { say('请求失败', true); });
+}
+
+function bookRow(b) {
+  var wrap = document.createElement('div');
+  wrap.className = 'item';
+
+  var row = document.createElement('div');
+  row.className = 'row';
+
+  var name = document.createElement('input');
+  name.type = 'text';
+  name.className = 'grow';
+  name.value = b.title;
+  name.setAttribute('aria-label', '书名');
+  // 失焦即存。加个「保存」按钮只是多一次点击。
+  name.onblur = function () {
+    var next = name.value.trim();
+    if (!next || next === b.title) { name.value = b.title; return; }
+    post('/api/nook/rename', { slug: b.slug, title: next }).then(function (d) {
+      if (d && d.ok) { b.title = d.title; name.value = d.title; say('改好了'); }
+      else name.value = b.title;
+    });
+  };
+  name.onkeydown = function (e) { if (e.key === 'Enter') name.blur(); };
+
+  var toc = document.createElement('button');
+  toc.className = 'icon';
+  toc.type = 'button';
+  toc.textContent = '\\u2261';
+  toc.setAttribute('aria-label', '看章节');
+
+  var del = document.createElement('button');
+  del.className = 'icon';
+  del.type = 'button';
+  del.textContent = '\\u00d7';
+  del.setAttribute('aria-label', '删除 ' + b.title);
+  del.onclick = function () {
+    if (!confirm('删掉《' + b.title + '》？这本书的划线也会一起删。')) return;
+    del.disabled = true;
+    post('/api/nook/delete', { slug: b.slug }).then(function () { say('删了'); load(); });
+  };
+
+  row.appendChild(name);
+  row.appendChild(toc);
+  row.appendChild(del);
+  wrap.appendChild(row);
+
+  var info = document.createElement('small');
+  info.textContent = (b.chapters || []).length + ' 节';
+  wrap.appendChild(info);
+
+  var box = document.createElement('div');
+  box.className = 'chapters';
+  wrap.appendChild(box);
+
+  toc.onclick = function () {
+    if (box.classList.contains('open')) { box.classList.remove('open'); return; }
+    box.classList.add('open');
+    if (box.dataset.done) return;
+    box.textContent = '读取中…';
+    fetch('/api/nook/chapters/' + encodeURIComponent(b.slug), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        box.textContent = '';
+        if (!d || !d.ok) { box.textContent = '读不到章节'; return; }
+        box.dataset.done = '1';
+        (d.chapters || []).forEach(function (name, i) {
+          var cr = document.createElement('div');
+          cr.className = 'cr';
+          var num = document.createElement('span');
+          num.className = 'n';
+          num.textContent = (i + 1) + '.';
+          var input = document.createElement('input');
+          input.type = 'text';
+          input.className = 'grow';
+          input.value = name;
+          input.setAttribute('aria-label', '第 ' + (i + 1) + ' 节的名字');
+          var was = name;
+          input.onblur = function () {
+            var next = input.value.trim();
+            if (!next || next === was) { input.value = was; return; }
+            post('/api/nook/rename', {
+              slug: b.slug, chapter: i, title: next
+            }).then(function (r) {
+              if (r && r.ok) { was = r.title; input.value = r.title; say('改好了'); }
+              else input.value = was;
+            });
+          };
+          input.onkeydown = function (e) { if (e.key === 'Enter') input.blur(); };
+          cr.appendChild(num);
+          cr.appendChild(input);
+          box.appendChild(cr);
+        });
+      })
+      .catch(function () { box.textContent = '读不到章节'; });
+  };
+
+  return wrap;
+}
 
 function load() {
   fetch('/api/nook/books', { cache: 'no-store' })
@@ -942,33 +1166,7 @@ function load() {
         box.innerHTML = '<div class="note" style="margin:0">还没有书。</div>';
         return;
       }
-      books.forEach(function (b) {
-        var row = document.createElement('div');
-        row.className = 'item';
-        var t = document.createElement('div');
-        t.className = 't';
-        var name = document.createElement('b');
-        name.textContent = b.title;
-        var sub = document.createElement('small');
-        sub.textContent = (b.chapters || []).length + ' 节';
-        t.appendChild(name); t.appendChild(sub);
-        var del = document.createElement('button');
-        del.className = 'del';
-        del.type = 'button';
-        del.textContent = '\\u00d7';
-        del.setAttribute('aria-label', '删除 ' + b.title);
-        del.onclick = function () {
-          if (!confirm('删掉《' + b.title + '》？这本书的划线也会一起删。')) return;
-          del.disabled = true;
-          fetch('/api/nook/delete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ slug: b.slug })
-          }).then(function () { say('删了'); load(); });
-        };
-        row.appendChild(t); row.appendChild(del);
-        box.appendChild(row);
-      });
+      books.forEach(function (b) { box.appendChild(bookRow(b)); });
     })
     .catch(function () {
       document.getElementById('list').textContent = '读不到书架。';
@@ -990,16 +1188,14 @@ document.getElementById('pick').onchange = function (e) {
     var text = String(reader.result || '');
     if (text.length < 200) { say('内容太短，不像一本书', true); return; }
     say('上传中，切章要几秒…');
-    fetch('/api/nook/upload', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: titleEl.value.trim(), text: text })
-    }).then(function (r) { return r.json(); }).then(function (d) {
-      if (!d || !d.ok) { say((d && d.error) || '没传上去', true); return; }
+    post('/api/nook/upload', {
+      title: titleEl.value.trim(), text: text
+    }).then(function (d) {
+      if (!d || !d.ok) return;
       say('好了，切成 ' + d.chapters + ' 节。去「共读」里读。');
       titleEl.value = '';
       load();
-    }).catch(function () { say('请求失败', true); });
+    });
   };
   reader.onerror = function () { say('这个文件读不出来', true); };
   // 中文 txt 多半是 UTF-8；GBK 的会乱码，那种先转一下编码再传。
