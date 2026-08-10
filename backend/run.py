@@ -25,6 +25,7 @@ from busy_guard import register_busy_guard
 from sticker_feature import register_sticker_feature
 from music_feature import register_music_feature
 from news_feature import register_news_feature
+from nook_feature import register_nook_feature
 from heartbeat_feature import register_heartbeat_feature
 from wake_feature import register_wake_feature
 from backup_feature import register_backup_feature
@@ -65,14 +66,13 @@ register_agent_tools_feature(server)
 # 反过来，它必须在心跳之前——心跳靠 call_gateway 的返回值
 # 区分「没轮到」和「真说过」。
 register_busy_guard(server)
-# 表情包在 agent_tools 之后：它要往 agent_tools 的 TOOLS 里追两条工具，
-# 并包住 execute_tool 和 build_context_snapshot。
+# 下面这几个都要往 agent_tools 的 TOOLS 里追工具、
+# 或者包一层 execute_tool / build_context_snapshot，所以都排在它之后。
+# 它们各自包住的是「上一层」，所以顺序之间互不影响。
 register_sticker_feature(server)
-# 音乐同理，要往 TOOLS 里追一条 find_song 并包一层 execute_tool。
 register_music_feature(server)
-# 日报也要往 TOOLS 里追一条 read_news。它自己发非流式请求、
-# 不走 call_gateway（四个版块会把网关占好几分钟），所以和 busy_guard 无关。
 register_news_feature(server)
+register_nook_feature(server)
 # 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具、
 # 带占位的那一版，同时依赖 server.send_push 把主动说的话推到锁屏。
 register_heartbeat_feature(server)
@@ -96,8 +96,8 @@ if __name__ == "__main__":
     print(f"  port    : {server.PORT}")
     print(f"  db      : {db_path}")
     print("  frontend: ../web/index.html（动态读取，无需复制）")
-    print("  modules : 聊天 / 待办 / 日历 / 悄悄话 / 日记 / 仓库 / 日报")
-    print("  tools   : 待办 / 日历 / 悄悄话 / 日记 / 摘录 / 表情 / 找歌 / 翻日报")
+    print("  modules : 聊天 / 待办 / 日历 / 悄悄话 / 日记 / 仓库 / 日报 / 共读")
+    print("  tools   : 待办 / 日历 / 悄悄话 / 日记 / 摘录 / 表情 / 找歌 / 日报 / 共读")
     print("  events  : 可重放游标队列")
     print("  history : 思考与工具调用持久化重放")
     print("  config  : 设置 → 接入 API（地址/令牌/模型名）")
@@ -107,10 +107,11 @@ if __name__ == "__main__":
     print("  media   : /api/upload，图片存 data/uploads")
     print("  sticker : /stickers 面板，原图存 data/stickers")
     print("  music   : /api/music，网易云链接自动变卡片")
-    print("  news    : /api/news，稿子存 data/news（默认关闭）")
+    print("  news    : /api/news，稿子存 data/news（默认关闭，隔几天一份）")
+    print("  nook    : /books 传书，书稿存 data/books，划线进库")
     print("  icon    : /api/icon/status")
     print("  backup  : /backup 面板（默认关闭，只推文本库）")
     print("  panels  : 浮层内打开，配色取自上游 :root（/api/panel/vars）")
     print("  busy    : 原子占位，卡住会自动抢占（/api/busy）")
-    print("  auth    : /auth 设口令；没设之前整站敞开")
+    print("  auth    : /auth 设口令；维护令牌在 data/admin_token")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
