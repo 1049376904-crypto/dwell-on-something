@@ -20,6 +20,7 @@ from repo_feature import register_repo_feature
 from event_stream_feature import register_event_stream_feature
 from transcript_feature import register_transcript_feature
 from agent_tools_feature import register_agent_tools_feature
+from busy_guard import register_busy_guard
 from sticker_feature import register_sticker_feature
 from heartbeat_feature import register_heartbeat_feature
 from wake_feature import register_wake_feature
@@ -52,11 +53,16 @@ register_event_stream_feature(server)
 # 注册，后者依赖 server.save_transcript。
 register_transcript_feature(server)
 register_agent_tools_feature(server)
+# busy 占位必须紧跟在 agent_tools 之后：那个模块会整体替换
+# call_gateway，先包的话包住的是旧版、随后被覆盖，finally 就白写了。
+# 反过来，它必须在心跳之前——心跳靠 call_gateway 的返回值
+# 区分「没轮到」和「真说过」。
+register_busy_guard(server)
 # 表情包在 agent_tools 之后：它要往 agent_tools 的 TOOLS 里追两条工具，
 # 并包住 execute_tool 和 build_context_snapshot。
 register_sticker_feature(server)
-# 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具的那一版，
-# 同时依赖 server.send_push 把主动说的话推到锁屏。
+# 心跳必须最后注册：它调用 server.call_gateway，要拿到带工具、
+# 带占位的那一版，同时依赖 server.send_push 把主动说的话推到锁屏。
 register_heartbeat_feature(server)
 # /api/wake 是上游设置页那个开关的后端，要在心跳之后：
 # 它借用 heartbeat_feature 的键名和 night_key()，
@@ -91,4 +97,5 @@ if __name__ == "__main__":
     print("  icon    : /api/icon/status")
     print("  backup  : /backup 面板（默认关闭，只推文本库）")
     print("  panels  : 浮层内打开，配色取自上游 :root（/api/panel/vars）")
+    print("  busy    : 原子占位，卡住会自动抢占（/api/busy）")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
