@@ -9,6 +9,8 @@
 * 绝不打断对话。生成中（busy）或她刚说过话（静默不足）都直接跳过。
 * 必须留下痕迹。每次触发都记录结果（spoke / silent），
   否则「它没醒」和「它醒了但没说话」在界面上完全分辨不出来。
+  同理，每次「没触发」也要记下被哪道闸门挡住——不然事后问
+  「昨晚为什么没醒」只能靠猜。
 * 说了就推送。页面关着的时候心跳等于对着空气说话，
   所以产生正文后会调 server.send_push 推一条到锁屏。
 * 敲醒不够，还要告诉它醒了能做什么。下面那份 DEFAULT_GUIDE 就是这个用。
@@ -21,8 +23,14 @@
 关于时间：所有「现在几点」「算哪一夜」的判断都必须走 cn_now()。
 服务器本地时区可能是 UTC，直接用 datetime.now() 会让整个时段判断
 整体平移八小时——夜里的窗口跑到白天去。这一个函数漏掉一处就前功尽弃。
+
+关于窗口和静默的配比：这两个数字要一起挑。窗口比 idle_minutes 短的话，
+只要她在窗口开始前不久说过话，这一夜就必然全被挡住——
+它得等静默满 idle_minutes，而窗口在那之前已经关了。
+默认值现在是 22:00-01:00 配 45 分钟，留了足够余量。
 """
 
+import json
 import re
 import threading
 import time
@@ -43,6 +51,10 @@ KEY_LAST_TEXT = "heartbeat_last_text"
 KEY_LAST_PUSH = "heartbeat_last_push"
 KEY_LAST_MANUAL = "heartbeat_last_manual_at"
 KEY_GUIDE = "heartbeat_guide"
+# 后台线程活着的证据，以及它每次看到的情况。
+KEY_LAST_CHECK_AT = "heartbeat_last_check_at"
+KEY_LAST_BLOCK = "heartbeat_last_block"
+KEY_BLOCK_LOG = "heartbeat_block_log"
 
 # 醒来该干吗。写成可改的（POST /api/heartbeat {"guide": "..."}），
 # 传空字串就回到这份默认。
@@ -65,19 +77,27 @@ DEFAULT_GUIDE = """挑一件事做，一次只做一件：
 DEFAULTS = {
     KEY_ENABLED: "0",
     # 睡前和清早各留一个窗口。这两个窗口属于同一「夜」，共享 max_per_day。
-    KEY_WINDOWS: "22:30-23:59,07:00-08:30",
+    # 夜间窗口跨到凌晨一点：它必须明显长于 idle_minutes，否则
+    # 她睡前说过话就会把整夜挡掉（原来 89 分钟配 90 分钟正是这个毛病）。
+    KEY_WINDOWS: "22:00-01:00,07:00-09:00",
     KEY_MAX_PER_DAY: "2",
     KEY_MIN_GAP: "240",
-    KEY_IDLE: "90",
+    KEY_IDLE: "45",
     KEY_LAST_RESULT: "",
     KEY_LAST_TEXT: "",
     KEY_LAST_PUSH: "",
     KEY_LAST_MANUAL: "0",
     KEY_GUIDE: DEFAULT_GUIDE,
+    KEY_LAST_CHECK_AT: "0",
+    KEY_LAST_BLOCK: "",
+    KEY_BLOCK_LOG: "[]",
 }
 
 CHECK_INTERVAL = 60
 HISTORY_FOR_HEARTBEAT = 24
+
+# block_log 留多少条。够看清一整夜的走向就行，不用当日志系统。
+BLOCK_LOG_LIMIT = 30
 
 CN_TZ = timezone(timedelta(hours=8))
 
@@ -157,6 +177,28 @@ def _in_windows(windows, now_minutes):
     return False
 
 
+def _next_open(windows, now=None):
+    """下一次窗口开启的时刻（已在窗口内则返回 None）。
+
+    直接回答「它下次可能几点开口」，省得对着一串 HH:MM 自己换算。
+    """
+    if not windows:
+        return None
+    now = now or cn_now()
+    minutes = now.hour * 60 + now.minute
+    if _in_windows(windows, minutes):
+        return None
+
+    best = None
+    for start, _ in windows:
+        delta = start - minutes
+        if delta <= 0:
+            delta += 1440          # 今天已经过了，看明天这个点
+        if best is None or delta < best:
+            best = delta
+    return now + timedelta(minutes=best) if best is not None else None
+
+
 def register_heartbeat_feature(server_module):
     get_db = server_module.get_db
 
@@ -218,6 +260,34 @@ def register_heartbeat_feature(server_module):
         write(KEY_DAY_TALLY, f"{key}:{count + 1}")
         write(KEY_LAST_AT, int(time.time()))
 
+    # ── 检查留痕
+    #
+    # 原来被闸门挡住时一行都不记，于是「昨晚它为什么没醒」事后完全查不了，
+    # 只能拿现有字段反推。这里做两件事：
+    #   last_check_at —— 后台线程还活着的证据（它死了这个值就停住）；
+    #   block_log     —— 理由变化时追一条，看得出一夜里闸门怎么切换的。
+    # 只在理由变化时追加，不是每分钟写一条：否则一天 1440 条，全是重复的。
+
+    def read_log():
+        try:
+            data = json.loads(read(KEY_BLOCK_LOG) or "[]")
+            return data if isinstance(data, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def record_check(reason):
+        now = int(time.time())
+        write(KEY_LAST_CHECK_AT, now)
+
+        text = reason or "可以触发"
+        if read(KEY_LAST_BLOCK) == text:
+            return                      # 情况没变，不重复记
+        write(KEY_LAST_BLOCK, text)
+
+        log = read_log()
+        log.append({"at": now, "reason": text})
+        write(KEY_BLOCK_LOG, json.dumps(log[-BLOCK_LOG_LIMIT:], ensure_ascii=False))
+
     def why_not_now():
         """返回不该触发的原因；None 表示可以触发。"""
         if read(KEY_ENABLED) != "1":
@@ -244,7 +314,7 @@ def register_heartbeat_feature(server_module):
         if last and time.time() - last < gap_minutes * 60:
             return f"距上次心跳不足 {gap_minutes} 分钟"
 
-        idle_minutes = read_int(KEY_IDLE, 90)
+        idle_minutes = read_int(KEY_IDLE, 45)
         last_msg = last_her_at()
         if last_msg and time.time() - last_msg < idle_minutes * 60:
             return f"她刚说过话，静默不足 {idle_minutes} 分钟"
@@ -355,11 +425,16 @@ def register_heartbeat_feature(server_module):
         time.sleep(10)
         while True:
             try:
-                if why_not_now() is None:
+                reason = why_not_now()
+                record_check(reason)
+                if reason is None:
                     fire()
             except Exception as exc:
                 print(f"[dwell] 心跳异常: {exc}")
             time.sleep(CHECK_INTERVAL)
+
+    def stamp(ts):
+        return datetime.fromtimestamp(ts, CN_TZ).strftime("%m-%d %H:%M") if ts else ""
 
     def api_heartbeat_get():
         now = cn_now()
@@ -367,33 +442,52 @@ def register_heartbeat_feature(server_module):
         blocked = why_not_now()
         last_her = last_her_at()
         guide = read_guide()
+        windows = _parse_windows(read(KEY_WINDOWS))
+        upcoming = _next_open(windows, now)
+        last_check = read_int(KEY_LAST_CHECK_AT, 0)
+
         return jsonify({
             "ok": True,
             "enabled": read(KEY_ENABLED) == "1",
             "windows": read(KEY_WINDOWS),
             "windows_parsed": [
                 f"{s // 60:02d}:{s % 60:02d}-{e // 60:02d}:{e % 60:02d}"
-                for s, e in _parse_windows(read(KEY_WINDOWS))
+                for s, e in windows
             ],
             "max_per_day": read_int(KEY_MAX_PER_DAY, 2),
             "min_gap_minutes": read_int(KEY_MIN_GAP, 240),
-            "idle_minutes": read_int(KEY_IDLE, 90),
+            "idle_minutes": read_int(KEY_IDLE, 45),
             "guide": guide,
             "guide_is_default": guide == DEFAULT_GUIDE,
             # 时段判断用的是下面这个 cn_time。它和 server_local_time 不一致
             # 说明服务器不在 UTC+8，以前按本地时区判断的窗口是偏的。
             "cn_time": now.strftime("%Y-%m-%d %H:%M:%S"),
             "server_local_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "in_window": _in_windows(windows, now.hour * 60 + now.minute),
+            # 下一次可能开口的时刻。已经在窗口里就是空的。
+            "next_window_cn": upcoming.strftime("%m-%d %H:%M") if upcoming else "",
             "night": key,
             "night_count": count,
             "today_count": count,
             "last_at": read_int(KEY_LAST_AT, 0),
+            "last_at_cn": stamp(read_int(KEY_LAST_AT, 0)),
             "last_manual_at": read_int(KEY_LAST_MANUAL, 0),
             "her_last_at": last_her,
+            "her_last_at_cn": stamp(last_her),
             "her_quiet_minutes": int((time.time() - last_her) / 60) if last_her else None,
             "last_result": read(KEY_LAST_RESULT),
             "last_text": read(KEY_LAST_TEXT),
             "last_push": read(KEY_LAST_PUSH),
+            # 后台线程还活着的证据。这个时间停在很久以前，
+            # 说明循环线程挂了，重启后端即可。
+            "last_check_at_cn": stamp(last_check),
+            "last_check_age_seconds": int(time.time() - last_check) if last_check else None,
+            "last_block": read(KEY_LAST_BLOCK),
+            # 闸门变化的时间线，最近的在最后。查「昨晚为什么没醒」看这个。
+            "block_log": [
+                {"at": stamp(item.get("at", 0)), "reason": item.get("reason", "")}
+                for item in read_log()
+            ],
             "ready": blocked is None,
             "blocked_by": blocked,
         })
@@ -422,6 +516,8 @@ def register_heartbeat_feature(server_module):
                 except (TypeError, ValueError):
                     return jsonify({"ok": False, "error": f"{field} 需要是整数"}), 400
 
+        # 改完配置立刻重算一次留痕，省得等下一分钟才更新。
+        record_check(why_not_now())
         return api_heartbeat_get()
 
     def api_heartbeat_preview():
@@ -445,7 +541,7 @@ def register_heartbeat_feature(server_module):
         return jsonify({
             "ok": True,
             "detail": "已触发，十几秒后看聊天页；"
-                      "结果也会记在 /api/heartbeat 的 last_result 里。"
+                      "结果也会记在 /api/heartbeat 的 last_result 和 last_push 里。"
                       "手动触发不占当夜次数。",
         })
 
