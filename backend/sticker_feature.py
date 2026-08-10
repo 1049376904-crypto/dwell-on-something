@@ -57,6 +57,8 @@ JUNK_NAME = re.compile(
     re.IGNORECASE,
 )
 
+PLACEHOLDER_NAME = re.compile(r"^表情\d+$")
+
 
 def _clean_name(raw, fallback="表情"):
     """名字去掉控制字符和方括号。
@@ -75,9 +77,9 @@ def _looks_like_junk(name):
     text = str(name or "").strip()
     if not text:
         return True
-    if JUNK_NAME.match(text):
+    if JUNK_NAME.match(text) or PLACEHOLDER_NAME.match(text):
         return True
-    # 纯数字或纯十六进制串（时间戳、哈希）也算没名字。
+    # 纯十六进制串（时间戳、哈希）也算没名字。
     compact = text.replace("-", "").replace("_", "").replace(" ", "")
     return len(compact) >= 6 and all(c in "0123456789abcdefABCDEF" for c in compact)
 
@@ -119,7 +121,7 @@ def register_sticker_feature(server_module):
             "keywords": row["keywords"],
             "used": row["used"],
             # 前端据此把没起名的标出来，提醒她改。
-            "unnamed": _looks_like_junk(row["name"]) or row["name"].startswith("表情"),
+            "unnamed": _looks_like_junk(row["name"]),
         }
 
     def unique_name(name, exclude_id=None):
@@ -264,7 +266,6 @@ def register_sticker_feature(server_module):
         名字像「表情7」的不报给它——那种名字它没法判断该不该发。
         """
         items = [r for r in rows("used") if not _looks_like_junk(r["name"])]
-        items = [r for r in items if not re.fullmatch(r"表情\d+", r["name"])]
         if not items:
             return ""
         names = "、".join(r["name"] for r in items[:NAMES_IN_PROMPT])
@@ -548,14 +549,12 @@ def _wire_tools(server_module, send, rows, overview):
 # 上游 renderRich 到底给 img 挂了什么 class 我没核实过，
 # 而 src 里的前缀是我们自己存的，一定在。
 #
-# 上一版这里写了 !important，然后在面板里又用 max-width:none !important
-# 把上限拿掉、改用 grid 的列宽约束——列宽一旦没按预期生效，
-# 图片就彻底没有上限了，于是撑满整行。这一版：聊天里的规则不用 !important
-# （靠选择器权重压过 .chatimg 就够），面板里的尺寸写死像素并带 !important，
-# 任何一层布局失效都不会让图变大。
+# 两条颜色原则（上一版没做到，面板整片深色加蓝，跟这套暖白的皮完全脱节）：
+# 一是主题色一律从页面上读，不写死；二是不用蓝色，链接和图标都走前景色。
+# 读的办法是往上找第一个不透明的背景色，body 上可能是透明的。
 #
-# 气泡去底色必须靠 JS：CSS 选不中「只装了一张表情的气泡」。
-# :has() 能写，但旧一点的 Safari 不支持，而手机上没法开控制台查。
+# 输入区那个按钮不再自己写样式，直接克隆上游的「+」再换掉里面的图标：
+# 底色、圆角、大小、颜色全部自动跟它一致，换主题也不会脱节。
 CLIENT_SCRIPT = """<style>
   img[src*="/sticker/"] {
     max-width: 112px;
@@ -575,18 +574,11 @@ CLIENT_SCRIPT = """<style>
     line-height: 0;
   }
   .row.me .bubble.stickeronly { margin-left: auto; }
-  #dwellStickerBtn {
-    width: 34px; height: 34px; flex: 0 0 34px;
-    display: inline-flex; align-items: center; justify-content: center;
-    padding: 0; margin: 0 2px; border: 0; border-radius: 999px;
-    background: transparent; color: var(--dim, #8a8a8a); cursor: pointer;
-  }
-  #dwellStickerBtn svg { width: 20px; height: 20px; display: block; }
 
   /* 点空白处也能关掉。 */
   #dwellStickerBackdrop {
     position: fixed; inset: 0; z-index: 9998;
-    background: rgba(0,0,0,.32);
+    background: rgba(0,0,0,.28);
     opacity: 0; pointer-events: none; transition: opacity .2s ease;
   }
   #dwellStickerBackdrop.open { opacity: 1; pointer-events: auto; }
@@ -595,67 +587,91 @@ CLIENT_SCRIPT = """<style>
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 9999;
     display: flex; flex-direction: column;
     max-height: 52vh;
-    background: rgba(28,28,30,.96);
-    -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
-    border-radius: 16px 16px 0 0;
-    box-shadow: 0 -6px 30px rgba(0,0,0,.4);
+    /* 这两个值由 JS 从页面上读出来写进来。 */
+    background: var(--dws-bg, #f5f2ec);
+    color: var(--dws-fg, #26241f);
+    border-radius: 18px 18px 0 0;
+    box-shadow: 0 -8px 36px rgba(0,0,0,.18);
     transform: translateY(102%); transition: transform .22s ease;
   }
   #dwellStickerSheet.open { transform: translateY(0); }
 
   /* 头部固定，不跟着列表滚走——关闭键必须一直看得见。 */
   #dwellStickerSheet .head {
+    position: relative;
     flex: 0 0 auto;
     display: flex; align-items: center; justify-content: space-between;
-    padding: 6px 8px 6px 16px;
-    border-bottom: 1px solid rgba(255,255,255,.08);
+    padding: 6px 8px 6px 18px;
   }
-  #dwellStickerSheet .head .t { font-size: 15px; font-weight: 600; color: #ececf1; }
-  #dwellStickerSheet .head .r { display: flex; align-items: center; gap: 4px; }
+  #dwellStickerSheet .head::after {
+    content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+    height: 1px; background: currentColor; opacity: .1;
+  }
+  #dwellStickerSheet .head .t { font-size: 16px; font-weight: 600; }
+  #dwellStickerSheet .head .r { display: flex; align-items: center; gap: 2px; }
   #dwellStickerSheet .head button,
   #dwellStickerSheet .head a {
-    font: inherit; font-size: 14px;
+    font: inherit; font-size: 15px;
     min-width: 44px; min-height: 44px;
     display: inline-flex; align-items: center; justify-content: center;
-    padding: 0 10px; border: 0; border-radius: 10px;
-    background: transparent; color: #7fb2ff; text-decoration: none; cursor: pointer;
+    padding: 0 10px; border: 0; border-radius: 12px;
+    background: transparent; color: inherit; text-decoration: none; cursor: pointer;
   }
-  #dwellStickerSheet .head .x { color: #ececf1; font-size: 22px; line-height: 1; }
+  #dwellStickerSheet .head a { opacity: .55; }
+  #dwellStickerSheet .head .x { font-size: 21px; line-height: 1; }
 
   #dwellStickerSheet .body {
     flex: 1 1 auto; overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 12px 14px calc(16px + env(safe-area-inset-bottom));
+    padding: 14px 16px calc(18px + env(safe-area-inset-bottom));
   }
 
   /* 固定像素的格子。上一版用 grid + 百分比 + aspect-ratio，
      列宽没生效时图片就没了上限。这版每一格宽高都写死。 */
-  #dwellStickerSheet .grid {
-    display: flex; flex-wrap: wrap; gap: 12px;
-  }
+  #dwellStickerSheet .grid { display: flex; flex-wrap: wrap; gap: 14px; }
   #dwellStickerSheet .grid .cell {
     width: 76px; flex: 0 0 76px;
     padding: 0; border: 0; background: transparent; cursor: pointer;
-    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    display: flex; flex-direction: column; align-items: center; gap: 5px;
+    color: inherit;
   }
   #dwellStickerSheet .grid .cell img {
     width: 72px !important; height: 72px !important;
     max-width: 72px !important; max-height: 72px !important;
-    object-fit: contain; border-radius: 10px;
-    background: rgba(255,255,255,.05);
+    object-fit: contain; border-radius: 12px;
+    background: rgba(128,128,128,.12);
     display: block;
   }
   #dwellStickerSheet .grid .cell span {
-    font-size: 11px; line-height: 1.3; color: #9b9b9f;
+    font-size: 11.5px; line-height: 1.3; opacity: .6;
     max-width: 76px; text-align: center;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   #dwellStickerSheet .grid .cell:disabled { opacity: .45; }
-  #dwellStickerSheet .empty { font-size: 13px; color: #9b9b9f; line-height: 1.7; }
+  #dwellStickerSheet .empty { font-size: 13.5px; opacity: .6; line-height: 1.7; }
+  #dwellStickerSheet .empty a { color: inherit; text-decoration: underline; }
 </style>
 <script>
 (function () {
-  var sheet = null, backdrop = null, grid = null, loaded = false;
+  var sheet = null, backdrop = null, grid = null;
+
+  var FACE =
+    '<circle cx="12" cy="12" r="9"/>' +
+    '<path d="M8.8 14.2c.8.9 1.9 1.4 3.2 1.4s2.4-.5 3.2-1.4"/>' +
+    '<circle cx="9.3" cy="10" r=".95" fill="currentColor" stroke="none"/>' +
+    '<circle cx="14.7" cy="10" r=".95" fill="currentColor" stroke="none"/>';
+
+  // 往上找第一个不透明的背景色。body 上经常是 transparent。
+  function solidBg(el) {
+    for (var n = el; n && n !== document.documentElement; n = n.parentElement) {
+      var c = getComputedStyle(n).backgroundColor;
+      if (c && c !== 'transparent' && !/rgba\\(\\s*0\\s*,\\s*0\\s*,\\s*0\\s*,\\s*0\\s*\\)/.test(c)) {
+        return c;
+      }
+    }
+    var h = getComputedStyle(document.documentElement).backgroundColor;
+    return h || '#f5f2ec';
+  }
 
   // 只装了一张表情的气泡去掉底色。灰框套着图很脏，表情更明显。
   function strip(root) {
@@ -684,10 +700,15 @@ CLIENT_SCRIPT = """<style>
       '<div class="head">' +
       '<span class="t">表情</span>' +
       '<span class="r"><a href="/stickers">管理</a>' +
-      '<button type="button" class="x" data-close aria-label="关闭">\\u00d7</button></span>' +
+      '<button type="button" class="x" data-close aria-label="关闭">\u00d7</button></span>' +
       '</div>' +
       '<div class="body"><div class="grid"></div></div>';
     document.body.appendChild(sheet);
+
+    // 跟着页面主题走，不写死配色。
+    var log = document.getElementById('log') || document.body;
+    sheet.style.setProperty('--dws-bg', solidBg(log));
+    sheet.style.setProperty('--dws-fg', getComputedStyle(document.body).color);
 
     grid = sheet.querySelector('.grid');
     sheet.querySelector('[data-close]').onclick = close;
@@ -705,9 +726,8 @@ CLIENT_SCRIPT = """<style>
       if (!items.length) {
         var tip = document.createElement('div');
         tip.className = 'empty';
-        tip.innerHTML = '还一张都没有。去 <a href="/stickers" style="color:#7fb2ff">管理页</a> 传几张。';
+        tip.innerHTML = '还一张都没有。去 <a href="/stickers">管理页</a> 传几张。';
         grid.appendChild(tip);
-        loaded = true;
         return;
       }
       items.forEach(function (it) {
@@ -729,7 +749,6 @@ CLIENT_SCRIPT = """<style>
         cell.onclick = function () { pick(it, cell); };
         grid.appendChild(cell);
       });
-      loaded = true;
     }).catch(function () {
       grid.innerHTML = '<div class="empty">读不到表情列表。</div>';
     });
@@ -759,20 +778,51 @@ CLIENT_SCRIPT = """<style>
     backdrop.classList.add('open');
   }
 
-  // 按钮插在上游那个「+」旁边。尺寸写死：上游的 .ic 没有全局宽高，
-  // 之前那个回形针就是因为这个铺满了整个容器。
+  // 克隆上游的「+」按钮，只换里面的图标。
+  // 上一版自己写样式，结果少了那层底色，一个光秃秃的笑脸挂在圆底按钮旁边很突兀。
+  // 克隆之后 class 完全一致，底色圆角大小配色全部自动跟上，换主题也不会脱节。
+  // cloneNode 不会复制 addEventListener 和 onclick 属性挂的处理器，
+  // 但内联 onclick="" 会跟着复制，所以显式清掉。
   function mount() {
     if (document.getElementById('dwellStickerBtn')) return true;
     var plus = document.getElementById('plusBtn');
     if (!plus || !plus.parentNode) return false;
-    var b = document.createElement('button');
+
+    // 先量原按钮里的图标，克隆出来的还没进文档，量不到。
+    var size = 20, stroke = 1.6;
+    var osvg = plus.querySelector('svg');
+    if (osvg) {
+      var box = osvg.getBoundingClientRect();
+      if (box.width) size = Math.round(box.width);
+      var sw = parseFloat(getComputedStyle(osvg).strokeWidth);
+      if (sw) stroke = sw;
+    }
+
+    var b = plus.cloneNode(true);
     b.id = 'dwellStickerBtn';
-    b.type = 'button';
+    b.removeAttribute('onclick');
     b.setAttribute('aria-label', '发表情');
-    b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
-      'stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="9"/>' +
-      '<path d="M8.5 14.3c.9 1.1 2.1 1.7 3.5 1.7s2.6-.6 3.5-1.7"/>' +
-      '<path d="M9 9.6v.3"/><path d="M15 9.6v.3"/></svg>';
+    b.title = '发表情';
+
+    var svg =
+      '<svg viewBox="0 0 24 24" width="' + size + '" height="' + size + '" ' +
+      'fill="none" stroke="currentColor" stroke-width="' + stroke + '" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      FACE + '</svg>';
+
+    // 上游图标可能包在 <span class="ic" data-i="plus"> 里，也可能是裸 svg。
+    // 找得到那层就替换它的内容，顺手把 data-i 改掉，免得重绘时又变回加号。
+    var holder = b.querySelector('.ic') || b.querySelector('svg');
+    if (holder && holder.tagName.toLowerCase() === 'svg') {
+      holder.innerHTML = FACE;
+      holder.setAttribute('viewBox', '0 0 24 24');
+    } else if (holder) {
+      holder.setAttribute('data-i', 'smile');
+      holder.innerHTML = svg;
+    } else {
+      b.innerHTML = svg;
+    }
+
     b.onclick = open;
     plus.parentNode.insertBefore(b, plus.nextSibling);
     return true;
@@ -814,9 +864,9 @@ CLIENT_SCRIPT = """<style>
 # 和 /push、/models 一样做成独立页：上游设置页靠字符串补丁插东西，容易打歪。
 # 上传不过 canvas，直接读原字节转 base64——GIF 得保住它的动。
 #
-# 上一版每传一张弹一次 prompt 问名字，传二十张点二十次。这版改成：
-# 选完直接全部传上去（一个请求），名字先用文件名、认不出就叫「表情N」，
-# 然后在下面列表里想改哪张改哪张。没起名的标出来。
+# 配色跟着主应用那套暖白走（上一版是 #111113 加蓝，完全两码事）。
+# 这是独立文档，读不到主应用的主题变量，所以写死一套暖色，
+# 另外加一段 prefers-color-scheme: dark，系统切深色时自动跟着变。
 PANEL_HTML = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -824,55 +874,74 @@ PANEL_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>表情包</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    --bg:     #f4f1ea;
+    --card:   #fffdf8;
+    --fg:     #26241f;
+    --dim:    #8b867b;
+    --line:   #e5e0d5;
+    --field:  #faf8f3;
+    --accent: #c2603f;
+    --todo:   #f0e6d4;
+    --todobg: #fdf8ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161514; --card: #1f1e1c; --fg: #ece9e3; --dim: #8e8a82;
+      --line: #302e2b; --field: #262523; --accent: #d97a58;
+      --todo: #5a4a2c; --todobg: #2a2620;
+    }
+  }
   * { -webkit-tap-highlight-color: transparent; }
   body {
-    margin: 0; padding: 20px 16px calc(40px + env(safe-area-inset-bottom));
-    background: #111113; color: #ececf1;
+    margin: 0; padding: 22px 16px calc(40px + env(safe-area-inset-bottom));
+    background: var(--bg); color: var(--fg);
     font: 15px/1.6 -apple-system, "SF Pro Text", system-ui, sans-serif;
   }
-  h1 { font-size: 19px; font-weight: 600; margin: 0 0 4px; }
-  .sub { color: #8e8e93; font-size: 13px; margin-bottom: 18px; }
-  .sub a { color: #7fb2ff; }
-  .card { background: #1c1c1e; border-radius: 14px; padding: 14px; margin-bottom: 14px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
+  .sub a { color: var(--accent); }
+  .card {
+    background: var(--card); border-radius: 16px; padding: 14px; margin-bottom: 14px;
+    border: 1px solid var(--line);
+  }
   label.file {
-    display: block; text-align: center; padding: 20px 12px;
-    border: 1px dashed #3a3a3c; border-radius: 12px; color: #9b9b9f; font-size: 14px;
+    display: block; text-align: center; padding: 22px 12px;
+    border: 1px dashed var(--line); border-radius: 12px;
+    color: var(--dim); font-size: 14px;
   }
   input[type=file] { display: none; }
 
   .item {
     display: flex; align-items: center; gap: 12px;
-    padding: 10px 0; border-bottom: 1px solid #2c2c2e;
+    padding: 10px 0; border-bottom: 1px solid var(--line);
   }
   .item:last-child { border-bottom: 0; }
   /* 尺寸写死，不用百分比：布局失效时也不会撑开。 */
   .item img {
     width: 60px !important; height: 60px !important;
     max-width: 60px !important; max-height: 60px !important;
-    object-fit: contain; border-radius: 8px;
-    background: #26262a; flex: 0 0 60px;
+    object-fit: contain; border-radius: 10px;
+    background: rgba(128,128,128,.12); flex: 0 0 60px;
   }
   .item .fields { flex: 1 1 auto; min-width: 0; }
   .item input[type=text] {
     width: 100%; box-sizing: border-box;
-    background: #26262a; border: 1px solid #3a3a3c; border-radius: 8px;
-    color: #ececf1; padding: 8px 9px; font-size: 15px;
+    background: var(--field); border: 1px solid var(--line); border-radius: 10px;
+    color: var(--fg); padding: 8px 10px; font-size: 15px;
   }
-  .item input.todo { border-color: #6b5a2a; background: #2a2620; }
-  .item input.kw {
-    margin-top: 6px; font-size: 13px; color: #b6b6bb; padding: 6px 9px;
-  }
+  .item input.todo { border-color: var(--todo); background: var(--todobg); }
+  .item input.kw { margin-top: 6px; font-size: 13px; color: var(--dim); padding: 6px 10px; }
   .item .del {
     flex: 0 0 auto; min-width: 44px; min-height: 44px;
     display: inline-flex; align-items: center; justify-content: center;
-    font-size: 20px; color: #ff6b6b;
+    font-size: 20px; color: var(--dim);
     border: 0; background: transparent; cursor: pointer;
   }
-  #msg { min-height: 20px; font-size: 13px; color: #8e8e93; margin: 8px 0 0; }
-  #msg.warn { color: #ffb86b; }
-  .count { font-size: 13px; color: #8e8e93; margin-bottom: 6px; }
-  .hint { font-size: 12px; color: #6f6f75; margin: 0 0 10px; }
+  #msg { min-height: 20px; font-size: 13px; color: var(--dim); margin: 8px 0 0; }
+  #msg.warn { color: var(--accent); }
+  .count { font-size: 13px; color: var(--dim); margin-bottom: 6px; }
+  .hint { font-size: 12px; color: var(--dim); opacity: .8; margin: 0 0 10px; }
 </style>
 </head>
 <body>
@@ -892,7 +961,7 @@ PANEL_HTML = """<!doctype html>
 
 <div class="card">
   <div class="count" id="count">读取中…</div>
-  <p class="hint">改完名字点一下别处就存了。橙色框的还没起名，沐看不到这些。</p>
+  <p class="hint">改完名字点一下别处就存了。浅色框的还没起名，沐看不到这些。</p>
   <div id="list"></div>
 </div>
 
@@ -968,7 +1037,7 @@ function render(it) {
   var del = document.createElement('button');
   del.className = 'del';
   del.type = 'button';
-  del.textContent = '\\u00d7';
+  del.textContent = '\u00d7';
   del.setAttribute('aria-label', '删除 ' + it.name);
   del.onclick = function () {
     if (!confirm('删掉「' + it.name + '」？聊天记录里已经发过的不会消失。')) return;
