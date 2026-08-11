@@ -25,7 +25,12 @@ VERBOF_ANCHOR = (
 )
 
 # 自建工具的词条。沿用上游风格：图标名 + 英文动词 + 对象。
-# 动词过去式、对象取具体内容，扭一眼就知道沐刚做了什么。
+# 动词过去式、对象取具体内容，扫一眼就知道沐刚做了什么。
+#
+# 每加一个新工具都要在这里补一条，否则它会掉进 verbOf 的 default 分支，
+# 界面上直接摊出函数名（「Used read_marks」）。
+# 漏了不会报错，只会难看——所以下面 TOOL_NAMES 列了全部工具名，
+# /api/version 会逐个核对并报出漏的那几个。
 OUR_VERBS = """    case 'write_diary':           return ['pen', 'Wrote', brief(input.title || input.text)];
     case 'list_diary_entries':    return ['bookOpen', 'Read', 'the diary'];
     case 'delete_diary_entry':    return ['fileText', 'Removed', 'a diary entry'];
@@ -45,7 +50,35 @@ OUR_VERBS = """    case 'write_diary':           return ['pen', 'Wrote', brief(i
     case 'read_whispers':         return ['bookOpen', 'Read', 'the whispers'];
     case 'send_sticker':          return ['smile', 'Sent', brief(input.name)];
     case 'list_stickers':         return ['smile', 'Looked', 'through the stickers'];
+    case 'find_song':             return ['music', 'Looked up', brief(input.query)];
+    case 'read_news':             return ['fileText', 'Read', input.date ? ('the paper · ' + input.date) : 'the paper'];
+    case 'make_news':             return ['fileText', 'Started', 'a new issue'];
+    case 'list_news_sections':    return ['fileText', 'Checked', 'the sections'];
+    case 'tune_news_section':     return ['pen', 'Retuned', brief(input.name)];
+    case 'add_news_section':      return ['pen', 'Added', brief(input.name) + ' to the paper'];
+    case 'remove_news_section':   return ['fileText', 'Dropped', brief(input.name)];
+    case 'list_books':            return ['bookOpen', 'Checked', 'the shelf'];
+    case 'read_chapter':          return ['bookOpen', 'Read', brief(input.slug)];
+    case 'read_marks':            return ['bookOpen', 'Read', 'her marks'];
+    case 'reply_to_mark':         return ['pen', 'Wrote', 'beside her mark'];
+    case 'mark_passage':          return ['pen', 'Marked', brief(input.quote)];
 """
+
+# 上面配过词条的工具名。/api/version 拿它逐个核对，
+# 漏了哪个直接报出来——不用等在界面上看见「Used xxx」才发现。
+TOOL_NAMES = (
+    "write_diary", "list_diary_entries", "delete_diary_entry", "read_my_diary",
+    "add_favorite_line", "read_favorite_lines",
+    "add_todo", "list_todos", "set_todo_done", "delete_todo",
+    "add_calendar_event", "list_calendar_events", "delete_calendar_event",
+    "set_mood", "read_day_records",
+    "add_whisper", "read_whispers",
+    "send_sticker", "list_stickers",
+    "find_song",
+    "read_news", "make_news", "list_news_sections",
+    "tune_news_section", "add_news_section", "remove_news_section",
+    "list_books", "read_chapter", "read_marks", "reply_to_mark", "mark_passage",
+)
 
 # brief 用来压掉换行、限长，避免日记正文把整行撑开。
 BRIEF_HELPER = (
@@ -57,8 +90,10 @@ BRIEF_HELPER = (
 # ICONS 表的锚点，上游第一条。
 ICONS_ANCHOR = "const ICONS = {\n"
 
-# cpu / smile / archive 都不在上游那张表里，补三个 feather 风格的：
-# cpu 给侧边栏「模型」，smile 给「表情」和工具卡片，archive 给「备份」。
+# 上游那张表里没有的图标，补几个 feather 风格的：
+# cpu 给侧边栏「模型」，smile 给「表情」和工具卡片，
+# archive 给「备份」，music 给找歌那条工具卡片。
+# 日报和共读复用已有的 fileText / bookOpen / pen，不另造。
 EXTRA_ICONS = (
     "  cpu: S('<rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\"/>"
     "<rect x=\"9\" y=\"9\" width=\"6\" height=\"6\"/>"
@@ -77,6 +112,9 @@ EXTRA_ICONS = (
     "  archive: S('<path d=\"M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8\"/>"
     "<rect x=\"2\" y=\"3\" width=\"20\" height=\"5\" rx=\"1\"/>"
     "<line x1=\"10\" y1=\"12\" x2=\"14\" y2=\"12\"/>'),\n"
+    "  music: S('<path d=\"M9 18V5l10-2v13\"/>"
+    "<circle cx=\"6\" cy=\"18\" r=\"3\"/>"
+    "<circle cx=\"16\" cy=\"16\" r=\"3\"/>'),\n"
 )
 
 # 输入区那个「发表情」按钮的样式。
@@ -402,18 +440,30 @@ def _patch_tool_labels(html: str) -> str:
     """给自建工具补 verbOf 词条。
 
     上游 verbOf 只认 Read / Write / Bash 这类 Claude Code 内置工具，
-    我们的 write_diary、add_whisper 等会掉进 default 分支，
-    直接把函数名摊在屏幕上（“Used add whisper”）。
+    我们的 write_diary、read_marks 等会掉进 default 分支，
+    直接把函数名摊在屏幕上（「Used read marks」）。
+
+    幂等检查用最后一条（mark_passage）而不是第一条：
+    这个补丁扩充过几次，用第一条的话，旧版本注入过的页面
+    会被当成「已经打过了」而永远补不上新增的那几条。
     """
-    if "case 'write_diary'" in html:
+    if "case 'mark_passage'" in html:
         return html
 
-    # 先注入 brief 助手，再插词条；两者都锚在 verbOf 内部。
-    html = html.replace(
-        "function verbOf(name, input) {\n  input = input || {};",
-        "function verbOf(name, input) {\n  input = input || {};\n" + BRIEF_HELPER,
-        1,
-    )
+    # 老版本只插了前一批词条：先整段撤掉，再插完整的。
+    if "case 'write_diary'" in html:
+        start = html.find("    case 'write_diary':")
+        end = html.find(VERBOF_ANCHOR, start)
+        if start >= 0 and end > start:
+            html = html[:start] + html[end:]
+
+    # brief 助手可能已经在了（上一版注入过），别插第二遍。
+    if "const brief = (s, n)" not in html:
+        html = html.replace(
+            "function verbOf(name, input) {\n  input = input || {};",
+            "function verbOf(name, input) {\n  input = input || {};\n" + BRIEF_HELPER,
+            1,
+        )
     html = html.replace(VERBOF_ANCHOR, OUR_VERBS + VERBOF_ANCHOR, 1)
     return html
 
@@ -579,6 +629,13 @@ def register_frontend_feature(server_module):
             _build_frontend(source, push_script(), icon_links(), sticker_script())
             if source.exists() else ""
         )
+        # 逐个核对工具词条。漏了哪个直接报出来——
+        # 以前只检查一个 case，新加的工具漏了词条得等在界面上
+        # 看见「Used read marks」才发现。
+        missing = [
+            name for name in TOOL_NAMES
+            if ("case '" + name + "'") not in built
+        ]
         return jsonify({
             "ok": True,
             "version": _git_version(repo_root),
@@ -595,7 +652,10 @@ def register_frontend_feature(server_module):
                 "demo_removed": DEMO_START not in built,
                 "her_messages": "m.kind === 'me' || m.kind === 'her'" in built,
                 "tool_result": "m.result || ''" in built,
-                "tool_labels": "case 'write_diary'" in built,
+                "tool_labels": not missing,
+                "tool_labels_total": len(TOOL_NAMES),
+                # 非空说明有工具还会在界面上摊出函数名。
+                "tool_labels_missing": missing,
                 "verbof_anchor_found": VERBOF_ANCHOR in source_text,
                 "img_re_patched": "(?:https?:\\/\\/|\\/)" in built,
                 "img_re_anchor_found": IMG_RE_ORIGINAL in source_text,
@@ -607,7 +667,6 @@ def register_frontend_feature(server_module):
                 "pet_guarded": PET_IMG_PATCHED in built,
                 "push_script": "window.dwellPush" in built,
                 "sticker_script": "window.dwellStickers" in built,
-                "sticker_labels": "case 'send_sticker'" in built,
                 # 表情按钮的底色和居中全靠这条：它是 false 就说明
                 # 上游那条 #plusBtn 规则改了写法，按钮会变成裸图标。
                 "sticker_btn_css": "#plusBtn, #dwellStickerBtn {" in built,
@@ -617,6 +676,7 @@ def register_frontend_feature(server_module):
                 "cpu_icon": "  cpu: S(" in built,
                 "smile_icon": "  smile: S(" in built,
                 "archive_icon": "  archive: S(" in built,
+                "music_icon": "  music: S(" in built,
                 "manifest_link": 'rel="manifest"' in built,
                 "apple_icon": "apple-touch-icon" in built,
                 "push_nav": 'id="navPush"' in built,
