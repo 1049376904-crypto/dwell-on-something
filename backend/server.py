@@ -121,9 +121,12 @@ def load_messages(limit=400, before=None):
 def call_gateway(messages, model):
     headers = {"Authorization": f"Bearer {GATEWAY_TOKEN}", "Content-Type": "application/json"}
     payload = {"model": model, "stream": True, "messages": messages}
+    # 这里刻意不动 stop_flag。原来这一行是 state["stop_flag"] = False，
+    # 会把「刚按下的停止」吃掉：发送之后立刻点停止，那一下落在
+    # 线程启动前的几毫秒里，进到这里就被清掉了。
+    # 现在由 busy_guard.acquire_busy 统一决定这一代该不该停。
     with state_lock:
         state["busy"] = True
-        state["stop_flag"] = False
     full_text = ""
     think_text = ""
     try:
