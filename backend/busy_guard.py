@@ -1,6 +1,6 @@
 """把「谁在跟网关说话」这件事做成原子的，并保证一定会释放。
 
-## 原来的两个问题
+## 原来的三个问题
 
 **一、检查和占位不是一步。** server.api_send 长这样：
 
@@ -31,7 +31,12 @@
 就没人把 busy 清回 False。之后所有发送一律 429，界面上表现为
 「他一直在说话」，只能重启后端。
 
-## 修法：把占位收敛到一处
+**三、刚按下的停止会被吃掉。** /api/stop 设 stop_flag=True，
+但 call_gateway 开头又设回 False。发送之后立刻点停止，
+那一下正好落在线程启动前的几毫秒里，进到生成函数就被清掉了——
+界面上表现为「点了停止但它还在说」。
+
+## 修法：把占位和停止都收敛到一处
 
 第一版想的是在那三个入口各加一次 acquire。放弃了：以后再加入口
 （音乐、日报、共读都要打网关）还是会漏掉一个，而漏掉的那个正是
@@ -40,6 +45,11 @@
 现在 call_gateway 自己负责占位——它在同一把锁里查+占，占不到就
 根本不发请求，返回 False。于是那三个调用点一行都不用改，
 将来新加的入口也自动被管住。
+
+停止同理：server.py 里那句 `stop_flag = False` 已经删掉，
+改由这里的 acquire_busy 决定新的一代该不该停。
+判断依据是 stop_armed_at——停止刚按下（10 秒内），
+说明那一下是冲着这一代来的，直接让它停。
 
 调用方原有的「先查 busy」留着，当预检用：那样界面能立刻收到 429，
 而不是等线程起来才发现白跑一趟。真正的原子性在这一层。
@@ -62,6 +72,13 @@ import time
 # 否则一次慢回复就会被当成卡死。
 BUSY_MAX_SECONDS = 300
 
+# 「停止」按下之后多久之内起来的那一代算被停掉。
+#
+# 这个窗口是取舍：太长会让「停完隔一会儿再发」被误停，
+# 太短则在网关慢、线程起得晚的时候仍然漏掉。
+# 10 秒够覆盖线程启动和网关握手，也短于任何人重新想好话再发的时间。
+STOP_ARM_SECONDS = 10
+
 
 def register_busy_guard(server_module):
     state = server_module.state
@@ -70,13 +87,18 @@ def register_busy_guard(server_module):
     # 记录是谁占着、什么时候占的。卡住时不用靠猜。
     state.setdefault("busy_owner", "")
     state.setdefault("busy_since", 0)
+    # 停止按下的时刻。给「还没起来的那一代」用。
+    state.setdefault("stop_armed_at", 0)
 
     def acquire_busy(owner="chat"):
         """原子地占住网关。占到返回 True，已被占住返回 False。
 
         「查」和「占」在同一把锁里完成，这正是原来那个洞。
+
+        顺便决定这一代的 stop_flag：停止刚按下（STOP_ARM_SECONDS 内）
+        说明那一下是冲着这一代来的，直接置 True 让它别开口。
         """
-        now = int(time.time())
+        now = time.time()
         with state_lock:
             if state.get("busy"):
                 since = int(state.get("busy_since") or 0)
@@ -87,11 +109,20 @@ def register_busy_guard(server_module):
                     )
                 else:
                     return False
+
+            armed = float(state.get("stop_armed_at") or 0)
+            stop_now = bool(armed and now - armed <= STOP_ARM_SECONDS)
+
             state["busy"] = True
             state["busy_owner"] = str(owner)
-            state["busy_since"] = now
-            state["stop_flag"] = False
-            return True
+            state["busy_since"] = int(now)
+            state["stop_flag"] = stop_now
+            # 消耗掉，别让同一次「停止」把接下来好几代都停了。
+            state["stop_armed_at"] = 0
+
+        if stop_now:
+            print("[dwell] 停止是刚按下的，这一代（%s）直接停" % owner)
+        return True
 
     def release_busy():
         with state_lock:
@@ -104,12 +135,14 @@ def register_busy_guard(server_module):
             busy = bool(state.get("busy"))
             owner = state.get("busy_owner") or ""
             since = int(state.get("busy_since") or 0)
+            armed = float(state.get("stop_armed_at") or 0)
         return {
             "busy": busy,
             "owner": owner,
             "since": since,
             "held_seconds": int(time.time() - since) if busy and since else 0,
             "max_seconds": BUSY_MAX_SECONDS,
+            "stop_armed": bool(armed and time.time() - armed <= STOP_ARM_SECONDS),
         }
 
     original_call_gateway = server_module.call_gateway
@@ -120,7 +153,7 @@ def register_busy_guard(server_module):
         返回 False 表示压根没发请求（有人正占着）。心跳靠这个返回值
         决定要不要计入当夜次数——不然一次「没轮到」也会被算成醒过。
 
-        原函数内部自己也会设 busy=True / False，那些留着无害：
+        原函数内部自己也会设 busy=True，那行留着无害：
         这里的 finally 是最终保证。
         """
         if not acquire_busy(owner):
@@ -153,6 +186,24 @@ def register_busy_guard(server_module):
     server_module.busy_info = busy_info
     server_module.call_gateway = call_gateway_guarded
 
+    def api_stop():
+        """替换 server.py 的 /api/stop，额外记下「停止按在什么时候」。
+
+        只置 stop_flag 是不够的：那一代可能还没开始，
+        acquire_busy 会重新决定 stop_flag，把这一下覆盖掉。
+        stop_armed_at 就是留给它看的。
+        """
+        from flask import jsonify
+
+        with state_lock:
+            state["stop_flag"] = True
+            state["stop_armed_at"] = time.time()
+        try:
+            server_module.broadcast({"type": "system", "subtype": "stopped"})
+        except Exception:
+            pass
+        return jsonify({"ok": True})
+
     def api_status():
         """替换 server.py 的 /api/status，多报占位者和占了多久。
 
@@ -182,6 +233,7 @@ def register_busy_guard(server_module):
         return jsonify(payload)
 
     server_module.app.view_functions["api_status"] = api_status
+    server_module.app.view_functions["api_stop"] = api_stop
     server_module.app.add_url_rule(
         "/api/busy", endpoint="api_busy", view_func=api_busy, methods=["GET"]
     )
