@@ -5,10 +5,13 @@ dwell-backend
 
 启动：
   cd backend
-  cp ../web/index.html .
   pip install flask flask-cors requests
-  python3 server.py
+  python3 run.py          ← 用 run.py，不要直接跑这个文件
 然后访问 http://你的IP:8888
+
+注意：这个文件是最底层的骨架，绝大多数行为都被 backend/*_feature.py
+覆盖过了（鉴权、事件流、上下文、工具、占位、日报、共读…）。
+读这里的代码判断线上行为会得出错误结论，要看 run.py 的注册顺序。
 """
 
 import json
@@ -24,8 +27,12 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 # ── 配置
+#
+# 令牌不留默认值。这个仓库是公开的 fork，写在这里等于公开发布。
+# 运行时的真值存在 settings 表（gateway_config 模块负责读写，
+# 界面上在「设置 → 接入 API」里配），环境变量只作为首次初始值。
 GATEWAY_URL   = os.getenv("GATEWAY_URL",   "http://127.0.0.1:18003")
-GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "sk-ebb1179c1f074daeb406c80efe203aca")
+GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "")
 DEFAULT_MODEL = os.getenv("MODEL",         "claude-sonnet-4-5")
 PORT          = int(os.getenv("PORT",       "8888"))
 DB_PATH       = Path(os.getenv("DB_PATH",   "dwell.db"))
