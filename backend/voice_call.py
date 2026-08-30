@@ -15,8 +15,12 @@ Android APK 里反编译出来了），走 isNewBloop == false 那一支：纯�
 不用任何纹理。SDF + opSmoothUnion 的公式和参数一个没改，只是从 GPU 的
 逐像素并行改成 Canvas 2D 上逐像素串行。
 
-调参：`dwellCall.preview('thinking')` 把形态定住看，`dwellCall.P` 是
-那张参数表，改完立刻生效。
+液态玻璃那个质感是 isNewBloop == true 那一支，靠 voice_prepass.fsh 里
+Perlin + FBM + Linear Burn 混出彩色星云，必然有明暗层次、做不到纯黑，
+而且还缺仓库里没给的 noiseTexture。要那个得另开一版。
+
+调参：`dwellCall.preview('thinking')` 把形态定住，`dwellCall.fake(0.7)`
+手动喂音量，`dwellCall.P` 是那张参数表，改完立刻生效。
 
 删掉 run.py 里那一行就完全没有这个功能，别的都不受影响。
 """
@@ -51,7 +55,7 @@ CLIENT_SCRIPT = r"""
 .vc-bars.s3 i:nth-child(-n+3),.vc-bars.s4 i{opacity:.68}
 
 .vc-mid{display:flex;flex-direction:column;align-items:center;justify-content:center;
-  gap:clamp(14px,3.6vh,34px);min-height:0;padding:0 20px}
+  gap:clamp(16px,4vh,38px);min-height:0;padding:0 20px}
 .vc-stage{position:relative;flex:0 0 auto;display:block}
 .vc-stage canvas{display:block;width:100%;height:100%}
 
@@ -96,7 +100,11 @@ CLIENT_SCRIPT = r"""
   var P = {
     ink: [21, 21, 26],       // 形状颜色
     mainRadius: 0.49,        // args.mainRadius
-    tol: 0.005,              // clampingTolerance，边缘软化 = 免费抗锯齿
+    tolPx: 1.4,              // 边缘软化宽度，按设备像素算（源码是固定 0.005）
+    ss: 2,                   // 距离场按 1/ss 分辨率算；嫌卡调成 3
+    sizeVW: 0.60,            // 画布边长：min(vw*sizeVW, vh*sizeVH, sizeMax)
+    sizeVH: 0.30,
+    sizeMax: 268,
     // speak
     barCount: 4,
     barScale: 0.44,          // w = (1/barCount) * barScale
@@ -106,13 +114,14 @@ CLIENT_SCRIPT = r"""
     cloudCount: 5,
     ringFrac: 0.45,          // 环半径 = mainRadius * ringFrac
     blobFrac: 0.5,           // 每颗圆半径 = mainRadius * blobFrac（比环大，必然重叠）
-    cloudWobble: 0.1,        // 环半径的正弦扰动幅度
+    cloudWobble: 0.1,        // 环半径的正弦扰动，云朵不规则起伏就是它
     spinDiv: 3.0,            // 自转：time / spinDiv
     // listen
     listenBase: 0.38,
     listenMic: 0.05,
     listenBreath: 0.03,
-    listenFade: 0.6,         // 音量越大越透明
+    // 源码是 0.6：音量越大越透明。压到 0 就是一直纯黑，想要那个淡出改回来
+    listenFade: 0,
     // idle
     idleMid: 0.12,
     idleMax: 0.3
@@ -137,23 +146,20 @@ CLIENT_SCRIPT = r"""
     return (Math.atan(k * Math.sin((t - 0.5) * PI)) / Math.atan(k)) * 0.5 + 0.5;
   }
   function mix(a, b, h) { return a + (b - a) * h; }
-  function smoothstep(e0, e1, x) {
-    var t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
-    return t * t * (3 - 2 * t);
-  }
 
-  /* SDF 平滑并集。之前用 metaball 场强凑，融出来的腰比这个胖一圈，
-     形状特征就是那么丢的。k 是"胶水量"。 */
+  /* SDF 平滑并集。k 是"胶水量"，k→0 就退化成硬并集（min）。 */
   function opSmoothUnion(d1, d2, k) {
     if (k <= 0) k = 1e-6;
-    var h = Math.max(0, Math.min(1, 0.5 + 0.5 * (d2 - d1) / k));
-    return mix(d2, d1, h) - k * h * (1 - h);
+    var h = 0.5 + 0.5 * (d2 - d1) / k;
+    h = h < 0 ? 0 : (h > 1 ? 1 : h);
+    return d2 + (d1 - d2) * h - k * h * (1 - h);
   }
   /* 圆角矩形 SDF。四颗方块用它，圆角半径 = 宽度时就是圆角正方块。 */
   function sdRoundedBox(px, py, bx, by, r) {
     var qx = Math.abs(px) - bx + r, qy = Math.abs(py) - by + r;
-    return Math.min(Math.max(qx, qy), 0)
-         + Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) - r;
+    var mx = qx > 0 ? qx : 0, my = qy > 0 ? qy : 0;
+    var inner = Math.max(qx, qy);
+    return (inner < 0 ? inner : 0) + Math.sqrt(mx * mx + my * my) - r;
   }
 
   /* ═══ 状态 ═══════════════════════════════════════════════════ */
@@ -190,25 +196,26 @@ CLIENT_SCRIPT = r"""
     speaking:  { amount: 0, ts: 0 }
   };
   var T0 = 0, silenceAmount = 0, silenceTs = 0;
-  var drawRaf = 0, lastT = 0, W = 0, H = 0, DPR = 1;
+  var drawRaf = 0, W = 0, H = 0, DPR = 1;
 
-  /* SDF 是逐像素算的，全分辨率在 iPad 上跑不满 60fps，
-     所以画在 1/SS 的离屏上再放大。边缘那点软化正好当抗锯齿。 */
-  var SS = 2, off = null, octx = null, oimg = null;
+  /* 距离场按 1/ss 分辨率算，再双线性插值到全分辨率做 smoothstep。
+     SDF 近表面接近线性，插值完全够用 —— 直接放大 alpha 蒙版才会糊。 */
+  var GW = 0, GH = 0, dfield = null, img = null;
 
   function fit() {
     if (!cv || !stage) return;
-    var side = Math.min(window.innerWidth * 0.9, window.innerHeight * 0.46, 420);
+    var side = Math.min(window.innerWidth * P.sizeVW,
+                        window.innerHeight * P.sizeVH, P.sizeMax);
     stage.style.width = side + 'px';
     stage.style.height = side + 'px';
     DPR = Math.min(window.devicePixelRatio || 1, 2);
     cv.width = Math.round(side * DPR);
     cv.height = Math.round(side * DPR);
     W = cv.width; H = cv.height;
-    var ow = Math.max(1, Math.round(W / SS)), oh = Math.max(1, Math.round(H / SS));
-    if (!off) { off = document.createElement('canvas'); octx = off.getContext('2d'); }
-    off.width = ow; off.height = oh;
-    oimg = octx.createImageData(ow, oh);
+    GW = Math.ceil(W / P.ss) + 2;
+    GH = Math.ceil(H / P.ss) + 2;
+    dfield = new Float32Array(GW * GH);
+    img = ctx.createImageData(W, H);
   }
   var fitTimer = null;
   function fitLater() {
@@ -217,7 +224,7 @@ CLIENT_SCRIPT = r"""
   }
 
   /* ── idle：t<=1 弹簧到 0.12，之后指数逼近 0.3。
-     k = exp(-gamma)*omega 保证导数在 t=1 处连续（原版注释就是这么说的） */
+     k = exp(-gamma)*omega 保证导数在 t=1 处连续（源码注释就是这么说的） */
   function idleRadius(time) {
     var gamma = 3.0, omega = PI / 2, t1 = 1.0;
     var k = Math.exp(-gamma) * omega;
@@ -228,42 +235,40 @@ CLIENT_SCRIPT = r"""
     return P.idleMid + (P.idleMax - P.idleMid) * (1 - Math.exp(-k * (time - t1)));
   }
 
-  /* ── 每帧先把形状参数算出来，逐像素那层循环里只做距离计算 ── */
-  var SH = { idleR: 0.3, bars: [], clouds: [], dot: null,
-             listenR: 0, listenA: 1, alpha: 1 };
+  /* 每帧先把形状参数算出来，逐像素那层循环里只做距离计算 */
+  var SH = { idleR: 0.3, listenR: 0.38, bars: [], clouds: [], dots: [] };
+  var frameAlpha = 1, bound = 0.6;
 
   function shape(time) {
     var t = time;
-
-    // idle 一直在（原版 idleArgs.amount = 1.0）
     SH.idleR = idleRadius(t);
-    SH.alpha = Math.sin((PI / 0.7) * t) * 0.175 + 0.825;
 
-    // listen
+    // ── listen
     var L = ST.listening;
     if (L.amount > 0.001) {
       var dur = t - L.ts;
       var breathing = Math.sin(t) * 0.5 + 0.5;
       var entry = fixedSpring(scaled(0, 3, dur), 0.9);
-      var listenAnim = Math.max(0, Math.min(1, spring(scaled(0, 0.9, dur), 1)));
-      var l1 = micLevel;
-      var r = P.listenBase + l1 * P.listenMic + breathing * P.listenBreath;
+      var r = P.listenBase + micLevel * P.listenMic + breathing * P.listenBreath;
       SH.listenR = r * (1 - (1 - entry) * 0.25);
-      // 原版是靠 alpha 而不是形变来表达"在听"：音量越大越透明
-      SH.listenA = mix(1, 1 - l1 * P.listenFade, listenAnim);
     }
 
-    // think：五颗圆排在环上，圆比环大所以必然重叠成云朵
+    // ── think：五颗圆排在环上，圆比环大所以必然重叠成云朵。
+    //    那颗独立点也在同一个循环里画五遍，错位叠成不规则的一团。
     var K = ST.thinking;
     SH.clouds.length = 0;
-    SH.dot = null;
+    SH.dots.length = 0;
     if (K.amount > 0.001) {
       var dur2 = t - K.ts;
       var entry2 = spring(scaled(0, 1, dur2), 1);
       var dotEntry = spring(scaled(0.1, 1.1, dur2), 1);
       var dotR = mix(0.2, 0.06, dotEntry) * K.amount;
-      var shiftX = dotR * 0.5 * dotEntry;       // 对齐光学中心
+      // 源码里是 args.st.x -= s，等价于形状整体往 +x 挪，所以这里是加
+      var shiftX = dotR * 0.5 * dotEntry;
       var goo = 0.03 * scaled(0, 10, dur2) + 0.8 * (1 - entry2);
+      var dotGoo = (1 - Math.min(dotEntry, K.amount)) * dotR;
+      var dotBaseX = -P.mainRadius * 0.8 * dotEntry;
+      var dotBaseY = P.mainRadius * 0.8 * dotEntry;   // +y 朝下，所以在左下
 
       for (var i = 0; i < P.cloudCount; i++) {
         var f = (i + 0.5) / P.cloudCount;
@@ -274,26 +279,25 @@ CLIENT_SCRIPT = r"""
                           - silkySmooth(t / 4, 2) * PI) * 0.5 + 0.5)
                 * P.mainRadius * P.cloudWobble;
         SH.clouds.push({
-          x: Math.cos(a) * ring - shiftX,
+          x: Math.cos(a) * ring + shiftX,
           y: Math.sin(a) * ring,
           r: P.mainRadius * P.blobFrac,
           goo: goo
         });
+        // 同一圈里的那颗小点：角度和绕圈半径都随 i 变，五颗错位叠起来
+        var dotAngle = f * PI * 2;
+        var dotRing = (Math.sin(dotEntry * PI * 4 + a * PI * 2 + t * 0.1 * PI * 4) * 0.5 + 0.5)
+                    * dotR * 0.3;
+        SH.dots.push({
+          x: dotBaseX + Math.cos(dotAngle + t) * dotRing + shiftX,
+          y: dotBaseY + Math.sin(dotAngle + t) * dotRing,
+          r: dotR * 0.8,
+          goo: dotGoo
+        });
       }
-      // 左上那颗独立点，自己绕小圈转
-      var dotAngle = 0.5 / P.cloudCount * PI * 2;
-      var a0 = -0.5 / P.cloudCount * PI * 2 + t / P.spinDiv;
-      var dotRing = (Math.sin(dotEntry * PI * 4 + a0 * PI * 2 + t * 0.1 * PI * 4) * 0.5 + 0.5)
-                  * dotR * 0.3;
-      SH.dot = {
-        x: -P.mainRadius * 0.8 * dotEntry + Math.cos(dotAngle + t) * dotRing - shiftX,
-        y: P.mainRadius * 0.8 * dotEntry + Math.sin(dotAngle + t) * dotRing,
-        r: dotR * 0.8,
-        goo: (1 - Math.min(dotEntry, K.amount)) * dotR
-      };
     }
 
-    // speak：四颗圆角方块
+    // ── speak：四颗圆角方块
     var S = ST.speaking;
     SH.bars.length = 0;
     if (S.amount > 0.001) {
@@ -310,8 +314,7 @@ CLIENT_SCRIPT = r"""
         // 安静时那点小摆动
         if (silenceAmount > 0) {
           var stagger = f2 / 5, delay = 0.6;
-          var bt = scaled(delay, delay + 1,
-                          ((silenceDur + stagger) / 2 % 1) * 2);
+          var bt = scaled(delay, delay + 1, ((silenceDur + stagger) / 2 % 1) * 2);
           py += bounce(bt, 6) * w * 0.25 * silenceAmount
               * Math.pow(entry3, 4) * Math.pow(S.amount, 4);
         }
@@ -321,91 +324,143 @@ CLIENT_SCRIPT = r"""
                        goo: P.barGoo * (1 - S.amount) });
       }
     }
+
+    /* ── alpha：源码里每个态各管各的，不是一个全局透明度。
+       idle 按 0.7 秒周期呼吸，listen 音量越大越淡，
+       think 硬置 1.0，speak 混到 displayColor 的 1.0。 */
+    var al = Math.sin((PI / 0.7) * t) * 0.175 + 0.825;
+    if (L.amount > 0.001) {
+      var listenAnim = Math.max(0, Math.min(1, spring(scaled(0, 0.9, t - L.ts), 1)));
+      al = mix(al, mix(1, 1 - micLevel * P.listenFade, listenAnim), L.amount);
+    }
+    if (K.amount > 0.001) al = 1;
+    if (S.amount > 0.001) al = mix(al, 1, S.amount);
+    frameAlpha = al;
+
+    /* ── 包围圈：圈外的像素直接留空，不进 SDF 那层循环 */
+    var b = SH.idleR;
+    if (L.amount > 0.001 && SH.listenR > b) b = SH.listenR;
+    var n, o, dd;
+    for (n = 0; n < SH.clouds.length; n++) {
+      o = SH.clouds[n];
+      dd = Math.sqrt(o.x * o.x + o.y * o.y) + o.r;
+      if (dd > b) b = dd;
+    }
+    for (n = 0; n < SH.dots.length; n++) {
+      o = SH.dots[n];
+      dd = Math.sqrt(o.x * o.x + o.y * o.y) + o.r + o.goo;
+      if (dd > b) b = dd;
+    }
+    for (n = 0; n < SH.bars.length; n++) {
+      o = SH.bars[n];
+      dd = Math.sqrt((Math.abs(o.x) + o.w) * (Math.abs(o.x) + o.w)
+                   + (Math.abs(o.y) + o.h) * (Math.abs(o.y) + o.h)) + o.goo;
+      if (dd > b) b = dd;
+    }
+    bound = b + 0.03;
   }
 
-  /* 逐像素：跟 shader 的 main() 一个顺序，各态按 amount 依次 mix */
+  /* 逐点距离：跟 shader 的 main() 一个顺序，各态按 amount 依次 mix */
   function distAt(sx, sy) {
-    var d = Math.hypot(sx, sy) - SH.idleR;      // idle 垫底
-    var a;
+    var d = Math.sqrt(sx * sx + sy * sy) - SH.idleR;   // idle 垫底
+    var a, i, o;
 
     a = ST.listening.amount;
-    if (a > 0.001) d = mix(d, Math.hypot(sx, sy) - SH.listenR, a);
+    if (a > 0.001) d = d + (Math.sqrt(sx * sx + sy * sy) - SH.listenR - d) * a;
 
     a = ST.thinking.amount;
     if (a > 0.001 && SH.clouds.length) {
       var dk = 1000;
-      for (var i = 0; i < SH.clouds.length; i++) {
-        var c = SH.clouds[i];
-        dk = opSmoothUnion(dk, Math.hypot(sx - c.x, sy - c.y) - c.r, c.goo);
+      for (i = 0; i < SH.clouds.length; i++) {
+        o = SH.clouds[i];
+        dk = opSmoothUnion(dk, Math.sqrt((sx - o.x) * (sx - o.x)
+                                       + (sy - o.y) * (sy - o.y)) - o.r, o.goo);
+        o = SH.dots[i];
+        dk = opSmoothUnion(dk, Math.sqrt((sx - o.x) * (sx - o.x)
+                                       + (sy - o.y) * (sy - o.y)) - o.r, o.goo);
       }
-      if (SH.dot) {
-        dk = opSmoothUnion(dk, Math.hypot(sx - SH.dot.x, sy - SH.dot.y) - SH.dot.r,
-                           SH.dot.goo);
-      }
-      d = mix(d, dk, a);
+      d = d + (dk - d) * a;
     }
 
     a = ST.speaking.amount;
     if (a > 0.001 && SH.bars.length) {
       var ds = 1000;
-      for (var j = 0; j < SH.bars.length; j++) {
-        var b = SH.bars[j];
-        ds = opSmoothUnion(ds, sdRoundedBox(sx - b.x, sy - b.y, b.w, b.h, b.r), b.goo);
+      for (i = 0; i < SH.bars.length; i++) {
+        o = SH.bars[i];
+        ds = opSmoothUnion(ds, sdRoundedBox(sx - o.x, sy - o.y, o.w, o.h, o.r), o.goo);
       }
-      d = mix(d, ds, a);
+      d = d + (ds - d) * a;
     }
     return d;
   }
 
   function frame(now) {
     drawRaf = requestAnimationFrame(frame);
-    if (!ctx || !live || !oimg) return;
-    lastT = now;
+    if (!ctx || !live || !img) return;
     var time = (now - T0) / 1000;
 
     // 各态 amount 往目标滑：这就是 shader 里 stateXxx 的作用
     for (var k in ST) {
-      var want = (phase === k) ? 1 : 0;
-      ST[k].amount += (want - ST[k].amount) * 0.14;
+      ST[k].amount += ((phase === k ? 1 : 0) - ST[k].amount) * 0.14;
     }
 
     // 安静程度：speaking 时用它驱动那点小摆动
-    if (phase === 'speaking' && micLevel < 0.02) {
-      if (silenceAmount === 0) silenceTs = time;
-      silenceAmount = Math.min(1, silenceAmount + 0.02);
-    } else if (phase !== 'speaking') {
-      silenceAmount = 0;
+    if (phase === 'speaking') {
+      if (micLevel < 0.02) {
+        if (silenceAmount === 0) silenceTs = time;
+        silenceAmount = Math.min(1, silenceAmount + 0.02);
+      } else {
+        silenceAmount = Math.max(0, silenceAmount - 0.06);
+      }
     } else {
-      silenceAmount = Math.max(0, silenceAmount - 0.06);
+      silenceAmount = 0;
     }
 
     shape(time);
 
-    var ow = off.width, oh = off.height, data = oimg.data;
-    var ink = P.ink;
-    // 坐标系：st ∈ [-0.5, 0.5]，跟 shader 一致
-    var inv = 1 / oh, ox = (ow * inv) * 0.5;
-    var alphaBase = SH.alpha * mix(1, SH.listenA, ST.listening.amount);
-    var tol = P.tol;
-
-    for (var y = 0, idx = 0; y < oh; y++) {
-      var sy = (y + 0.5) * inv - 0.5;
-      for (var x = 0; x < ow; x++, idx += 4) {
-        var sx = (x + 0.5) * inv - ox;
-        // smoothstep(tol, 0, d)：负距离(形状内)为 1，正距离淡出
-        var cs = smoothstep(tol, 0, distAt(sx, sy));
-        var al = cs * alphaBase;
-        if (al > 0.002) {
-          data[idx] = ink[0]; data[idx + 1] = ink[1]; data[idx + 2] = ink[2];
-          data[idx + 3] = (al * 255) | 0;
-        } else {
-          data[idx + 3] = 0;
-        }
+    /* ── 第一遍：1/ss 分辨率的距离场 */
+    var ss = P.ss, inv = 1 / H, cx = W * 0.5, cy = H * 0.5;
+    var bsq = bound * bound, gi = 0;
+    for (var gy = 0; gy < GH; gy++) {
+      var sy = (gy * ss + 0.5 - cy) * inv;
+      for (var gx = 0; gx < GW; gx++, gi++) {
+        var sx = (gx * ss + 0.5 - cx) * inv;
+        dfield[gi] = (sx * sx + sy * sy > bsq) ? 1 : distAt(sx, sy);
       }
     }
-    octx.putImageData(oimg, 0, 0);
-    ctx.clearRect(0, 0, W, H);
-    ctx.drawImage(off, 0, 0, W, H);
+
+    /* ── 第二遍：全分辨率双线性插值 + smoothstep，边缘一个半像素收干净 */
+    var data = img.data;
+    data.fill(0);
+    var ink0 = P.ink[0], ink1 = P.ink[1], ink2 = P.ink[2];
+    var tol = P.tolPx * inv, invSS = 1 / ss;
+    var y0 = Math.max(0, Math.floor(cy - bound * H) - 2);
+    var y1 = Math.min(H, Math.ceil(cy + bound * H) + 2);
+    var x0 = Math.max(0, Math.floor(cx - bound * H) - 2);
+    var x1 = Math.min(W, Math.ceil(cx + bound * H) + 2);
+
+    for (var y = y0; y < y1; y++) {
+      var fy = y * invSS, iy = fy | 0, ty = fy - iy;
+      var rowA = iy * GW, rowB = rowA + GW;
+      var base = (y * W + x0) * 4;
+      for (var x = x0; x < x1; x++, base += 4) {
+        var fx = x * invSS, ix = fx | 0, tx = fx - ix;
+        var d00 = dfield[rowA + ix], d10 = dfield[rowA + ix + 1];
+        var d01 = dfield[rowB + ix], d11 = dfield[rowB + ix + 1];
+        var d = (d00 + (d10 - d00) * tx) + ((d01 + (d11 - d01) * tx)
+                                          - (d00 + (d10 - d00) * tx)) * ty;
+        // smoothstep(tol, 0, d)：形状内为 1，往外一个半像素淡到 0
+        var u = (tol - d) / tol;
+        if (u <= 0) continue;
+        var al = (u >= 1 ? 1 : u * u * (3 - 2 * u)) * frameAlpha;
+        if (al < 0.004) continue;
+        data[base] = ink0;
+        data[base + 1] = ink1;
+        data[base + 2] = ink2;
+        data[base + 3] = (al * 255) | 0;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
 
     if (timeEl && dialT0) timeEl.textContent = fmt((Date.now() - dialT0) / 1000);
   }
@@ -531,8 +586,7 @@ CLIENT_SCRIPT = r"""
     for (var b = 0; b < 4; b++) {
       var s = 0, c = edges[b + 1] - edges[b];
       for (var k = edges[b]; k < edges[b + 1]; k++) s += fq[k];
-      var v2 = c > 0 ? (s / c / 255) : 0;
-      AM[b] = AM[b] * 0.68 + v2 * 0.32;
+      AM[b] = AM[b] * 0.68 + (c > 0 ? (s / c / 255) : 0) * 0.32;
     }
     return Math.sqrt(sum / wave.length);
   }
@@ -857,8 +911,10 @@ CLIENT_SCRIPT = r"""
       if (ST[p]) ST[p].amount = 1;
     },
     P: P,
-    // 手动喂音频，不打电话也能看四颗方块跳：dwellCall.fake(.6)
-    fake: function (v) { micLevel = v; AM[0] = AM[1] = AM[2] = AM[3] = v; }
+    // 手动喂音量，不打电话也能看四颗方块跳：dwellCall.fake(0.7)
+    fake: function (v) { micLevel = v; AM[0] = AM[1] = AM[2] = AM[3] = v; },
+    // 改了 ss / 尺寸之后重建缓冲
+    refit: fit
   };
 
   function boot() {
