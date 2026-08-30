@@ -1,19 +1,19 @@
 """dwell 语音通话：对讲机模式。
 
-点电话进全屏，球跟着你的声音活；你停下来一秒半就算说完，自动上传、
+点电话进全屏，形状跟着你的声音变；你停下来一秒半就算说完，自动上传、
 自动发出去、模型回话自动念出来、念完自动接着听。整通电话不用碰屏幕。
 
 ⚠️ 这是**回合制**，不是 ChatGPT 那种实时双向流。一轮的等待是：
-听写 ~1s + 模型写完 2~4s + ElevenLabs 合成 1~3s，加网络大概 5~8 秒，
+转写 ~1s + 模型写完 2~4s + ElevenLabs 合成 1~3s，加网络大概 5~8 秒，
 中间打断不了。要做到真通话得换整条底层，那是另一件事。
 
 ⚠️ 每一句都要合成，ElevenLabs 按字符收钱。界面上那个计数就是这通电话
 花掉的字符数，别当装饰看。
 
-球的实现见下面 CLIENT_SCRIPT 里的注释：阻尼弹簧 + 三层噪声流场 +
-音频驱动坐标扭曲。白底黑球，内部流体是极克制的灰度层次。
-调参：`dwellCall.preview('speaking')` 把球定在某态，`dwellCall.spec`
-是那张参数表，改完立刻生效。
+视觉是 2D 矢量扁平纯黑，四个形态：正圆 / 波浪圆 / 思想气泡 / 横排四点。
+形态之间靠 metaball 场强融合 + 节点弹簧插值，连续变形不硬切。
+调参：`dwellCall.preview('thinking')` 把形态定住，SHAPES 和 FIELD
+是那两张参数表，改完立刻生效。
 
 删掉 run.py 里那一行就完全没有这个功能，别的都不受影响。
 """
@@ -23,8 +23,7 @@ from voice_feature import _voice_token
 CLIENT_SCRIPT = r"""
 <style>
 #vcall{position:fixed;inset:0;z-index:9999;display:none;
-  background:radial-gradient(125% 95% at 50% 4%, #fbfaf8 0%, #f3f1ed 44%, #e8e6e0 100%);
-  color:#15151a;-webkit-user-select:none;user-select:none;
+  background:#faf9f7;color:#15151a;-webkit-user-select:none;user-select:none;
   -webkit-font-smoothing:antialiased;
   font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',sans-serif}
 #vcall.on{display:grid;grid-template-rows:auto 1fr auto}
@@ -32,8 +31,7 @@ CLIENT_SCRIPT = r"""
 .vc-top{display:flex;justify-content:center;align-items:center;gap:8px;flex-wrap:wrap;
   padding:calc(env(safe-area-inset-top,0px) + 22px) 20px 0}
 .vc-tag{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;
-  background:rgba(255,255,255,.5);border:1px solid rgba(21,21,26,.06);
-  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  background:rgba(21,21,26,.032);border:1px solid rgba(21,21,26,.055);
   font-size:clamp(9.5px,2.4vw,11px);letter-spacing:.13em;text-transform:uppercase;
   color:rgba(21,21,26,.4);font-variant-numeric:tabular-nums;white-space:nowrap}
 .vc-dot{width:5px;height:5px;border-radius:50%;background:#3f9e74;flex:0 0 auto;
@@ -70,15 +68,12 @@ CLIENT_SCRIPT = r"""
 .vc-btn{-webkit-appearance:none;appearance:none;
   width:clamp(56px,15vw,64px);height:clamp(56px,15vw,64px);border-radius:50%;cursor:pointer;
   display:flex;align-items:center;justify-content:center;
-  color:#15151a;background:rgba(255,255,255,.66);border:1px solid rgba(21,21,26,.07);
-  box-shadow:0 3px 14px rgba(21,21,26,.055);
-  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  color:#15151a;background:rgba(21,21,26,.045);border:1px solid rgba(21,21,26,.07);
   transition:transform .42s cubic-bezier(.34,1.42,.5,1),background .3s ease,opacity .3s ease}
 .vc-btn:active{transform:scale(.9)}
 .vc-btn:focus-visible{outline:2px solid rgba(21,21,26,.45);outline-offset:3px}
-.vc-btn.mute.off{opacity:.4;background:rgba(255,255,255,.4)}
-.vc-btn.hang{background:#b4413a;border-color:rgba(21,21,26,.05);color:#fdfbf8;
-  box-shadow:0 5px 20px rgba(180,65,58,.24)}
+.vc-btn.mute.off{opacity:.4}
+.vc-btn.hang{background:#15151a;border-color:#15151a;color:#faf9f7}
 #vcBtn{display:inline-flex;align-items:center;justify-content:center}
 
 @media (prefers-reduced-motion:reduce){
@@ -91,35 +86,73 @@ CLIENT_SCRIPT = r"""
   if (window.dwellCall) return;
   var TOKEN = '__VOICE_TOKEN__';
   var CALL_HINT = '[通话中]';
+  var INK = [21, 21, 26];              // 纯黑那个黑
 
-  /* ═══ 主题：黑球在白底上，颜色只是外壳 ═══════════════════════
-     main 主色，low/mid/high 是内部流体那三层的灰度 —— 差异故意做得
-     极小，不仔细看看不见，但能感觉到里面在动。调大就不黑了。 */
-  var THEMES = {
-    ink: {
-      main: [10, 10, 12], low: [22, 22, 27], mid: [34, 33, 41], high: [52, 50, 62],
-      hue: 236, halo: 0.062, shade: 0.20
-    },
-    slate: {
-      main: [10, 12, 15], low: [21, 25, 31], mid: [31, 37, 46], high: [46, 55, 68],
-      hue: 212, halo: 0.058, shade: 0.185
-    }
+  /* ═══ metaball 场强参数 ═══════════════════════════════════════
+     每颗圆贡献 w * r² / d² 的场强，超过 T 的像素填黑。圆靠近时场强
+     叠加，边界自然消融 —— 这就是"平滑合并"，比手画贝塞尔靠谱。
+     T 越小融得越狠（形状会胀），EDGE 是边缘软化宽度，当抗锯齿用。 */
+  var FIELD = { T: 1.0, EDGE: 0.14, POW: 1.0 };
+
+  /* ═══ 四个形态：每个都是一组节点 ═══════════════════════════════
+     x/y 是相对半径 R 的偏移，r 是相对 R 的半径，w 是场强权重。
+     节点数必须一样多（8 个），换态时一一对应做弹簧插值，
+     所以圆分裂成四颗胶囊那一下是连续变形的。
+     用不到的节点把 w 压到 0，它就"消失"但位置还在插值里。 */
+  var SHAPES = {
+    // 一颗正圆：主节点独大，其余缩在中心权重为 0
+    idle: [
+      { x: 0, y: 0, r: 1.00, w: 1 },
+      { x: 0, y: 0, r: 0.30, w: 0 }, { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 }, { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 }, { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 }
+    ],
+    // 听：还是一颗圆，波浪加在边缘采样上（见 waveAt）
+    listening: [
+      { x: 0, y: 0, r: 0.96, w: 1 },
+      { x: 0, y: 0, r: 0.30, w: 0 }, { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 }, { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 }, { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 }
+    ],
+    /* 思想气泡：上方四颗互相粘连成云朵，左下角一颗独立小点留空隙。
+       四颗的圆心距要小于半径和，不然融不到一起。 */
+    thinking: [
+      { x: -0.30, y: -0.16, r: 0.58, w: 1 },
+      { x:  0.26, y: -0.24, r: 0.50, w: 1 },
+      { x:  0.40, y:  0.16, r: 0.42, w: 1 },
+      { x: -0.10, y:  0.26, r: 0.52, w: 1 },
+      { x: -0.62, y:  0.72, r: 0.17, w: 1 },   // 那颗独立小点
+      { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 },
+      { x: 0, y: 0, r: 0.30, w: 0 }
+    ],
+    /* 横排四点：左两颗偏宽（sx 拉横），右两颗趋正圆，互不粘连。
+       间距要够大，不然会融成一条虫。 */
+    speaking: [
+      { x: -0.95, y: 0, r: 0.34, w: 1, sx: 1.34 },
+      { x: -0.32, y: 0, r: 0.33, w: 1, sx: 1.20 },
+      { x:  0.32, y: 0, r: 0.31, w: 1, sx: 1.04 },
+      { x:  0.95, y: 0, r: 0.30, w: 1, sx: 1.00 },
+      { x: 0, y: 0, r: 0.20, w: 0 }, { x: 0, y: 0, r: 0.20, w: 0 },
+      { x: 0, y: 0, r: 0.20, w: 0 }, { x: 0, y: 0, r: 0.20, w: 0 }
+    ]
   };
-  var TH = THEMES.ink;
+  var N = 8;
 
-  /* ═══ 状态机 ═══════════════════════════════════════════════════
-     scale 目标大小，k/d 弹簧刚度与阻尼，flow 流速，warp 形变幅度,
-     tension 边缘张力（越低越"液体"），lum 内部流体亮度，
-     swirl 漩涡强度，halo 辉光倍率。 */
+  /* ═══ 状态机：形态之外的运动参数 ═════════════════════════════
+     k/d 形态插值的弹簧刚度与阻尼，breathe 呼吸幅度，period 周期，
+     wave 边缘波浪幅度，spin 整体自转，wobble 内部起伏。 */
   var SPEC = {
-    idle:      { scale: 1.00, k: 42,  d: 7.4, flow: .16, warp: .022, tension: .82,
-                 lum: .52, swirl: .04, halo: .70, label: 'Idle' },
-    listening: { scale: 0.94, k: 78,  d: 8.2, flow: .40, warp: .034, tension: .74,
-                 lum: .78, swirl: .10, halo: .88, label: 'Listening' },
-    thinking:  { scale: 0.97, k: 120, d: 6.2, flow: .82, warp: .046, tension: .70,
-                 lum: .88, swirl: 1.0, halo: .80, label: 'Thinking' },
-    speaking:  { scale: 1.09, k: 165, d: 5.4, flow: 1.0, warp: .090, tension: .52,
-                 lum: 1.0,  swirl: .18, halo: 1.0, label: 'Speaking' }
+    idle:      { k: 46,  d: 8.0, breathe: .034, period: 5200, wave: 0,
+                 spin: 0,    wobble: .010, label: 'Idle' },
+    listening: { k: 92,  d: 9.5, breathe: .008, period: 4200, wave: 1,
+                 spin: 0,    wobble: .014, label: 'Listening' },
+    thinking:  { k: 62,  d: 8.6, breathe: .016, period: 3000, wave: .35,
+                 spin: .085, wobble: .040, label: 'Thinking' },
+    speaking:  { k: 150, d: 7.2, breathe: .030, period: 1300, wave: .22,
+                 spin: 0,    wobble: .022, label: 'Speaking' }
   };
 
   var box, cv, ctx, stage, stateEl, saidEl, metaEl, timeEl, barsEl, muteBtn, modelEl;
@@ -143,116 +176,63 @@ CLIENT_SCRIPT = r"""
     return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
   }
 
-  /* ═══════════════════════════════════════════════════════════════
-     阻尼谐振弹簧。lerp 永远追不过头，所以显得机械；弹簧会过冲目标
-     再回弹 settling，重量感就是从这儿来的。
-       a = (target - x) * k - v * d
-     k 刚度（多急），d 阻尼（多快停）。d 小了会晃很久，大了就没弹性。
-     ═════════════════════════════════════════════════════════════ */
-  function Spring(x0, k, d) {
-    this.x = x0; this.v = 0; this.k = k; this.d = d;
-  }
-  Spring.prototype.to = function (target, dt) {
-    // dt 钳在 32ms：切后台回来那一下 dt 会很大，不钳的话直接炸开
-    dt = Math.min(dt, 0.032);
-    var a = (target - this.x) * this.k - this.v * this.d;
-    this.v += a * dt;
+  /* ═══ 阻尼谐振弹簧 ═══════════════════════════════════════════
+     lerp 永远追不过头，所以显得机械。弹簧会过冲目标再回弹 settling，
+     重量感就是从这儿来的。a = (target - x) * k - v * d */
+  function Spring(x0, k, d) { this.x = x0; this.v = 0; this.k = k; this.d = d; }
+  Spring.prototype.to = function (t, dt) {
+    dt = Math.min(dt, 0.032);          // 切后台回来那一下 dt 会很大，不钳会炸
+    this.v += ((t - this.x) * this.k - this.v * this.d) * dt;
     this.x += this.v * dt;
     return this.x;
   };
   Spring.prototype.tune = function (k, d) { this.k = k; this.d = d; };
 
-  /* ═══ 三层 FBM 噪声：离屏预渲染，主循环只采样合成 ═══════════════
-     值噪声 + 分形布朗运动。三层频率不同、流速不同，叠起来才是"翻涌"，
-     单层只会看着像整片平移。 */
-  var NZ = 168;                       // 每层 tile 边长
-  var layers = [];                    // 三张离屏 canvas
-
-  function valueNoise(seed) {
-    var g = new Float32Array(NZ * NZ);
-    var s = seed * 9301;
-    function rnd() { s = (s * 9301 + 49297) % 233280; return s / 233280; }
-    var grid = 12, gv = [];
-    for (var i = 0; i <= grid; i++) {
-      gv[i] = [];
-      for (var j = 0; j <= grid; j++) gv[i][j] = rnd();
-    }
-    function smooth(t) { return t * t * (3 - 2 * t); }
-    function at(gx, gy) {                // 双线性 + 平滑插值
-      var x = gx * grid, y = gy * grid;
-      var xi = Math.floor(x) % grid, yi = Math.floor(y) % grid;
-      var xf = smooth(x - Math.floor(x)), yf = smooth(y - Math.floor(y));
-      var a = gv[xi][yi], b = gv[xi + 1][yi], c = gv[xi][yi + 1], dd = gv[xi + 1][yi + 1];
-      return (a * (1 - xf) + b * xf) * (1 - yf) + (c * (1 - xf) + dd * xf) * yf;
-    }
-    for (var y2 = 0; y2 < NZ; y2++) {
-      for (var x2 = 0; x2 < NZ; x2++) {
-        // FBM：四个八度，振幅逐层减半
-        var v = 0, amp = .5, f = 1;
-        for (var o = 0; o < 4; o++) {
-          v += at((x2 / NZ * f) % 1, (y2 / NZ * f) % 1) * amp;
-          amp *= .5; f *= 2;
-        }
-        g[y2 * NZ + x2] = v;
-      }
-    }
-    return g;
+  /* 每个节点四根弹簧（x / y / r / w），加一根横向拉伸 */
+  var nodes = [];
+  for (var i0 = 0; i0 < N; i0++) {
+    nodes.push({
+      x: new Spring(0, 46, 8), y: new Spring(0, 46, 8),
+      r: new Spring(i0 === 0 ? 1 : .3, 46, 8),
+      w: new Spring(i0 === 0 ? 1 : 0, 46, 8),
+      sx: new Spring(1, 46, 8)
+    });
   }
+  var sBreathe = new Spring(.034, 40, 9);
+  var sWave = new Spring(0, 40, 9);
+  var sSpin = new Spring(0, 30, 9);
+  var sWob = new Spring(.01, 30, 9);
 
-  function buildLayers() {
-    if (layers.length) return;
-    var cfg = [
-      { seed: 3,  lo: TH.low,  a: 1.00 },
-      { seed: 17, lo: TH.mid,  a: 0.72 },
-      { seed: 41, lo: TH.high, a: 0.46 }
-    ];
-    for (var n = 0; n < 3; n++) {
-      var g = valueNoise(cfg[n].seed);
-      var c = document.createElement('canvas');
-      c.width = c.height = NZ;
-      var cc = c.getContext('2d');
-      var img = cc.createImageData(NZ, NZ);
-      var base = TH.main, tip = cfg[n].lo;
-      for (var i = 0, p = 0; i < g.length; i++, p += 4) {
-        // 对比度拉一把，中间调压掉，只留丝状的亮脉
-        var v = Math.min(1, Math.max(0, (g[i] - .28) * 2.1));
-        v = v * v * (3 - 2 * v);
-        img.data[p]     = base[0] + (tip[0] - base[0]) * v;
-        img.data[p + 1] = base[1] + (tip[1] - base[1]) * v;
-        img.data[p + 2] = base[2] + (tip[2] - base[2]) * v;
-        img.data[p + 3] = Math.round(255 * v * cfg[n].a);
-      }
-      cc.putImageData(img, 0, 0);
-      layers.push(c);
-    }
-  }
-
-  /* ═══ 渲染状态 ═══════════════════════════════════════════════ */
-  var sScale = new Spring(1, 42, 7.4);      // 大小
-  var sWarp = new Spring(0, 60, 9);         // 形变幅度
-  var sTens = new Spring(.82, 50, 9);       // 边缘张力
-  var sLum = new Spring(.52, 40, 9);        // 内部亮度
-  var sSwirl = new Spring(0, 44, 9);        // 漩涡
-  var sHalo = new Spring(.7, 36, 9);        // 辉光
-  var sFlow = new Spring(.16, 30, 8);       // 流速
-
-  // 四通道频率：低 / 中 / 高 / 总能量。分别驱动不同视觉参数
+  /* 四通道频率：低 / 中 / 高 / 总能量 */
   var A = { lo: 0, mid: 0, hi: 0, all: 0 };
-  var cumAudio = 0;                         // 累计音频能量，扭曲噪声坐标
-  var flowT = 0, waddleT = 0, silence = 0;
+  var loud = 0;              // listening 用：涨得快落得慢
+  var t = 0, spinA = 0;
   var drawRaf = 0, lastT = 0, W = 0, H = 0, R = 0, DPR = 1;
-  var SAMPLES = 128;                        // 边缘采样点数
+
+  /* 场强渲染是逐像素的，全分辨率在 iPad 上跑不满 60fps，
+     所以画在 1/SS 分辨率的离屏上再放大。边缘那点软化正好当抗锯齿。 */
+  var SS = 2;
+  var off = null, octx = null, oimg = null;
 
   function fit() {
     if (!cv || !stage) return;
-    var side = Math.min(window.innerWidth * 0.92, window.innerHeight * 0.56, 560);
+    var side = Math.min(window.innerWidth * 0.92, window.innerHeight * 0.5, 460);
     stage.style.width = side + 'px';
     stage.style.height = side + 'px';
-    DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
     cv.width = Math.round(side * DPR);
     cv.height = Math.round(side * DPR);
     W = cv.width; H = cv.height;
-    R = Math.min(W, H) * 0.268;
+    R = Math.min(W, H) * 0.215;
+
+    var ow = Math.max(1, Math.round(W / SS)), oh = Math.max(1, Math.round(H / SS));
+    if (!off) {
+      off = document.createElement('canvas');
+      octx = off.getContext('2d');
+    }
+    off.width = ow; off.height = oh;
+    oimg = octx.createImageData(ow, oh);
+    ctx.imageSmoothingEnabled = true;
   }
   var fitTimer = null;
   function fitLater() {
@@ -260,164 +240,143 @@ CLIENT_SCRIPT = r"""
     fitTimer = setTimeout(function () { fitTimer = null; fit(); }, 140);
   }
 
-  /* 液体边缘：不画正圆，r(θ) 三条不同频率的正弦叠加。
-     speaking 时幅度顶上去就是表面张力那种融化感。
-     （Canvas 2D 没有 SDF，opSmoothUnion 做不了，这是同等观感的替代） */
-  function edge(th, warp, tens, t) {
-    var w = warp * (0.55 + A.all * 1.5);
+  /* 边缘波浪：listening 时跟着音量起伏，thinking 时慢慢自己动 */
+  function waveAt(th, amp) {
     return 1
-      + Math.sin(th * 3 + t * 0.9 + cumAudio * 0.6) * w * (1.15 - tens * .5)
-      + Math.sin(th * 5 - t * 1.35 + cumAudio * 0.35) * w * 0.62
-      + Math.sin(th * 2 + t * 0.52) * w * 0.48 * (1 + A.lo * 1.2);
+      + Math.sin(th * 3 + t * 1.15) * amp * 0.055
+      + Math.sin(th * 5 - t * 0.82) * amp * 0.032
+      + Math.sin(th * 2 + t * 0.47) * amp * 0.026;
   }
 
   function frame(now) {
     drawRaf = requestAnimationFrame(frame);
-    if (!ctx || !live) return;
+    if (!ctx || !live || !oimg) return;
 
     var dt = lastT ? (now - lastT) / 1000 : 0.016;
     lastT = now;
+    t += dt;
     var s = SPEC[phase] || SPEC.idle;
+    var want = SHAPES[phase] || SHAPES.idle;
 
-    sScale.tune(s.k, s.d);
-    var target = s.scale;
-    if (phase === 'listening') target = s.scale + Math.min(0.22, A.all * 1.5);
-    if (phase === 'speaking') target = s.scale + A.all * 0.05;
+    // listening：涨得快落得慢。同一根弹簧涨落对称，停下来会"弹回去"，
+    // 那个手感不对 —— 要的是慢慢恢复，不猛缩。
+    var lvl = A.all;
+    loud = lvl > loud ? loud + (lvl - loud) * Math.min(1, dt * 9)
+                      : loud + (lvl - loud) * Math.min(1, dt * 1.7);
 
-    var sc = sScale.to(target, dt);
-    var warp = sWarp.to(s.warp, dt);
-    var tens = sTens.to(s.tension, dt);
-    var lum = sLum.to(s.lum, dt);
-    var swirl = sSwirl.to(s.swirl, dt);
-    var halo = sHalo.to(s.halo, dt);
-    var flow = sFlow.to(s.flow, dt);
+    var breathe = sBreathe.to(s.breathe, dt);
+    var wave = sWave.to(s.wave, dt);
+    var spin = sSpin.to(s.spin, dt);
+    var wob = sWob.to(s.wobble, dt);
 
-    // 累计音频能量：说得响流体转得急，安静下来慢慢淌
-    cumAudio += (A.all * 2.6 + 0.12) * flow * dt * 4;
-    flowT += dt * (0.24 + flow * 0.75 + A.mid * 0.9);
+    spinA += spin * dt;
 
-    // Waddle：安静久了微微摇摆，像活物待着而不是完全静止
-    if (phase === 'idle' || (phase === 'listening' && A.all < 0.02)) {
-      silence = Math.min(1, silence + dt * 0.55);
-    } else {
-      silence = Math.max(0, silence - dt * 2.2);
-    }
-    waddleT += dt;
-    var wx = Math.sin(waddleT * 0.72) * R * 0.020 * silence;
-    var wy = Math.sin(waddleT * 0.47 + 1.1) * R * 0.014 * silence;
+    // 整体呼吸：idle/speaking 走正弦，listening 由音量推
+    var puff = 1 + Math.sin(t / (s.period / 1000) * Math.PI * 2) * breathe;
+    if (phase === 'listening') puff = 1 + Math.min(0.20, loud * 1.5);
+    if (phase === 'speaking') puff += A.all * 0.10;
 
-    var cx = W / 2 + wx, cy = H / 2 + wy, r = R * sc;
-    ctx.clearRect(0, 0, W, H);
+    // 节点插值到目标形态
+    var pts = [];
+    for (var i = 1, j = 0; j < N; j++) {
+      var wn = want[j], nd = nodes[j];
+      nd.x.tune(s.k, s.d); nd.y.tune(s.k, s.d);
+      nd.r.tune(s.k, s.d); nd.w.tune(s.k, s.d); nd.sx.tune(s.k, s.d);
 
-    // ── 落地投影
-    var shY = cy + r * 1.28, shW = r * (1.02 + (halo - .7) * 1.1), shH = shW * 0.17;
-    var gs = ctx.createRadialGradient(cx, shY, 0, cx, shY, shW);
-    gs.addColorStop(0, 'rgba(21,21,26,' + (TH.shade * (1.15 - halo * .35)).toFixed(3) + ')');
-    gs.addColorStop(0.6, 'rgba(21,21,26,' + (TH.shade * .26).toFixed(3) + ')');
-    gs.addColorStop(1, 'rgba(21,21,26,0)');
-    ctx.save();
-    ctx.translate(cx, shY);
-    ctx.scale(1, shH / shW);
-    ctx.beginPath();
-    ctx.arc(0, 0, shW, 0, Math.PI * 2);
-    ctx.fillStyle = gs;
-    ctx.fill();
-    ctx.restore();
-
-    // ── 辉光：白底上是极淡的黑色晕开
-    var gh = ctx.createRadialGradient(cx, cy, r * .88, cx, cy, r * 2.3);
-    gh.addColorStop(0, 'rgba(21,21,26,' + (TH.halo * halo).toFixed(4) + ')');
-    gh.addColorStop(0.5, 'rgba(21,21,26,' + (TH.halo * halo * .3).toFixed(4) + ')');
-    gh.addColorStop(1, 'rgba(21,21,26,0)');
-    ctx.fillStyle = gh;
-    ctx.fillRect(0, 0, W, H);
-
-    // ── 球体轮廓：形变后的闭合曲线
-    ctx.beginPath();
-    for (var i = 0; i <= SAMPLES; i++) {
-      var th = i / SAMPLES * Math.PI * 2;
-      var rr = r * edge(th, slow ? 0 : warp, tens, flowT);
-      var x = cx + Math.cos(th) * rr, y = cy + Math.sin(th) * rr;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-
-    ctx.save();
-    ctx.clip();
-
-    // 球体底色：光源偏左上
-    var lx = cx - r * .30, ly = cy - r * .36;
-    var g1 = ctx.createRadialGradient(lx, ly, r * .05, cx, cy, r * 1.14);
-    var m = TH.main;
-    g1.addColorStop(0, 'rgb(' + (m[0] + 26) + ',' + (m[1] + 25) + ',' + (m[2] + 30) + ')');
-    g1.addColorStop(0.42, 'rgb(' + (m[0] + 9) + ',' + (m[1] + 9) + ',' + (m[2] + 12) + ')');
-    g1.addColorStop(1, 'rgb(' + m[0] + ',' + m[1] + ',' + m[2] + ')');
-    ctx.fillStyle = g1;
-    ctx.fillRect(cx - r * 1.3, cy - r * 1.3, r * 2.6, r * 2.6);
-
-    // ── 三层流体：各自流速方向不同，叠起来才是翻涌
-    if (!slow && layers.length) {
-      var spd = [1.0, -0.62, 0.38], zoom = [1.0, 1.62, 2.45];
-      var alpha = [0.55, 0.42, 0.34];
-      for (var n = 0; n < 3; n++) {
-        var side = r * 2.9 / zoom[n];
-        // thinking 时坐标绕中心转，能量在漩涡里打转
-        var ang = swirl * (flowT * 0.5 + n * 0.7) + cumAudio * 0.012 * (n + 1);
-        var ox = Math.cos(flowT * spd[n] * 0.5 + n * 2.1) * r * 0.30
-               + Math.sin(cumAudio * 0.05 * (n + 1)) * r * 0.13;
-        var oy = Math.sin(flowT * spd[n] * 0.42 + n * 1.3) * r * 0.26
-               + Math.cos(cumAudio * 0.04 * (n + 1)) * r * 0.11;
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.rotate(ang);
-        ctx.globalAlpha = alpha[n] * lum * (0.6 + A.all * 0.7);
-        ctx.globalCompositeOperation = n === 0 ? 'source-over' : 'lighter';
-        ctx.drawImage(layers[n], -side / 2 + ox, -side / 2 + oy, side, side);
-        ctx.restore();
+      // 说话时每颗胶囊各跟一段频谱：低频推左边，高频推右边
+      var kick = 1;
+      if (phase === 'speaking') {
+        var band = [A.lo, A.mid, A.mid * .8 + A.hi * .2, A.hi][j] || 0;
+        kick = 1 + band * 1.15;
       }
-      ctx.globalAlpha = 1;
-      ctx.globalCompositeOperation = 'source-over';
+      // 思考时内部微微起伏，各节点错开相位
+      var breath2 = 1 + Math.sin(t * 1.25 + j * 1.7) * wob;
+
+      var nx = nd.x.to(wn.x, dt), ny = nd.y.to(wn.y, dt);
+      var nr = nd.r.to(wn.r, dt) * kick * breath2;
+      var nw = nd.w.to(wn.w, dt);
+      var nsx = nd.sx.to(wn.sx || 1, dt);
+      if (nw <= 0.004) continue;      // 权重没了就不参与场强，省一层循环
+
+      // thinking 时整团绕中心转
+      var ca = Math.cos(spinA), sa = Math.sin(spinA);
+      pts.push({
+        x: (nx * ca - ny * sa) * R * puff,
+        y: (nx * sa + ny * ca) * R * puff,
+        r: nr * R * puff,
+        w: nw,
+        sx: nsx
+      });
     }
 
-    // 底缘反光：白底往上打的 bounce light。
-    // 这道弯月是黑球"有体积"的关键，没有它就是个洞。
-    var by = cy + r * .62;
-    var g2 = ctx.createRadialGradient(cx + r * .08, by, r * .04, cx + r * .08, by, r * .95);
-    g2.addColorStop(0, 'hsla(' + TH.hue + ',12%,74%,' + (0.26 + halo * .08).toFixed(3) + ')');
-    g2.addColorStop(0.44, 'hsla(' + TH.hue + ',10%,56%,0.085)');
-    g2.addColorStop(1, 'hsla(' + TH.hue + ',10%,44%,0)');
-    ctx.fillStyle = g2;
-    ctx.fillRect(cx - r * 1.3, cy - r * 1.3, r * 2.6, r * 2.6);
+    // ── 场强扫描：超阈值填黑，边缘按距离软化
+    var ow = off.width, oh = off.height;
+    var data = oimg.data;
+    var ocx = ow / 2, ocy = oh / 2, k = 1 / SS;
+    var T = FIELD.T, EDGE = FIELD.EDGE;
+    var np = pts.length;
 
-    // 镜面高光：一片冷调折射，随高频轻微抖动
-    var hi = 0.26 + halo * .12 + A.hi * .10;
-    var g3 = ctx.createRadialGradient(lx, ly, 0, lx, ly, r * .60);
-    g3.addColorStop(0, 'hsla(' + (TH.hue + 6) + ',16%,92%,' + hi.toFixed(3) + ')');
-    g3.addColorStop(0.4, 'hsla(' + TH.hue + ',12%,76%,0.055)');
-    g3.addColorStop(1, 'hsla(' + TH.hue + ',10%,60%,0)');
-    ctx.fillStyle = g3;
-    ctx.fillRect(cx - r * 1.3, cy - r * 1.3, r * 2.6, r * 2.6);
-
-    ctx.restore();
-
-    // 顶缘那道细亮线，勾住球和背景的边界
-    ctx.beginPath();
-    for (var j = 0; j <= SAMPLES; j++) {
-      var th2 = Math.PI * 1.04 + (j / SAMPLES) * Math.PI * 0.92;
-      var rr2 = r * edge(th2, slow ? 0 : warp, tens, flowT) - DPR * .5;
-      var x2 = cx + Math.cos(th2) * rr2, y2 = cy + Math.sin(th2) * rr2;
-      if (j === 0) ctx.moveTo(x2, y2); else ctx.lineTo(x2, y2);
+    // 预乘：场强用 (w*r²)/d²，先把 w*r² 算出来
+    var qx = new Float32Array(np), qy = new Float32Array(np);
+    var qn = new Float32Array(np), qs = new Float32Array(np);
+    for (var p = 0; p < np; p++) {
+      qx[p] = ocx + pts[p].x * k;
+      qy[p] = ocy + pts[p].y * k;
+      qn[p] = pts[p].w * (pts[p].r * k) * (pts[p].r * k);
+      qs[p] = 1 / (pts[p].sx * pts[p].sx);   // 横向拉伸：压 dx²
     }
-    ctx.strokeStyle = 'hsla(' + TH.hue + ',14%,84%,' + (0.13 + halo * .1).toFixed(3) + ')';
-    ctx.lineWidth = DPR;
-    ctx.stroke();
+
+    for (var y = 0, idx = 0; y < oh; y++) {
+      for (var x = 0; x < ow; x++, idx += 4) {
+        var f = 0;
+        for (var q = 0; q < np; q++) {
+          var dx = x - qx[q], dy = y - qy[q];
+          var d2 = dx * dx * qs[q] + dy * dy;
+          if (d2 < 0.35) { f += 40; continue; }   // 圆心附近别除爆
+          f += qn[q] / d2;
+        }
+        var a;
+        if (f >= T + EDGE) a = 255;
+        else if (f <= T - EDGE) a = 0;
+        else {
+          // 阈值附近平滑过渡，当抗锯齿
+          var u = (f - (T - EDGE)) / (EDGE * 2);
+          a = Math.round(255 * u * u * (3 - 2 * u));
+        }
+        if (a) {
+          data[idx] = INK[0]; data[idx + 1] = INK[1]; data[idx + 2] = INK[2];
+        }
+        data[idx + 3] = a;
+      }
+    }
+    octx.putImageData(oimg, 0, 0);
+
+    // ── 波浪：listening 时靠裁剪路径削一层，比塞进场强便宜得多
+    ctx.clearRect(0, 0, W, H);
+    var amp = wave * (0.35 + loud * 2.4);
+    if (amp > 0.02 && !slow && (phase === 'listening' || phase === 'idle')) {
+      ctx.save();
+      ctx.beginPath();
+      var rr = R * puff * 1.32;
+      for (var i2 = 0; i2 <= 96; i2++) {
+        var th = i2 / 96 * Math.PI * 2;
+        var v = rr * waveAt(th, amp);
+        var px = W / 2 + Math.cos(th) * v, py = H / 2 + Math.sin(th) * v;
+        if (i2 === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.clip();
+      ctx.drawImage(off, 0, 0, W, H);
+      ctx.restore();
+    } else {
+      ctx.drawImage(off, 0, 0, W, H);
+    }
 
     if (timeEl && dialT0) timeEl.textContent = fmt((Date.now() - dialT0) / 1000);
   }
 
   function startDraw() {
     if (drawRaf) return;
-    buildLayers();
     lastT = 0;
     drawRaf = requestAnimationFrame(frame);
   }
@@ -509,7 +468,7 @@ CLIENT_SCRIPT = r"""
       muted = !muted;
       muteBtn.classList.toggle('off', muted);
       muteBtn.setAttribute('aria-label', muted ? '取消静音' : '静音');
-      if (micStream) micStream.getTracks().forEach(function (t) { t.enabled = !muted; });
+      if (micStream) micStream.getTracks().forEach(function (tr) { tr.enabled = !muted; });
     };
     window.addEventListener('resize', fitLater);
     if (window.visualViewport) window.visualViewport.addEventListener('resize', fitLater);
@@ -521,7 +480,26 @@ CLIENT_SCRIPT = r"""
       .catch(function () {});
   }
 
-  /* ═══ 音频分析：四通道频率驱动视觉，同时判断你说完了没 ═══════ */
+  /* ═══ 音频分析 ═══════════════════════════════════════════════ */
+  function bands(node, wave, fq) {
+    node.getByteTimeDomainData(wave);
+    var sum = 0;
+    for (var i = 0; i < wave.length; i++) {
+      var v = (wave[i] - 128) / 128;
+      sum += v * v;
+    }
+    node.getByteFrequencyData(fq);
+    var n = fq.length, b1 = (n * .08) | 0, b2 = (n * .32) | 0;
+    var s1 = 0, s2 = 0, s3 = 0;
+    for (var j = 0; j < b1; j++) s1 += fq[j];
+    for (var j2 = b1; j2 < b2; j2++) s2 += fq[j2];
+    for (var j3 = b2; j3 < n; j3++) s3 += fq[j3];
+    A.lo = A.lo * .7 + (s1 / b1 / 255) * .3;
+    A.mid = A.mid * .7 + (s2 / (b2 - b1) / 255) * .3;
+    A.hi = A.hi * .7 + (s3 / (n - b2) / 255) * .3;
+    return Math.sqrt(sum / wave.length);
+  }
+
   function startMeter() {
     if (!micStream || !window.AudioContext || an) return;
     try {
@@ -535,25 +513,10 @@ CLIENT_SCRIPT = r"""
       var loop = function () {
         if (!an) return;
         meterRaf = requestAnimationFrame(loop);
-        an.getByteTimeDomainData(wave);
-        var sum = 0;
-        for (var i = 0; i < wave.length; i++) {
-          var v = (wave[i] - 128) / 128;
-          sum += v * v;
-        }
-        var lvl = Math.sqrt(sum / wave.length);
-
-        // 频谱分三段：低 / 中 / 高，各驱动不同参数
-        an.getByteFrequencyData(freqArr);
-        var n = freqArr.length, b1 = (n * .08) | 0, b2 = (n * .32) | 0;
-        var s1 = 0, s2 = 0, s3 = 0;
-        for (var j = 0; j < b1; j++) s1 += freqArr[j];
-        for (var j2 = b1; j2 < b2; j2++) s2 += freqArr[j2];
-        for (var j3 = b2; j3 < n; j3++) s3 += freqArr[j3];
-        A.lo = A.lo * .7 + (s1 / b1 / 255) * .3;
-        A.mid = A.mid * .7 + (s2 / (b2 - b1) / 255) * .3;
-        A.hi = A.hi * .7 + (s3 / (n - b2) / 255) * .3;
-        A.all = A.all * .72 + lvl * .28;
+        // thinking / speaking 时麦克风不驱动画面：thinking 要"自己动"，
+        // speaking 那会儿麦克风收到的是喇叭回声
+        var lvl = bands(an, wave, freqArr);
+        if (phase === 'listening' || phase === 'idle') A.all = A.all * .72 + lvl * .28;
 
         if (phase !== 'listening' || muted) return;
         var now = Date.now();
@@ -571,10 +534,11 @@ CLIENT_SCRIPT = r"""
     if (meterRaf) { cancelAnimationFrame(meterRaf); meterRaf = 0; }
     an = null;
     A.lo = A.mid = A.hi = A.all = 0;
+    loud = 0;
     if (ac) { try { ac.close(); } catch (e) {} ac = null; }
   }
 
-  /* 模型说话时让球也跟着动：接一路分析器到播放器上 */
+  /* 模型说话时让形状跟着它的声音跳：接一路分析器到播放器上 */
   var pAn = null, pRaf = 0;
   function watchPlayer() {
     if (!ac || pAn || !player) return;
@@ -582,7 +546,7 @@ CLIENT_SCRIPT = r"""
       var src = ac.createMediaElementSource(player);
       pAn = ac.createAnalyser();
       pAn.fftSize = 1024;
-      pAn.smoothingTimeConstant = 0.7;
+      pAn.smoothingTimeConstant = 0.66;
       src.connect(pAn);
       pAn.connect(ac.destination);
       var wave = new Uint8Array(pAn.fftSize);
@@ -590,22 +554,7 @@ CLIENT_SCRIPT = r"""
       var loop = function () {
         pRaf = requestAnimationFrame(loop);
         if (!pAn || phase !== 'speaking') return;
-        pAn.getByteTimeDomainData(wave);
-        var sum = 0;
-        for (var i = 0; i < wave.length; i++) {
-          var v = (wave[i] - 128) / 128;
-          sum += v * v;
-        }
-        pAn.getByteFrequencyData(fq);
-        var n = fq.length, b1 = (n * .08) | 0, b2 = (n * .32) | 0;
-        var s1 = 0, s2 = 0, s3 = 0;
-        for (var j = 0; j < b1; j++) s1 += fq[j];
-        for (var j2 = b1; j2 < b2; j2++) s2 += fq[j2];
-        for (var j3 = b2; j3 < n; j3++) s3 += fq[j3];
-        A.lo = A.lo * .7 + (s1 / b1 / 255) * .3;
-        A.mid = A.mid * .7 + (s2 / (b2 - b1) / 255) * .3;
-        A.hi = A.hi * .7 + (s3 / (n - b2) / 255) * .3;
-        A.all = A.all * .7 + Math.sqrt(sum / wave.length) * .3;
+        A.all = A.all * .68 + bands(pAn, wave, fq) * .32;
       };
       pRaf = requestAnimationFrame(loop);
     } catch (e) { pAn = null; }   // 有的浏览器不给接，那就只按时间驱动
@@ -693,7 +642,7 @@ CLIENT_SCRIPT = r"""
 
   async function sendTurn(blob, mime, dur) {
     setPhase('thinking');
-    var t = Date.now();
+    var t0 = Date.now();
     var fd = new FormData();
     fd.append('file', blob, 'voice' + extOf(mime));
     fd.append('duration', String(dur));
@@ -704,12 +653,10 @@ CLIENT_SCRIPT = r"""
         var d = await up.json();
         if (d.message) line = d.message;
       }
-      var ms = Date.now() - t;
-      signal(ms < 500 ? 4 : ms < 1200 ? 3 : ms < 2600 ? 2 : 1);
+      var ms = Date.now() - t0;
+      signal(ms < 900 ? 4 : ms < 2000 ? 3 : ms < 4000 ? 2 : 1);
     } catch (e) { signal(1); }
 
-    // 手机自带的听写在通话里不跑（它跟录音抢同一个音频会话），
-    // 所以这行多半只有时长。模型看得懂 [通话中] 那行，会问回来。
     var mine = line.replace(/^\[voice[^\]]*\]\s*/, '');
     say(mine || '说了 ' + fmt(dur), true);
 
@@ -780,7 +727,6 @@ CLIENT_SCRIPT = r"""
     if (!player) {
       player = new Audio();
       player.setAttribute('playsinline', '');
-      player.crossOrigin = 'anonymous';
     }
     try {
       player.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
@@ -794,8 +740,7 @@ CLIENT_SCRIPT = r"""
     turns = 0;
     chars = 0;
     muted = false;
-    silence = 0;
-    cumAudio = 0;
+    loud = 0;
     dialT0 = Date.now();
     muteBtn.classList.remove('off');
     meta();
@@ -828,7 +773,7 @@ CLIENT_SCRIPT = r"""
     rec = null;
     chunks = [];
     if (micStream) {
-      micStream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+      micStream.getTracks().forEach(function (tr) { try { tr.stop(); } catch (e) {} });
       micStream = null;
     }
     if (player) { try { player.pause(); } catch (e) {} }
@@ -861,13 +806,7 @@ CLIENT_SCRIPT = r"""
   window.dwellCall = {
     dial: dial,
     hang: hang,
-    theme: function (name) {
-      if (!THEMES[name]) return;
-      TH = THEMES[name];
-      layers = [];          // 流体那三层跟着重建
-      buildLayers();
-    },
-    // 调参时把球定在某态：dwellCall.preview('speaking')
+    // 调参时把形态定住：dwellCall.preview('thinking')
     preview: function (p) {
       if (!SPEC[p]) return;
       build();
@@ -878,7 +817,8 @@ CLIENT_SCRIPT = r"""
       setPhase(p);
     },
     spec: SPEC,
-    themes: THEMES,
+    shapes: SHAPES,
+    field: FIELD,
     audio: A
   };
 
