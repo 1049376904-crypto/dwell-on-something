@@ -1,19 +1,19 @@
 """dwell 语音通话：对讲机模式。
 
-点电话进全屏，球跟着你的音量涨落；你停下来一秒半就算说完，自动上传、
+点电话进全屏，球跟着你的声音活；你停下来一秒半就算说完，自动上传、
 自动发出去、模型回话自动念出来、念完自动接着听。整通电话不用碰屏幕。
 
 ⚠️ 这是**回合制**，不是 ChatGPT 那种实时双向流。一轮的等待是：
 听写 ~1s + 模型写完 2~4s + ElevenLabs 合成 1~3s，加网络大概 5~8 秒，
-中间打断不了。要做到真通话得换整条底层（流式输出 + 边出字边分句合成 +
-边说边转写 + 打断处理），那是另一件事。
+中间打断不了。要做到真通话得换整条底层，那是另一件事。
 
 ⚠️ 每一句都要合成，ElevenLabs 按字符收钱。界面上那个计数就是这通电话
 花掉的字符数，别当装饰看。
 
-白底黑球。黑球在亮底上不能靠发光立体（那样会像一个洞），靠的是
-镜面高光 + 底缘反光 + 落地投影。球是 Canvas 2D 画的，四态之间弹簧插值。
-改主题只动 THEMES；调参时 `dwellCall.preview('speaking')` 能把球定住看。
+球的实现见下面 CLIENT_SCRIPT 里的注释：阻尼弹簧 + 三层噪声流场 +
+音频驱动坐标扭曲。白底黑球，内部流体是极克制的灰度层次。
+调参：`dwellCall.preview('speaking')` 把球定在某态，`dwellCall.spec`
+是那张参数表，改完立刻生效。
 
 删掉 run.py 里那一行就完全没有这个功能，别的都不受影响。
 """
@@ -23,72 +23,62 @@ from voice_feature import _voice_token
 CLIENT_SCRIPT = r"""
 <style>
 #vcall{position:fixed;inset:0;z-index:9999;display:none;
-  background:
-    radial-gradient(125% 95% at 50% 6%, #faf9f7 0%, #f2f0ec 42%, #e7e5df 100%);
-  color:#1b1b20;-webkit-user-select:none;user-select:none;
+  background:radial-gradient(125% 95% at 50% 4%, #fbfaf8 0%, #f3f1ed 44%, #e8e6e0 100%);
+  color:#15151a;-webkit-user-select:none;user-select:none;
   -webkit-font-smoothing:antialiased;
   font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',sans-serif}
 #vcall.on{display:grid;grid-template-rows:auto 1fr auto}
 
-/* 顶部：细小的胶囊标签，稀疏地排一行 */
 .vc-top{display:flex;justify-content:center;align-items:center;gap:8px;flex-wrap:wrap;
   padding:calc(env(safe-area-inset-top,0px) + 22px) 20px 0}
-.vc-tag{display:inline-flex;align-items:center;gap:6px;
-  padding:5px 11px;border-radius:999px;
-  background:rgba(255,255,255,.55);border:1px solid rgba(24,24,28,.07);
+.vc-tag{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;
+  background:rgba(255,255,255,.5);border:1px solid rgba(21,21,26,.06);
   backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
   font-size:clamp(9.5px,2.4vw,11px);letter-spacing:.13em;text-transform:uppercase;
-  color:rgba(27,27,32,.42);font-variant-numeric:tabular-nums;white-space:nowrap}
+  color:rgba(21,21,26,.4);font-variant-numeric:tabular-nums;white-space:nowrap}
 .vc-dot{width:5px;height:5px;border-radius:50%;background:#3f9e74;flex:0 0 auto;
-  transition:background .5s ease}
-#vcall.thinking .vc-dot{background:#b08d3c}
-#vcall.speaking .vc-dot{background:#1b1b20}
+  transition:background .6s ease}
+#vcall.thinking .vc-dot{background:#ab8836}
+#vcall.speaking .vc-dot{background:#15151a}
 .vc-bars{display:inline-flex;align-items:flex-end;gap:1.5px;height:9px}
-.vc-bars i{width:2px;background:currentColor;opacity:.2;border-radius:1px}
+.vc-bars i{width:2px;background:currentColor;opacity:.18;border-radius:1px}
 .vc-bars i:nth-child(1){height:3px}
 .vc-bars i:nth-child(2){height:5px}
 .vc-bars i:nth-child(3){height:7px}
 .vc-bars i:nth-child(4){height:9px}
 .vc-bars.s1 i:nth-child(1),.vc-bars.s2 i:nth-child(-n+2),
-.vc-bars.s3 i:nth-child(-n+3),.vc-bars.s4 i{opacity:.72}
+.vc-bars.s3 i:nth-child(-n+3),.vc-bars.s4 i{opacity:.68}
 
-/* 中间：球 + 字幕，慷慨留白 */
 .vc-mid{display:flex;flex-direction:column;align-items:center;justify-content:center;
-  gap:clamp(16px,4vh,36px);min-height:0;padding:0 20px}
+  gap:clamp(14px,3.6vh,34px);min-height:0;padding:0 20px}
 .vc-stage{position:relative;flex:0 0 auto;display:block}
 .vc-stage canvas{display:block;width:100%;height:100%}
 
 .vc-cap{text-align:center;max-width:min(74vw,430px);min-height:3.4em}
 .vc-state{font-size:clamp(10px,2.6vw,11.5px);letter-spacing:.2em;text-transform:uppercase;
-  color:rgba(27,27,32,.3);margin-bottom:11px;
-  transition:color .5s cubic-bezier(.22,.61,.36,1)}
-#vcall.speaking .vc-state{color:rgba(27,27,32,.58)}
+  color:rgba(21,21,26,.28);margin-bottom:11px;
+  transition:color .6s cubic-bezier(.22,.61,.36,1)}
+#vcall.speaking .vc-state{color:rgba(21,21,26,.56)}
 .vc-said{font-size:clamp(14px,3.7vw,16.5px);line-height:1.85;font-weight:300;
-  letter-spacing:.028em;color:rgba(27,27,32,.8);word-break:break-word}
+  letter-spacing:.028em;color:rgba(21,21,26,.8);word-break:break-word}
 .vc-said b{font-weight:300;opacity:0;animation:vcin .5s cubic-bezier(.22,.61,.36,1) forwards}
 @keyframes vcin{to{opacity:1}}
-.vc-said.dim{color:rgba(27,27,32,.34)}
+.vc-said.dim{color:rgba(21,21,26,.32)}
 
-/* 底部：两颗玻璃按钮 */
-.vc-btns{display:flex;justify-content:center;align-items:center;
-  gap:clamp(22px,7vw,34px);
-  padding:0 20px calc(env(safe-area-inset-bottom,0px) + clamp(30px,6vh,54px))}
+.vc-btns{display:flex;justify-content:center;align-items:center;gap:clamp(22px,7vw,34px);
+  padding:0 20px calc(env(safe-area-inset-bottom,0px) + clamp(28px,5.5vh,50px))}
 .vc-btn{-webkit-appearance:none;appearance:none;
-  width:clamp(56px,15vw,64px);height:clamp(56px,15vw,64px);
-  border-radius:50%;cursor:pointer;
+  width:clamp(56px,15vw,64px);height:clamp(56px,15vw,64px);border-radius:50%;cursor:pointer;
   display:flex;align-items:center;justify-content:center;
-  color:#1b1b20;background:rgba(255,255,255,.66);
-  border:1px solid rgba(24,24,28,.08);
-  box-shadow:0 3px 14px rgba(24,24,28,.06);
+  color:#15151a;background:rgba(255,255,255,.66);border:1px solid rgba(21,21,26,.07);
+  box-shadow:0 3px 14px rgba(21,21,26,.055);
   backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
-  transition:transform .42s cubic-bezier(.34,1.42,.5,1),
-             background .3s ease,opacity .3s ease}
+  transition:transform .42s cubic-bezier(.34,1.42,.5,1),background .3s ease,opacity .3s ease}
 .vc-btn:active{transform:scale(.9)}
-.vc-btn:focus-visible{outline:2px solid rgba(27,27,32,.5);outline-offset:3px}
+.vc-btn:focus-visible{outline:2px solid rgba(21,21,26,.45);outline-offset:3px}
 .vc-btn.mute.off{opacity:.4;background:rgba(255,255,255,.4)}
-.vc-btn.hang{background:#b8433b;border-color:rgba(24,24,28,.06);color:#fdfbf8;
-  box-shadow:0 5px 20px rgba(184,67,59,.26)}
-
+.vc-btn.hang{background:#b4413a;border-color:rgba(21,21,26,.05);color:#fdfbf8;
+  box-shadow:0 5px 20px rgba(180,65,58,.24)}
 #vcBtn{display:inline-flex;align-items:center;justify-content:center}
 
 @media (prefers-reduced-motion:reduce){
@@ -102,40 +92,43 @@ CLIENT_SCRIPT = r"""
   var TOKEN = '__VOICE_TOKEN__';
   var CALL_HINT = '[通话中]';
 
-  /* ── 主题：改色只动这里 ─────────────────────────────────────────
-     hue 反光的色相偏向，body 球体明度基准，rim 底缘反光强度，
-     shadow 投影浓度。黑球在亮底上全靠 rim 和 shadow 立住。 */
+  /* ═══ 主题：黑球在白底上，颜色只是外壳 ═══════════════════════
+     main 主色，low/mid/high 是内部流体那三层的灰度 —— 差异故意做得
+     极小，不仔细看看不见，但能感觉到里面在动。调大就不黑了。 */
   var THEMES = {
-    ink:   { hue: 232, sat: 9,  body: 13, rim: 0.30, shadow: 0.20 },
-    slate: { hue: 214, sat: 15, body: 16, rim: 0.36, shadow: 0.18 }
+    ink: {
+      main: [10, 10, 12], low: [22, 22, 27], mid: [34, 33, 41], high: [52, 50, 62],
+      hue: 236, halo: 0.062, shade: 0.20
+    },
+    slate: {
+      main: [10, 12, 15], low: [21, 25, 31], mid: [31, 37, 46], high: [46, 55, 68],
+      hue: 212, halo: 0.058, shade: 0.185
+    }
   };
   var TH = THEMES.ink;
 
-  /* ── 状态机：每态一组目标值，帧间弹簧插值，不许生硬跳变 ───────
-     scale 基准大小，breathe 呼吸幅度，period 周期，lift 投影扩散，
-     rim 反光倍率，emit 粒子量，ripple 涟漪开关，jitter 抖动，
-     spin 高光游走速度。 */
+  /* ═══ 状态机 ═══════════════════════════════════════════════════
+     scale 目标大小，k/d 弹簧刚度与阻尼，flow 流速，warp 形变幅度,
+     tension 边缘张力（越低越"液体"），lum 内部流体亮度，
+     swirl 漩涡强度，halo 辉光倍率。 */
   var SPEC = {
-    idle:      { scale: 1.00, breathe: .038, period: 5500, lift: .30, rim: .70,
-                 emit: .10, ripple: 0, jitter: 0, spin: .10, label: 'Idle' },
-    listening: { scale: 0.945, breathe: .006, period: 4200, lift: .22, rim: .88,
-                 emit: .38, ripple: 1, jitter: 0, spin: .16, label: 'Listening' },
-    thinking:  { scale: 0.985, breathe: .010, period: 1500, lift: .34, rim: .80,
-                 emit: .28, ripple: 0, jitter: .9, spin: .74, label: 'Thinking' },
-    speaking:  { scale: 1.080, breathe: .088, period: 1150, lift: 1.0, rim: 1.0,
-                 emit: 1.0, ripple: 0, jitter: 0, spin: .30, label: 'Speaking' }
+    idle:      { scale: 1.00, k: 42,  d: 7.4, flow: .16, warp: .022, tension: .82,
+                 lum: .52, swirl: .04, halo: .70, label: 'Idle' },
+    listening: { scale: 0.94, k: 78,  d: 8.2, flow: .40, warp: .034, tension: .74,
+                 lum: .78, swirl: .10, halo: .88, label: 'Listening' },
+    thinking:  { scale: 0.97, k: 120, d: 6.2, flow: .82, warp: .046, tension: .70,
+                 lum: .88, swirl: 1.0, halo: .80, label: 'Thinking' },
+    speaking:  { scale: 1.09, k: 165, d: 5.4, flow: 1.0, warp: .090, tension: .52,
+                 lum: 1.0,  swirl: .18, halo: 1.0, label: 'Speaking' }
   };
 
   var box, cv, ctx, stage, stateEl, saidEl, metaEl, timeEl, barsEl, muteBtn, modelEl;
   var live = false, phase = 'idle', muted = false;
   var micStream = null, rec = null, chunks = [], recT0 = 0;
-  var ac = null, an = null, meterRaf = 0, silentSince = 0, spoke = false;
+  var ac = null, an = null, freqArr = null, meterRaf = 0, silentSince = 0, spoke = false;
   var player = null, chars = 0, turns = 0, stopAll = false, dialT0 = 0;
 
-  var MIN_MS = 700;      // 太短的当噪音扔掉
-  var MAX_MS = 30000;    // 一轮封顶，别让它录到天亮
-  var HUSH_MS = 1400;    // 安静这么久就算说完了
-  var HUSH_LVL = 0.055;  // 低于这个音量算安静
+  var MIN_MS = 700, MAX_MS = 30000, HUSH_MS = 1400, HUSH_LVL = 0.055;
 
   var slow = false;
   try { slow = matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
@@ -150,35 +143,109 @@ CLIENT_SCRIPT = r"""
     return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
   }
 
-  /* ══ 渲染层 ═══════════════════════════════════════════════════ */
-  var V = { scale: 1, lift: .3, rim: .7, emit: .1, ripple: 0,
-            spin: .1, level: 0, drift: 0 };
-  var parts = [], ripples = [], noiseTile = null;
-  var drawRaf = 0, t0 = 0, lastRip = 0, W = 0, H = 0, R = 0, DPR = 1;
-
-  function lerp(a, b, k) { return a + (b - a) * k; }
-
-  /* 噪点：预渲染一小块反复铺，不每帧算随机数。
-     亮底上要用 multiply 才压得出颗粒，overlay 会被冲掉。 */
-  function buildNoise() {
-    var n = document.createElement('canvas');
-    n.width = n.height = 96;
-    var c = n.getContext('2d');
-    var img = c.createImageData(96, 96);
-    for (var i = 0; i < img.data.length; i += 4) {
-      var v = 190 + (Math.random() - .5) * 130;
-      img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
-      img.data[i + 3] = 255;
-    }
-    c.putImageData(img, 0, 0);
-    noiseTile = n;
+  /* ═══════════════════════════════════════════════════════════════
+     阻尼谐振弹簧。lerp 永远追不过头，所以显得机械；弹簧会过冲目标
+     再回弹 settling，重量感就是从这儿来的。
+       a = (target - x) * k - v * d
+     k 刚度（多急），d 阻尼（多快停）。d 小了会晃很久，大了就没弹性。
+     ═════════════════════════════════════════════════════════════ */
+  function Spring(x0, k, d) {
+    this.x = x0; this.v = 0; this.k = k; this.d = d;
   }
+  Spring.prototype.to = function (target, dt) {
+    // dt 钳在 32ms：切后台回来那一下 dt 会很大，不钳的话直接炸开
+    dt = Math.min(dt, 0.032);
+    var a = (target - this.x) * this.k - this.v * this.d;
+    this.v += a * dt;
+    this.x += this.v * dt;
+    return this.x;
+  };
+  Spring.prototype.tune = function (k, d) { this.k = k; this.d = d; };
+
+  /* ═══ 三层 FBM 噪声：离屏预渲染，主循环只采样合成 ═══════════════
+     值噪声 + 分形布朗运动。三层频率不同、流速不同，叠起来才是"翻涌"，
+     单层只会看着像整片平移。 */
+  var NZ = 168;                       // 每层 tile 边长
+  var layers = [];                    // 三张离屏 canvas
+
+  function valueNoise(seed) {
+    var g = new Float32Array(NZ * NZ);
+    var s = seed * 9301;
+    function rnd() { s = (s * 9301 + 49297) % 233280; return s / 233280; }
+    var grid = 12, gv = [];
+    for (var i = 0; i <= grid; i++) {
+      gv[i] = [];
+      for (var j = 0; j <= grid; j++) gv[i][j] = rnd();
+    }
+    function smooth(t) { return t * t * (3 - 2 * t); }
+    function at(gx, gy) {                // 双线性 + 平滑插值
+      var x = gx * grid, y = gy * grid;
+      var xi = Math.floor(x) % grid, yi = Math.floor(y) % grid;
+      var xf = smooth(x - Math.floor(x)), yf = smooth(y - Math.floor(y));
+      var a = gv[xi][yi], b = gv[xi + 1][yi], c = gv[xi][yi + 1], dd = gv[xi + 1][yi + 1];
+      return (a * (1 - xf) + b * xf) * (1 - yf) + (c * (1 - xf) + dd * xf) * yf;
+    }
+    for (var y2 = 0; y2 < NZ; y2++) {
+      for (var x2 = 0; x2 < NZ; x2++) {
+        // FBM：四个八度，振幅逐层减半
+        var v = 0, amp = .5, f = 1;
+        for (var o = 0; o < 4; o++) {
+          v += at((x2 / NZ * f) % 1, (y2 / NZ * f) % 1) * amp;
+          amp *= .5; f *= 2;
+        }
+        g[y2 * NZ + x2] = v;
+      }
+    }
+    return g;
+  }
+
+  function buildLayers() {
+    if (layers.length) return;
+    var cfg = [
+      { seed: 3,  lo: TH.low,  a: 1.00 },
+      { seed: 17, lo: TH.mid,  a: 0.72 },
+      { seed: 41, lo: TH.high, a: 0.46 }
+    ];
+    for (var n = 0; n < 3; n++) {
+      var g = valueNoise(cfg[n].seed);
+      var c = document.createElement('canvas');
+      c.width = c.height = NZ;
+      var cc = c.getContext('2d');
+      var img = cc.createImageData(NZ, NZ);
+      var base = TH.main, tip = cfg[n].lo;
+      for (var i = 0, p = 0; i < g.length; i++, p += 4) {
+        // 对比度拉一把，中间调压掉，只留丝状的亮脉
+        var v = Math.min(1, Math.max(0, (g[i] - .28) * 2.1));
+        v = v * v * (3 - 2 * v);
+        img.data[p]     = base[0] + (tip[0] - base[0]) * v;
+        img.data[p + 1] = base[1] + (tip[1] - base[1]) * v;
+        img.data[p + 2] = base[2] + (tip[2] - base[2]) * v;
+        img.data[p + 3] = Math.round(255 * v * cfg[n].a);
+      }
+      cc.putImageData(img, 0, 0);
+      layers.push(c);
+    }
+  }
+
+  /* ═══ 渲染状态 ═══════════════════════════════════════════════ */
+  var sScale = new Spring(1, 42, 7.4);      // 大小
+  var sWarp = new Spring(0, 60, 9);         // 形变幅度
+  var sTens = new Spring(.82, 50, 9);       // 边缘张力
+  var sLum = new Spring(.52, 40, 9);        // 内部亮度
+  var sSwirl = new Spring(0, 44, 9);        // 漩涡
+  var sHalo = new Spring(.7, 36, 9);        // 辉光
+  var sFlow = new Spring(.16, 30, 8);       // 流速
+
+  // 四通道频率：低 / 中 / 高 / 总能量。分别驱动不同视觉参数
+  var A = { lo: 0, mid: 0, hi: 0, all: 0 };
+  var cumAudio = 0;                         // 累计音频能量，扭曲噪声坐标
+  var flowT = 0, waddleT = 0, silence = 0;
+  var drawRaf = 0, lastT = 0, W = 0, H = 0, R = 0, DPR = 1;
+  var SAMPLES = 128;                        // 边缘采样点数
 
   function fit() {
     if (!cv || !stage) return;
-    var vw = window.innerWidth, vh = window.innerHeight;
-    // 球占屏高 40~50%；画布比球大一圈，留给投影和粒子
-    var side = Math.min(vw * 0.92, vh * 0.56, 560);
+    var side = Math.min(window.innerWidth * 0.92, window.innerHeight * 0.56, 560);
     stage.style.width = side + 'px';
     stage.style.height = side + 'px';
     DPR = Math.min(window.devicePixelRatio || 1, 2.5);
@@ -188,182 +255,160 @@ CLIENT_SCRIPT = r"""
     R = Math.min(W, H) * 0.268;
   }
   var fitTimer = null;
-  function fitLater() {                     // 节流 resize
+  function fitLater() {
     if (fitTimer) return;
     fitTimer = setTimeout(function () { fitTimer = null; fit(); }, 140);
   }
 
-  function emitParticle(now) {
-    parts.push({
-      a: Math.random() * Math.PI * 2,
-      r: R * (0.97 + Math.random() * 0.08),
-      vr: R * (0.0020 + Math.random() * 0.0068),
-      va: (Math.random() - .5) * 0.0040,
-      sz: DPR * (0.45 + Math.random() * 1.35),
-      born: now,
-      life: 1200 + Math.random() * 2200
-    });
+  /* 液体边缘：不画正圆，r(θ) 三条不同频率的正弦叠加。
+     speaking 时幅度顶上去就是表面张力那种融化感。
+     （Canvas 2D 没有 SDF，opSmoothUnion 做不了，这是同等观感的替代） */
+  function edge(th, warp, tens, t) {
+    var w = warp * (0.55 + A.all * 1.5);
+    return 1
+      + Math.sin(th * 3 + t * 0.9 + cumAudio * 0.6) * w * (1.15 - tens * .5)
+      + Math.sin(th * 5 - t * 1.35 + cumAudio * 0.35) * w * 0.62
+      + Math.sin(th * 2 + t * 0.52) * w * 0.48 * (1 + A.lo * 1.2);
   }
 
   function frame(now) {
     drawRaf = requestAnimationFrame(frame);
     if (!ctx || !live) return;
 
+    var dt = lastT ? (now - lastT) / 1000 : 0.016;
+    lastT = now;
     var s = SPEC[phase] || SPEC.idle;
-    var k = slow ? 1 : 0.075;                  // 弹簧插值系数
-    var t = now - t0;
 
-    // 呼吸：正弦叠在基准 scale 上；listening 时改由音量驱动
-    var want = s.scale + Math.sin(t / s.period * Math.PI * 2) * s.breathe;
-    if (phase === 'listening') want = s.scale + Math.min(0.24, V.level * 1.8);
-    if (phase === 'thinking' && !slow) want += Math.sin(t / 92) * 0.006 * s.jitter;
+    sScale.tune(s.k, s.d);
+    var target = s.scale;
+    if (phase === 'listening') target = s.scale + Math.min(0.22, A.all * 1.5);
+    if (phase === 'speaking') target = s.scale + A.all * 0.05;
 
-    V.scale = lerp(V.scale, want, k);
-    V.lift = lerp(V.lift, s.lift, k * .8);
-    V.rim = lerp(V.rim, s.rim, k * .8);
-    V.emit = lerp(V.emit, s.emit, k);
-    V.ripple = lerp(V.ripple, s.ripple, k);
-    V.spin = lerp(V.spin, s.spin, k);
-    V.drift += V.spin * .05;
+    var sc = sScale.to(target, dt);
+    var warp = sWarp.to(s.warp, dt);
+    var tens = sTens.to(s.tension, dt);
+    var lum = sLum.to(s.lum, dt);
+    var swirl = sSwirl.to(s.swirl, dt);
+    var halo = sHalo.to(s.halo, dt);
+    var flow = sFlow.to(s.flow, dt);
 
-    var cx = W / 2, cy = H / 2, r = R * V.scale;
-    var hue = TH.hue, sat = TH.sat;
+    // 累计音频能量：说得响流体转得急，安静下来慢慢淌
+    cumAudio += (A.all * 2.6 + 0.12) * flow * dt * 4;
+    flowT += dt * (0.24 + flow * 0.75 + A.mid * 0.9);
 
+    // Waddle：安静久了微微摇摆，像活物待着而不是完全静止
+    if (phase === 'idle' || (phase === 'listening' && A.all < 0.02)) {
+      silence = Math.min(1, silence + dt * 0.55);
+    } else {
+      silence = Math.max(0, silence - dt * 2.2);
+    }
+    waddleT += dt;
+    var wx = Math.sin(waddleT * 0.72) * R * 0.020 * silence;
+    var wy = Math.sin(waddleT * 0.47 + 1.1) * R * 0.014 * silence;
+
+    var cx = W / 2 + wx, cy = H / 2 + wy, r = R * sc;
     ctx.clearRect(0, 0, W, H);
 
-    // ── 落地投影：球正下方一片椭圆，speaking 时扩散变软
-    var sy = cy + r * (1.24 + V.lift * .1);
-    var sw = r * (1.05 + V.lift * .5);
-    var sh = r * (0.17 + V.lift * .11);
-    var gs = ctx.createRadialGradient(cx, sy, 0, cx, sy, sw);
-    gs.addColorStop(0, 'hsla(' + hue + ',' + sat + '%,14%,' +
-      (TH.shadow * (1 - V.lift * .34)).toFixed(3) + ')');
-    gs.addColorStop(0.55, 'hsla(' + hue + ',' + sat + '%,16%,' +
-      (TH.shadow * .3 * (1 - V.lift * .3)).toFixed(3) + ')');
-    gs.addColorStop(1, 'hsla(' + hue + ',' + sat + '%,18%,0)');
+    // ── 落地投影
+    var shY = cy + r * 1.28, shW = r * (1.02 + (halo - .7) * 1.1), shH = shW * 0.17;
+    var gs = ctx.createRadialGradient(cx, shY, 0, cx, shY, shW);
+    gs.addColorStop(0, 'rgba(21,21,26,' + (TH.shade * (1.15 - halo * .35)).toFixed(3) + ')');
+    gs.addColorStop(0.6, 'rgba(21,21,26,' + (TH.shade * .26).toFixed(3) + ')');
+    gs.addColorStop(1, 'rgba(21,21,26,0)');
     ctx.save();
-    ctx.translate(cx, sy);
-    ctx.scale(1, sh / sw);
-    ctx.translate(-cx, -sy);
-    ctx.fillStyle = gs;
+    ctx.translate(cx, shY);
+    ctx.scale(1, shH / shW);
     ctx.beginPath();
-    ctx.arc(cx, sy, sw, 0, Math.PI * 2);
+    ctx.arc(0, 0, shW, 0, Math.PI * 2);
+    ctx.fillStyle = gs;
     ctx.fill();
     ctx.restore();
 
-    // ── 涟漪：listening 时一圈圈往外扩（亮底上是细深色环）
-    if (V.ripple > .02 && !slow) {
-      if (phase === 'listening' && now - lastRip > 780) {
-        ripples.push(now);
-        lastRip = now;
-      }
-      for (var i = ripples.length - 1; i >= 0; i--) {
-        var age = (now - ripples[i]) / 2600;
-        if (age >= 1) { ripples.splice(i, 1); continue; }
-        ctx.beginPath();
-        ctx.arc(cx, cy, r * (1 + age * 1.02), 0, Math.PI * 2);
-        ctx.strokeStyle = 'hsla(' + hue + ',' + sat + '%,22%,' +
-          ((1 - age) * 0.13 * V.ripple).toFixed(3) + ')';
-        ctx.lineWidth = DPR * (1 - age * .5);
-        ctx.stroke();
-      }
-    }
+    // ── 辉光：白底上是极淡的黑色晕开
+    var gh = ctx.createRadialGradient(cx, cy, r * .88, cx, cy, r * 2.3);
+    gh.addColorStop(0, 'rgba(21,21,26,' + (TH.halo * halo).toFixed(4) + ')');
+    gh.addColorStop(0.5, 'rgba(21,21,26,' + (TH.halo * halo * .3).toFixed(4) + ')');
+    gh.addColorStop(1, 'rgba(21,21,26,0)');
+    ctx.fillStyle = gh;
+    ctx.fillRect(0, 0, W, H);
 
-    // ── 边缘粒子：深灰半透明，从球面往外飘
-    if (!slow) {
-      var quota = V.emit * (2.0 + V.level * 8);
-      while (quota-- > 0) if (Math.random() < .8) emitParticle(now);
-      for (var p = parts.length - 1; p >= 0; p--) {
-        var q = parts[p];
-        var a2 = (now - q.born) / q.life;
-        if (a2 >= 1) { parts.splice(p, 1); continue; }
-        q.r += q.vr * (1 + V.level * 2.2);
-        q.a += q.va;
-        var fade = a2 < .18 ? a2 / .18 : (1 - a2) / .82;
-        ctx.beginPath();
-        ctx.arc(cx + Math.cos(q.a) * q.r * V.scale,
-                cy + Math.sin(q.a) * q.r * V.scale, q.sz, 0, Math.PI * 2);
-        ctx.fillStyle = 'hsla(' + hue + ',' + (sat + 4) + '%,20%,' +
-          (fade * 0.30 * (.5 + V.rim * .5)).toFixed(3) + ')';
-        ctx.fill();
-      }
-    }
-
-    // ── 接触阴影：球底那一小圈更浓的暗，把它压在"地面"上
-    var gc = ctx.createRadialGradient(cx, cy + r * .92, 0, cx, cy + r * .92, r * .8);
-    gc.addColorStop(0, 'hsla(' + hue + ',' + sat + '%,10%,' + (TH.shadow * .55).toFixed(3) + ')');
-    gc.addColorStop(1, 'hsla(' + hue + ',' + sat + '%,12%,0)');
-    ctx.fillStyle = gc;
+    // ── 球体轮廓：形变后的闭合曲线
     ctx.beginPath();
-    ctx.arc(cx, cy + r * .92, r * .8, 0, Math.PI * 2);
-    ctx.fill();
-
-    // ── 球体：深墨色，光源偏左上
-    var lx = cx - r * .32, ly = cy - r * .38;
-    var g1 = ctx.createRadialGradient(lx, ly, r * .05, cx, cy, r * 1.02);
-    g1.addColorStop(0, 'hsl(' + hue + ',' + sat + '%,' + (TH.body + 17) + '%)');
-    g1.addColorStop(0.36, 'hsl(' + hue + ',' + sat + '%,' + (TH.body + 4) + '%)');
-    g1.addColorStop(0.78, 'hsl(' + hue + ',' + (sat + 3) + '%,' + Math.max(4, TH.body - 6) + '%)');
-    g1.addColorStop(1, 'hsl(' + hue + ',' + (sat + 5) + '%,' + Math.max(3, TH.body - 9) + '%)');
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fillStyle = g1;
-    ctx.fill();
+    for (var i = 0; i <= SAMPLES; i++) {
+      var th = i / SAMPLES * Math.PI * 2;
+      var rr = r * edge(th, slow ? 0 : warp, tens, flowT);
+      var x = cx + Math.cos(th) * rr, y = cy + Math.sin(th) * rr;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
 
     ctx.save();
     ctx.clip();
 
-    // 底缘反光：白色环境往上打的 bounce light。
-    // 这道弯月是黑球在亮底上"有体积"的关键，没有它就是个洞。
-    var by = cy + r * .58;
-    var g2 = ctx.createRadialGradient(cx + r * .1, by, r * .04, cx + r * .1, by, r * .92);
-    g2.addColorStop(0, 'hsla(' + (hue - 8) + ',' + (sat + 8) + '%,72%,' +
-      (0.30 * V.rim).toFixed(3) + ')');
-    g2.addColorStop(0.42, 'hsla(' + (hue - 4) + ',' + (sat + 6) + '%,56%,' +
-      (0.10 * V.rim).toFixed(3) + ')');
-    g2.addColorStop(1, 'hsla(' + hue + ',' + sat + '%,40%,0)');
-    ctx.fillStyle = g2;
-    ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
+    // 球体底色：光源偏左上
+    var lx = cx - r * .30, ly = cy - r * .36;
+    var g1 = ctx.createRadialGradient(lx, ly, r * .05, cx, cy, r * 1.14);
+    var m = TH.main;
+    g1.addColorStop(0, 'rgb(' + (m[0] + 26) + ',' + (m[1] + 25) + ',' + (m[2] + 30) + ')');
+    g1.addColorStop(0.42, 'rgb(' + (m[0] + 9) + ',' + (m[1] + 9) + ',' + (m[2] + 12) + ')');
+    g1.addColorStop(1, 'rgb(' + m[0] + ',' + m[1] + ',' + m[2] + ')');
+    ctx.fillStyle = g1;
+    ctx.fillRect(cx - r * 1.3, cy - r * 1.3, r * 2.6, r * 2.6);
 
-    // 镜面高光：一片冷调折射，不是塑料球那种小圆点
-    var g3 = ctx.createRadialGradient(lx, ly, 0, lx, ly, r * .62);
-    g3.addColorStop(0, 'hsla(' + (hue + 6) + ',' + (sat + 10) + '%,90%,' +
-      (0.28 + V.rim * .14).toFixed(3) + ')');
-    g3.addColorStop(0.38, 'hsla(' + (hue + 4) + ',' + (sat + 6) + '%,74%,' +
-      (0.07 * V.rim).toFixed(3) + ')');
-    g3.addColorStop(1, 'hsla(' + hue + ',' + sat + '%,60%,0)');
-    ctx.fillStyle = g3;
-    ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
-
-    // thinking 时一颗光斑绕着球面游
-    if (V.spin > .3) {
-      var sa = t / 640, spr = r * .48;
-      var px2 = cx + Math.cos(sa) * spr, py2 = cy + Math.sin(sa * 1.3) * spr * .7;
-      var g4 = ctx.createRadialGradient(px2, py2, 0, px2, py2, r * .4);
-      g4.addColorStop(0, 'hsla(' + (hue + 10) + ',' + (sat + 8) + '%,80%,' +
-        (0.13 * Math.min(1, V.spin * 1.4)).toFixed(3) + ')');
-      g4.addColorStop(1, 'hsla(' + hue + ',' + sat + '%,60%,0)');
-      ctx.fillStyle = g4;
-      ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
-    }
-
-    // 噪点铺满球面：压掉渐变过于平滑的塑料感
-    if (noiseTile) {
-      ctx.globalAlpha = 0.09;
-      ctx.globalCompositeOperation = 'multiply';
-      for (var nx = cx - r; nx < cx + r; nx += 96) {
-        for (var ny = cy - r; ny < cy + r; ny += 96) ctx.drawImage(noiseTile, nx, ny);
+    // ── 三层流体：各自流速方向不同，叠起来才是翻涌
+    if (!slow && layers.length) {
+      var spd = [1.0, -0.62, 0.38], zoom = [1.0, 1.62, 2.45];
+      var alpha = [0.55, 0.42, 0.34];
+      for (var n = 0; n < 3; n++) {
+        var side = r * 2.9 / zoom[n];
+        // thinking 时坐标绕中心转，能量在漩涡里打转
+        var ang = swirl * (flowT * 0.5 + n * 0.7) + cumAudio * 0.012 * (n + 1);
+        var ox = Math.cos(flowT * spd[n] * 0.5 + n * 2.1) * r * 0.30
+               + Math.sin(cumAudio * 0.05 * (n + 1)) * r * 0.13;
+        var oy = Math.sin(flowT * spd[n] * 0.42 + n * 1.3) * r * 0.26
+               + Math.cos(cumAudio * 0.04 * (n + 1)) * r * 0.11;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(ang);
+        ctx.globalAlpha = alpha[n] * lum * (0.6 + A.all * 0.7);
+        ctx.globalCompositeOperation = n === 0 ? 'source-over' : 'lighter';
+        ctx.drawImage(layers[n], -side / 2 + ox, -side / 2 + oy, side, side);
+        ctx.restore();
       }
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = 'source-over';
     }
+
+    // 底缘反光：白底往上打的 bounce light。
+    // 这道弯月是黑球"有体积"的关键，没有它就是个洞。
+    var by = cy + r * .62;
+    var g2 = ctx.createRadialGradient(cx + r * .08, by, r * .04, cx + r * .08, by, r * .95);
+    g2.addColorStop(0, 'hsla(' + TH.hue + ',12%,74%,' + (0.26 + halo * .08).toFixed(3) + ')');
+    g2.addColorStop(0.44, 'hsla(' + TH.hue + ',10%,56%,0.085)');
+    g2.addColorStop(1, 'hsla(' + TH.hue + ',10%,44%,0)');
+    ctx.fillStyle = g2;
+    ctx.fillRect(cx - r * 1.3, cy - r * 1.3, r * 2.6, r * 2.6);
+
+    // 镜面高光：一片冷调折射，随高频轻微抖动
+    var hi = 0.26 + halo * .12 + A.hi * .10;
+    var g3 = ctx.createRadialGradient(lx, ly, 0, lx, ly, r * .60);
+    g3.addColorStop(0, 'hsla(' + (TH.hue + 6) + ',16%,92%,' + hi.toFixed(3) + ')');
+    g3.addColorStop(0.4, 'hsla(' + TH.hue + ',12%,76%,0.055)');
+    g3.addColorStop(1, 'hsla(' + TH.hue + ',10%,60%,0)');
+    ctx.fillStyle = g3;
+    ctx.fillRect(cx - r * 1.3, cy - r * 1.3, r * 2.6, r * 2.6);
+
     ctx.restore();
 
-    // 顶缘那道细亮线：勾住球和背景的边界
+    // 顶缘那道细亮线，勾住球和背景的边界
     ctx.beginPath();
-    ctx.arc(cx, cy, r - DPR * .5, Math.PI * 1.06, Math.PI * 1.94);
-    ctx.strokeStyle = 'hsla(' + (hue + 4) + ',' + (sat + 8) + '%,82%,' +
-      (0.14 + V.rim * .12).toFixed(3) + ')';
+    for (var j = 0; j <= SAMPLES; j++) {
+      var th2 = Math.PI * 1.04 + (j / SAMPLES) * Math.PI * 0.92;
+      var rr2 = r * edge(th2, slow ? 0 : warp, tens, flowT) - DPR * .5;
+      var x2 = cx + Math.cos(th2) * rr2, y2 = cy + Math.sin(th2) * rr2;
+      if (j === 0) ctx.moveTo(x2, y2); else ctx.lineTo(x2, y2);
+    }
+    ctx.strokeStyle = 'hsla(' + TH.hue + ',14%,84%,' + (0.13 + halo * .1).toFixed(3) + ')';
     ctx.lineWidth = DPR;
     ctx.stroke();
 
@@ -372,17 +417,15 @@ CLIENT_SCRIPT = r"""
 
   function startDraw() {
     if (drawRaf) return;
-    if (!noiseTile) buildNoise();
-    t0 = performance.now();
+    buildLayers();
+    lastT = 0;
     drawRaf = requestAnimationFrame(frame);
   }
   function stopDraw() {
     if (drawRaf) { cancelAnimationFrame(drawRaf); drawRaf = 0; }
-    parts = [];
-    ripples = [];
   }
 
-  /* ══ 界面 ═════════════════════════════════════════════════════ */
+  /* ═══ 界面 ═══════════════════════════════════════════════════ */
   function setPhase(p, label) {
     phase = p;
     if (!box) return;
@@ -391,7 +434,6 @@ CLIENT_SCRIPT = r"""
     if (stateEl) stateEl.textContent = label != null ? label : (SPEC[p] || SPEC.idle).label;
   }
 
-  /* 字幕逐字浮现。整段一次性塞进去只是"出现"，不是"说出来" */
   var typeTimer = null;
   function say(text, dim) {
     if (!saidEl) return;
@@ -409,7 +451,6 @@ CLIENT_SCRIPT = r"""
       saidEl.appendChild(b);
     }, 34);
   }
-
   function meta() {
     if (metaEl) metaEl.textContent = turns + ' 轮 · ' + chars + ' 字符';
   }
@@ -425,7 +466,7 @@ CLIENT_SCRIPT = r"""
     box.setAttribute('aria-label', '语音通话');
     box.innerHTML =
       '<div class="vc-top">' +
-        '<span class="vc-tag"><span class="vc-dot"></span><span class="vc-conn">Connected</span></span>' +
+        '<span class="vc-tag"><span class="vc-dot"></span><span>Connected</span></span>' +
         '<span class="vc-tag vc-model">—</span>' +
         '<span class="vc-tag"><span class="vc-time">0:00</span></span>' +
         '<span class="vc-tag"><span class="vc-meta">0 轮 · 0 字符</span>' +
@@ -480,26 +521,40 @@ CLIENT_SCRIPT = r"""
       .catch(function () {});
   }
 
-  /* ══ 音量表：球跟着涨落，同时用它判断你说完了没 ══════════════ */
+  /* ═══ 音频分析：四通道频率驱动视觉，同时判断你说完了没 ═══════ */
   function startMeter() {
     if (!micStream || !window.AudioContext || an) return;
     try {
       ac = new AudioContext();
       an = ac.createAnalyser();
-      an.fftSize = 512;
+      an.fftSize = 1024;
+      an.smoothingTimeConstant = 0.72;
       ac.createMediaStreamSource(micStream).connect(an);
-      var buf = new Uint8Array(an.fftSize);
+      var wave = new Uint8Array(an.fftSize);
+      freqArr = new Uint8Array(an.frequencyBinCount);
       var loop = function () {
         if (!an) return;
         meterRaf = requestAnimationFrame(loop);
-        an.getByteTimeDomainData(buf);
+        an.getByteTimeDomainData(wave);
         var sum = 0;
-        for (var i = 0; i < buf.length; i++) {
-          var v = (buf[i] - 128) / 128;
+        for (var i = 0; i < wave.length; i++) {
+          var v = (wave[i] - 128) / 128;
           sum += v * v;
         }
-        var lvl = Math.sqrt(sum / buf.length);
-        V.level = V.level * .72 + lvl * .28;
+        var lvl = Math.sqrt(sum / wave.length);
+
+        // 频谱分三段：低 / 中 / 高，各驱动不同参数
+        an.getByteFrequencyData(freqArr);
+        var n = freqArr.length, b1 = (n * .08) | 0, b2 = (n * .32) | 0;
+        var s1 = 0, s2 = 0, s3 = 0;
+        for (var j = 0; j < b1; j++) s1 += freqArr[j];
+        for (var j2 = b1; j2 < b2; j2++) s2 += freqArr[j2];
+        for (var j3 = b2; j3 < n; j3++) s3 += freqArr[j3];
+        A.lo = A.lo * .7 + (s1 / b1 / 255) * .3;
+        A.mid = A.mid * .7 + (s2 / (b2 - b1) / 255) * .3;
+        A.hi = A.hi * .7 + (s3 / (n - b2) / 255) * .3;
+        A.all = A.all * .72 + lvl * .28;
+
         if (phase !== 'listening' || muted) return;
         var now = Date.now();
         if (lvl > HUSH_LVL) { spoke = true; silentSince = 0; }
@@ -515,11 +570,48 @@ CLIENT_SCRIPT = r"""
   function stopMeter() {
     if (meterRaf) { cancelAnimationFrame(meterRaf); meterRaf = 0; }
     an = null;
-    V.level = 0;
+    A.lo = A.mid = A.hi = A.all = 0;
     if (ac) { try { ac.close(); } catch (e) {} ac = null; }
   }
 
-  /* ══ 一轮：听 → 传 → 发 → 等 → 念 ═══════════════════════════ */
+  /* 模型说话时让球也跟着动：接一路分析器到播放器上 */
+  var pAn = null, pRaf = 0;
+  function watchPlayer() {
+    if (!ac || pAn || !player) return;
+    try {
+      var src = ac.createMediaElementSource(player);
+      pAn = ac.createAnalyser();
+      pAn.fftSize = 1024;
+      pAn.smoothingTimeConstant = 0.7;
+      src.connect(pAn);
+      pAn.connect(ac.destination);
+      var wave = new Uint8Array(pAn.fftSize);
+      var fq = new Uint8Array(pAn.frequencyBinCount);
+      var loop = function () {
+        pRaf = requestAnimationFrame(loop);
+        if (!pAn || phase !== 'speaking') return;
+        pAn.getByteTimeDomainData(wave);
+        var sum = 0;
+        for (var i = 0; i < wave.length; i++) {
+          var v = (wave[i] - 128) / 128;
+          sum += v * v;
+        }
+        pAn.getByteFrequencyData(fq);
+        var n = fq.length, b1 = (n * .08) | 0, b2 = (n * .32) | 0;
+        var s1 = 0, s2 = 0, s3 = 0;
+        for (var j = 0; j < b1; j++) s1 += fq[j];
+        for (var j2 = b1; j2 < b2; j2++) s2 += fq[j2];
+        for (var j3 = b2; j3 < n; j3++) s3 += fq[j3];
+        A.lo = A.lo * .7 + (s1 / b1 / 255) * .3;
+        A.mid = A.mid * .7 + (s2 / (b2 - b1) / 255) * .3;
+        A.hi = A.hi * .7 + (s3 / (n - b2) / 255) * .3;
+        A.all = A.all * .7 + Math.sqrt(sum / wave.length) * .3;
+      };
+      pRaf = requestAnimationFrame(loop);
+    } catch (e) { pAn = null; }   // 有的浏览器不给接，那就只按时间驱动
+  }
+
+  /* ═══ 一轮：听 → 传 → 发 → 等 → 念 ═════════════════════════ */
   function pickMime() {
     var c = ['audio/mp4', 'audio/mp4;codecs=mp4a.40.2', 'audio/aac',
              'audio/webm;codecs=opus', 'audio/webm'];
@@ -652,6 +744,7 @@ CLIENT_SCRIPT = r"""
       });
       if (!r.ok) throw new Error('tts ' + r.status);
       var url = URL.createObjectURL(await r.blob());
+      watchPlayer();
       await new Promise(function (res) {
         player.onended = res;
         player.onerror = res;
@@ -674,9 +767,10 @@ CLIENT_SCRIPT = r"""
         }
       } catch (e2) {}
     }
+    A.all = A.lo = A.mid = A.hi = 0;
   }
 
-  /* ══ 进出 ═════════════════════════════════════════════════════ */
+  /* ═══ 进出 ═══════════════════════════════════════════════════ */
   async function dial() {
     if (live) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
@@ -686,6 +780,7 @@ CLIENT_SCRIPT = r"""
     if (!player) {
       player = new Audio();
       player.setAttribute('playsinline', '');
+      player.crossOrigin = 'anonymous';
     }
     try {
       player.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
@@ -699,6 +794,8 @@ CLIENT_SCRIPT = r"""
     turns = 0;
     chars = 0;
     muted = false;
+    silence = 0;
+    cumAudio = 0;
     dialT0 = Date.now();
     muteBtn.classList.remove('off');
     meta();
@@ -725,6 +822,7 @@ CLIENT_SCRIPT = r"""
     live = false;
     stopMeter();
     stopDraw();
+    if (pRaf) { cancelAnimationFrame(pRaf); pRaf = 0; }
     if (typeTimer) { clearInterval(typeTimer); typeTimer = null; }
     if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch (e) {} }
     rec = null;
@@ -763,18 +861,25 @@ CLIENT_SCRIPT = r"""
   window.dwellCall = {
     dial: dial,
     hang: hang,
-    theme: function (name) { if (THEMES[name]) TH = THEMES[name]; },
-    // 调参时手动切态看效果：dwellCall.preview('speaking')
+    theme: function (name) {
+      if (!THEMES[name]) return;
+      TH = THEMES[name];
+      layers = [];          // 流体那三层跟着重建
+      buildLayers();
+    },
+    // 调参时把球定在某态：dwellCall.preview('speaking')
     preview: function (p) {
       if (!SPEC[p]) return;
       build();
       box.classList.add('on');
       live = true;
+      fit();
       startDraw();
       setPhase(p);
     },
     spec: SPEC,
-    themes: THEMES
+    themes: THEMES,
+    audio: A
   };
 
   function boot() {
