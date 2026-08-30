@@ -31,6 +31,7 @@ from wake_feature import register_wake_feature
 from backup_feature import register_backup_feature
 from panel_shell import register_panel_shell
 from voice_feature import register_voice_feature
+from voice_call import register_voice_call
 from voice_prompt import register_voice_prompt
 
 
@@ -92,7 +93,9 @@ register_panel_shell(server)
 # 语音条要在 frontend 之后：它包住那一层 index 视图，把客户端脚本注进去。
 # 后端在 /api/voice（独立服务，nginx 反代到 127.0.0.1:8021），不经过 Flask。
 register_voice_feature(server)
-# 告诉模型那行 [voice] 是什么。要在 agent_tools 之后：
+# 通话再包一层，要在 voice_feature 之后：那颗话筒键得先在，电话键才挨着它长。
+register_voice_call(server)
+# 告诉模型那行 [voice] 和 [通话中] 是什么。要在 agent_tools 之后：
 # 它包的是那个模块的 build_context_snapshot。不接这一行，
 # 语音条依旧能录能发，只是模型不知道那行标记是什么意思。
 register_voice_prompt(server)
@@ -124,5 +127,6 @@ if __name__ == "__main__":
     print("  busy    : 原子占位，卡住会自动抢占（/api/busy）")
     print("  auth    : /auth 设口令；维护令牌在 data/admin_token")
     print("  voice   : 语音条；TTS 在 /api/voice（独立服务，不经过 Flask）")
-    print("  vprompt : [voice] 标记已接进 system 提示词")
+    print("  call    : 语音通话·对讲机模式（回合制，一轮 5~8 秒）")
+    print("  vprompt : [voice] 与 [通话中] 已接进 system 提示词")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
