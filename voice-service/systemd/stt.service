@@ -1,0 +1,15 @@
+[Unit]
+Description=STT service (aliyun gummy-realtime)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/voice
+EnvironmentFile=/etc/voice.env
+ExecStart=/opt/voice/venv/bin/uvicorn stt_service:app --host 127.0.0.1 --port 8022
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
