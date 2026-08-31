@@ -8,6 +8,10 @@ class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd 
 布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
 而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
 
+⚠️ 要盖住 voice_feature 里写死的字号（`.vz-dur` 那些）得靠**特异性**：
+那边是 `.vz-dur`（0,1,0），这边必须写成 `#log .row.apv .vz-dur`（1,2,0）。
+只写 `.vz-dur` 是同特异性，而这段样式注入在它前面，会输。
+
 ⚠️ 上游 `.sheet` 自己**没有**左右内边距 —— 内容本该放进 `.sheet .body`
 （那个才有 `padding: 6px 20px`）。往 `.sheet` 里直接塞东西的话必须自己
 补上内边距，否则 `margin-left:auto` 的开关会顶到屏幕外面去。
@@ -124,6 +128,30 @@ CLIENT_SCRIPT = r"""
   opacity:.72;white-space:nowrap;font-variant-numeric:tabular-nums;
   text-align:center;letter-spacing:.01em}
 
+/* ── 语音条也跟着字号走 ────────────────────────────────────────
+   ⚠️ voice_feature 那边把 .vz-dur 写死成 12px、.vz-txt 写死成 14.5px。
+   要盖住它得靠特异性：那边是 (0,1,0)，这边 #log .row.apv .vz-dur 是
+   (1,2,0)。只写 .vz-dur 是平手，而这段注入在它前面，会输。 */
+#log .row.apv .vz{font-size:var(--apv-font);
+  min-width:calc(var(--apv-font) * 7.2);
+  gap:calc(var(--apv-font) * .62);
+  padding:calc(var(--apv-font) * .48) calc(var(--apv-font) * .9)
+          calc(var(--apv-font) * .48) calc(var(--apv-font) * .76)}
+#log .row.apv .vz-ico{width:calc(var(--apv-font) * 1.04);
+  height:calc(var(--apv-font) * 1.04)}
+#log .row.apv .vz-wave{height:calc(var(--apv-font) * 1.04)}
+#log .row.apv .vz-dur{font-size:calc(var(--apv-font) * .82)}
+#log .row.apv .vz-txt{font-size:var(--apv-font);
+  margin-top:calc(var(--apv-font) * .48)}
+
+/* 工具行（Thought process 那种）：上游写死 14.5px，这儿也接过来。
+   前面那个转圈/时钟图标一起缩，不然字大了图标显得小一号。 */
+#log .row .toolline{font-size:calc(var(--apv-font) * .98)}
+#log .row .toolline .ic,
+#log .row .toolline .spin{width:calc(var(--apv-font) * .92);
+  height:calc(var(--apv-font) * .92)}
+#log .row .toolline .chev{font-size:calc(var(--apv-font) * .88)}
+
 /* 日期分隔条。是 #log 的直接子元素，不进 .row。 */
 #log .apv-day{display:flex;justify-content:center;
   margin:calc(var(--apv-gap) + 6px) auto;max-width:720px}
@@ -139,7 +167,7 @@ CLIENT_SCRIPT = r"""
 #log .apv-qbox b{display:block;font-weight:600;font-size:.9em;opacity:.7;
   margin-bottom:2px}
 
-/* 工具行（Thought process 那种）。默认缩进到跟气泡左边对齐。 */
+/* 工具行缩进：默认跟气泡左边对齐 */
 #log.apv-tool-align .row:not(.apv) > .toolline{
   margin-left:calc(var(--apv-av) + 9px)}
 #log.apv-tool-hide .row:not(.apv) > .toolline{display:none}
@@ -186,9 +214,7 @@ CLIENT_SCRIPT = r"""
   overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;
   padding:0 20px calc(env(safe-area-inset-bottom,0px) + 18px)}
 #apvSheet .sheet *{box-sizing:border-box}
-/* 抓手是上游画的，它要横跨整宽，所以把内边距抵掉 */
-#apvSheet .grabber{margin-left:-20px;margin-right:-20px;width:auto;
-  max-width:38px;margin-left:auto;margin-right:auto}
+#apvSheet .grabber{width:38px;margin-left:auto;margin-right:auto}
 #apvSheet .apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;
   color:var(--text,#2b2a27)}
 #apvSheet .apv-line{display:flex;align-items:center;gap:10px;padding:8px 0;
@@ -861,21 +887,26 @@ CLIENT_SCRIPT = r"""
           '<code>#log .row.me.apv</code> 你那一行（整行）<br>' +
           '<code>#log .row.apv.apv-split</code> 拆出来的段（不是头一段）<br>' +
           '<code>#log .apv-qbox</code> 气泡里那段引用<br>' +
+          '<code>#log .row.apv .vz</code> 语音条那颗药丸<br>' +
+          '<code>#log .row.apv .vz-txt</code> 语音的转写文字<br>' +
+          '<code>#log .row.apv .vz-dur</code> 语音的时长<br>' +
           '<code>#log .row.apv img</code> 图片和表情包<br>' +
           '<code>#log .apv-av</code> 头像　<code>#log .apv-time</code> 时间<br>' +
           '<code>#log .apv-day &gt; span</code> 中间那个日期条<br>' +
-          '<code>#log .toolline</code> 思考那一行' +
+          '<code>#log .row .toolline</code> 思考那一行' +
           '<b>能用的变量</b>' +
           '<code>--apv-av</code> <code>--apv-font</code> <code>--apv-radius</code> ' +
           '<code>--apv-gap</code> <code>--apv-split</code> <code>--apv-time</code><br>' +
           '上游的：<code>--bg</code> <code>--card</code> <code>--panel</code> ' +
           '<code>--line</code> <code>--text</code> <code>--dim</code> ' +
           '<code>--accent</code>' +
-          '<b>两个坑</b>' +
+          '<b>三个坑</b>' +
           '圆角别写 <code>999px</code> —— 单行好看，多行会撑成椭圆，' +
           '<code>20px</code> 上下都对。<br>' +
           '选择器前面那个 <code>#log</code> 别省 —— <code>.row</code> 这名字' +
-          '页面里别处也在用，写宽了会把锁屏弄坏。' +
+          '页面里别处也在用，写宽了会把锁屏弄坏。<br>' +
+          '改语音条和工具行要写足前缀（<code>#log .row.apv .vz-dur</code>），' +
+          '光写 <code>.vz-dur</code> 盖不住它们自带的字号。' +
         '</p>' +
         '<div class="apv-btns">' +
           '<button type="button" data-apv-reset="1">还原默认</button>' +
