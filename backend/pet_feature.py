@@ -6,6 +6,16 @@
 
 不改 web/index.html。在 index 视图外面再包一层注脚本。
 
+⚠️ 上游有三处会自己写 `#pet` 的位置，走动时必须每帧盖掉：
+1. `restorePetPos()` —— DOMContentLoaded 时从 `localStorage.petPos` 读回
+   `left/top`，并把 `right/bottom` 设成 `auto`；
+2. 拖动的 `pointermove` —— 每帧写 `left/top`；
+3. `#pet` 的 CSS 里 `right:8px; bottom:calc(118px + ...)` 是写死的。
+所以走动时每帧都要重设 `right/bottom = auto` 再写 `left/top`。
+
+⚠️ 旧的 `localStorage.petPos` 会让他"看起来没出现"—— 其实是被钉在了
+右下角。启动时如果那条记录不是本次会话拖出来的，直接清掉。
+
 ⚠️ 打字判定用 `visualViewport` 的高度，不是"输入框有没有焦点"。移动端
 软键盘会挤压可视视口高度；只看焦点的话，收起键盘但光标还在时他会一直
 站着不动。桌面端没有这个收缩，退回看焦点。
@@ -13,12 +23,8 @@
 ⚠️ 只在聊天页出现。任何浮层（`.sheetWrap.open`）打开就藏起来 —— 他的
 z-index 比浮层高，不藏会浮在日记、设置那些页面上面。
 
-⚠️ 拖过之后就不走了。上游把拖动位置记在 `localStorage.petPos` 里，既然
-你亲手摆过，那个位置就是你要的。面板上有「让他重新走起来」清掉它。
-
 ⚠️ 换图不能只改 `src`：上游 `petSet()` 每次状态变化都会重写 `petImg.src`。
-所以这里包住 `petSet` —— 在它设完之后再覆盖一次。取不到那个函数就退回
-用 MutationObserver 盯着 src 改回来。
+所以这里用 MutationObserver 盯着 src，它一被改写就立刻覆盖回来。
 
 删掉 run.py 里那一行就完全没有这个功能，上游那只螃蟹照旧能拖能戳。
 """
@@ -39,17 +45,17 @@ STATES = ("idle", "thinking", "typing", "happy", "doze", "sleeping", "react")
 DEFAULTS = {
     "on": True,             # 总开关
     "walk": True,           # 走不走
-    "speed": 15,            # 走动速度（px/秒 的基准，越小越慢）
-    "size": 128,            # 图片高度 px（上游原本是 128）
-    "lift": 4,              # 离输入卡顶边多高 px
-    "idleChance": 0.35,     # 每走一段路停下发呆的概率
+    "speed": 15,            # 走动速度（越小越慢）
+    "size": 96,             # 图片高度 px（上游原本 128，走动时小一点好看）
+    "lift": 0,              # 离输入卡顶边多高 px
+    "idleChance": 0.35,     # 走一段路停下发呆的概率
     "bounce": True,         # 戳一下跳两下
 }
 
 NUM_RANGE = {
     "speed": (2, 120),
     "size": (32, 260),
-    "lift": (-40, 120),
+    "lift": (-60, 160),
     "idleChance": (0, 1),
 }
 
@@ -78,11 +84,12 @@ def _clean(raw: dict) -> dict:
 
 CLIENT_SCRIPT = r"""
 <style id="pet-base">
-/* 走动时贴在输入卡正上方。上游给 #pet 的是 position:fixed + right/bottom，
-   这里改成挂在 footer 里、用 left 定位 —— 键盘弹起时 footer 会被顶上去，
-   他就跟着一起上去，不用自己算键盘高度。 */
-#pet.petwalk{position:absolute;right:auto;bottom:auto;
-  transition:none;will-change:transform,left}
+/* 走动时保持上游的 position:fixed，只是每帧由 JS 写 left/top。
+   ⚠️ right/bottom 必须 auto：上游 CSS 里那两个是写死的
+   （right:8px; bottom:calc(118px + safe-area)），不清掉的话
+   left 写了也没用，他会一直贴在右下角。 */
+#pet.petwalk{right:auto !important;bottom:auto !important;
+  transition:none;will-change:left,top}
 #pet.petwalk img{transition:transform .18s ease-out}
 /* 翻身：朝左走的时候整个镜像 */
 #pet.petwalk.pet-flip img{transform:scaleX(-1)}
@@ -156,7 +163,7 @@ CLIENT_SCRIPT = r"""
   if (window.dwellPet) return;
 
   var DEF = {
-    on: true, walk: true, speed: 15, size: 128, lift: 4,
+    on: true, walk: true, speed: 15, size: 96, lift: 0,
     idleChance: 0.35, bounce: true
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
@@ -170,7 +177,7 @@ CLIENT_SCRIPT = r"""
   var META = [
     ['speed', '走多快', 2, 120, 1],
     ['size', '多大', 32, 260, 2],
-    ['lift', '离底栏', -40, 120, 1],
+    ['lift', '离底栏', -60, 160, 1],
     ['idleChance', '爱发呆', 0, 1, 0.05]
   ];
 
@@ -178,9 +185,18 @@ CLIENT_SCRIPT = r"""
   function petImg() { return document.getElementById('petImg'); }
   function composer() { return document.querySelector('.composer'); }
 
+  /* ⚠️ 上一版栽在这儿：上游把拖动位置存在 localStorage.petPos，
+     只要那条记录还在，我就判定"别走了"，于是他退回右下角 ——
+     看起来像"没出现"，其实是没出现在输入栏上。
+     启动时把上次会话留下的那条清掉：打开应用就该在输入栏上。 */
+  try { localStorage.removeItem('petPos'); } catch (e) {}
+
+  /* 本次会话里刚拖过 —— 松手八秒内不走，之后自己走回去 */
+  var heldUntil = 0;
+
   /* ── 换图 ──────────────────────────────────────────────────────
      ⚠️ 不能只改 src：上游 petSet() 每次状态变化都会重写它。
-     所以包住 petSet，在它设完之后再覆盖一次。 */
+     用 MutationObserver 盯着，一被改写就覆盖回来。 */
   function urlOf(state) {
     return pics[state] ? ('api/pet/pic/' + state + '?v=' + pics[state]) : '';
   }
@@ -190,6 +206,7 @@ CLIENT_SCRIPT = r"""
     if (!im) return;
     // 上游把文件名写进 src，从里头认出当前是哪个状态
     var src = im.getAttribute('src') || '';
+    if (src.indexOf('api/pet/pic/') >= 0) return;   // 已经是我们的图了
     var hit = '';
     if (src.indexOf('idle-follow') >= 0) hit = 'idle';
     else if (src.indexOf('thinking') >= 0) hit = 'thinking';
@@ -200,23 +217,9 @@ CLIENT_SCRIPT = r"""
     else if (src.indexOf('double-jump') >= 0) hit = 'react';
     if (!hit) return;
     var want = urlOf(hit);
-    if (want && src.indexOf('api/pet/pic/' + hit) < 0) im.src = want;
+    if (want) im.src = want;
   }
 
-  var wrapped = false;
-  function wrapPetSet() {
-    if (wrapped) return;
-    if (typeof window.petSet !== 'function') return;
-    var orig = window.petSet;
-    window.petSet = function () {
-      orig.apply(this, arguments);
-      overrideNow();
-    };
-    wrapped = true;
-  }
-
-  /* petSet 是上游脚本里的局部函数，window 上可能取不到。
-     那就退回盯着 src：它一被改写就立刻覆盖回来。 */
   function watchImg() {
     var im = petImg();
     if (!im || im._petWatched || !window.MutationObserver) return;
@@ -246,42 +249,16 @@ CLIENT_SCRIPT = r"""
     return vv ? (focused && kbUp) : focused;
   }
 
-  /* 拖过就不走了 —— 那个位置是你亲手摆的 */
-  function wasDragged() {
-    try { return !!localStorage.getItem('petPos'); } catch (e) { return false; }
-  }
-
   /* ── 走 ──────────────────────────────────────────────────────── */
-  var x = 20, dir = 1, raf = 0;
+  var x = 0, dir = 1, raf = 0;
   var restUntil = 0, nextRest = 0, lastT = 0;
-  var mounted = false;
+  var walking = false;
 
-  /* 挂进 footer：键盘弹起时 footer 被顶上去，他跟着一起上去，
-     不用自己算键盘高度。 */
-  function mount() {
-    var p = petEl(), f = document.querySelector('footer');
-    if (!p || !f) return false;
-    if (p.parentNode !== f) {
-      f.insertBefore(p, f.firstChild);
-      p.style.right = 'auto';
-      p.style.bottom = 'auto';
-      p.style.top = 'auto';
-    }
-    p.classList.add('petwalk');
-    mounted = true;
-    return true;
-  }
-
-  function unmount() {
+  function stopWalk() {
     var p = petEl();
     if (!p) return;
     p.classList.remove('petwalk', 'pet-flip');
-    if (p.parentNode !== document.body) document.body.appendChild(p);
-    p.style.left = '';
-    p.style.top = '';
-    p.style.right = '';
-    p.style.bottom = '';
-    mounted = false;
+    walking = false;
   }
 
   function frame(now) {
@@ -289,42 +266,43 @@ CLIENT_SCRIPT = r"""
     var p = petEl();
     if (!p) return;
 
-    wrapPetSet();
     watchImg();
 
     // ⚠️ 浮层开着就藏起来：他 z-index 比浮层高，不藏会浮在日记、设置上面
     var sheetOpen = !!document.querySelector('.sheetWrap.open');
     var lock = document.getElementById('lockWrap');
-    if (sheetOpen || lock) {
-      p.classList.add('pet-away');
-      return;
-    }
+    if (sheetOpen || lock) { p.classList.add('pet-away'); return; }
     p.classList.remove('pet-away');
 
-    // 关了、或者你亲手拖过：回到上游那套（fixed 定位，不走）
-    if (!cfg.on || !cfg.walk || wasDragged()) {
-      if (mounted) unmount();
-      if (!cfg.on) p.classList.add('pet-away');
-      return;
-    }
-    if (!mounted && !mount()) return;
+    if (!cfg.on) { p.classList.add('pet-away'); stopWalk(); return; }
+    // 关了走路、或者刚被拖过（八秒内）：回到上游那套，别抢他的位置
+    if (!cfg.walk || now < heldUntil) { stopWalk(); return; }
+
+    var c = composer();
+    if (!c) { stopWalk(); return; }
 
     var im = petImg();
     if (im) im.style.height = cfg.size + 'px';
     p.style.width = cfg.size + 'px';
     p.style.height = cfg.size + 'px';
 
-    var c = composer();
-    if (!c) return;
-    var f = document.querySelector('footer');
-    var cr = c.getBoundingClientRect();
-    var fr = f.getBoundingClientRect();
-    // 贴着输入卡顶边站
-    p.style.top = (cr.top - fr.top - cfg.size + cfg.lift) + 'px';
+    /* ⚠️ 每帧都得重设 right/bottom：CSS 里那两个是写死的，
+       restorePetPos() 和拖动也会写 left/top。不盖掉就一直贴右下角。
+       （class 上有 !important 兜底，这儿再写一遍是双保险） */
+    p.classList.add('petwalk');
+    walking = true;
+    p.style.right = 'auto';
+    p.style.bottom = 'auto';
 
-    var minX = cr.left - fr.left + 4;
-    var maxX = cr.right - fr.left - cfg.size - 4;
+    // 直接用视口坐标：position:fixed 的参考系就是视口，
+    // 键盘弹起时输入卡自己会上移，读它的 rect 就够了。
+    var cr = c.getBoundingClientRect();
+    var minX = cr.left + 4;
+    var maxX = cr.right - cfg.size - 4;
     if (maxX < minX) maxX = minX;
+    if (!x) x = minX + (maxX - minX) * 0.3;   // 第一帧落在偏左的位置
+
+    p.style.top = (cr.top - cfg.size + cfg.lift) + 'px';
 
     var dt = lastT ? Math.min(0.05, (now - lastT) / 1000) : 0.016;
     lastT = now;
@@ -353,21 +331,43 @@ CLIENT_SCRIPT = r"""
     p.classList.toggle('pet-flip', dir === -1);
   }
 
+  /* 拖动：走路开着的时候，拖一下只是临时挪开，松手八秒后他自己走回去。
+     ⚠️ 上游 pointerup 里会往 localStorage 写 petPos —— 那条会让下次
+     打开又钉在原地，所以走路开着时把它清掉。 */
+  function bindDrag() {
+    var p = petEl();
+    if (!p || p._petDrag) return;
+    p._petDrag = 1;
+    var mark = function () {
+      if (!cfg.walk) return;             // 关了走路才当成固定摆位
+      heldUntil = performance.now() + 8000;
+      try { localStorage.removeItem('petPos'); } catch (e) {}
+    };
+    p.addEventListener('pointerdown', mark);
+    p.addEventListener('pointerup', function () {
+      mark();
+      // 上游是在 pointerup 里写的，等它写完再清
+      setTimeout(function () {
+        if (cfg.walk) { try { localStorage.removeItem('petPos'); } catch (e) {} }
+      }, 30);
+    });
+  }
+
   /* 戳一下跳两下。上游只换图，没有跳。 */
   function bindBounce() {
     var p = petEl();
     if (!p || p._petBounce) return;
     p._petBounce = 1;
     p.addEventListener('click', function () {
-      if (!cfg.bounce || !mounted) return;
+      if (!cfg.bounce) return;
       var im = petImg();
       if (!im || im._hop) return;
       im._hop = 1;
       var t0 = performance.now(), dur = 560, peak = -cfg.size * 0.22;
-      var flip = dir === -1 ? ' scaleX(-1)' : '';
       var step = function (t) {
         var k = Math.min(1, (t - t0) / dur);
         var y = Math.sin(k * Math.PI * 2) * peak * (1 - k);
+        var flip = (walking && dir === -1) ? ' scaleX(-1)' : '';
         im.style.transform = 'translateY(' + y.toFixed(1) + 'px)' + flip;
         if (k < 1) requestAnimationFrame(step);
         else { im.style.transform = ''; im._hop = 0; }
@@ -421,7 +421,8 @@ CLIENT_SCRIPT = r"""
         '<div class="grabber"></div>' +
         '<div class="pt-h">小家伙</div>' +
         '<p class="pt-sub">他会沿着输入栏来回走，撞到边就翻个身；' +
-          '你打字的时候他站着等。戳一下会跳。</p>' +
+          '你打字的时候他站着等。戳一下会跳。' +
+          '拖走了也没关系，松手几秒他自己走回来。</p>' +
 
         '<div class="pt-line"><label>让他在</label>' +
           '<button type="button" class="pt-sw" data-sw="on" role="switch"></button></div>' +
@@ -434,15 +435,16 @@ CLIENT_SCRIPT = r"""
 
         '<div class="pt-grp">换他的样子</div>' +
         '<div class="pt-pics">' + grid + '</div>' +
-        '<p class="pt-note">不传就用原来那七张。传了哪个换哪个，' +
-          '点同一格再选一次就是替换。png / gif / svg 都行，4MB 以内。</p>' +
+        '<p class="pt-note">不传就用原来那七张 —— 现在用的就是原来的。' +
+          '传了哪个换哪个，点同一格再选一次就是替换。' +
+          'png / gif / svg 都行，4MB 以内。</p>' +
 
         '<div class="pt-sep"></div>' +
         '<div class="pt-btns">' +
-          '<button type="button" data-pt-free="1">让他重新走起来</button>' +
+          '<button type="button" data-pt-free="1">让他回输入栏上</button>' +
         '</div>' +
-        '<p class="pt-note">把他拖到别处之后就不走了 —— 那个位置是你摆的。' +
-          '按上面这颗把他放回输入栏上。</p>' +
+        '<p class="pt-note">关掉「会走路」他就待在你拖的那个地方不动了。' +
+          '想让他回去按上面这颗。</p>' +
 
         '<div class="pt-btns">' +
           '<button type="button" data-pt-reset="1">还原默认</button>' +
@@ -456,13 +458,18 @@ CLIENT_SCRIPT = r"""
       if (t.closest && t.closest('[data-pt-close]')) { closeSheet(); return; }
       if (t.closest && t.closest('[data-pt-free]')) {
         try { localStorage.removeItem('petPos'); } catch (e2) {}
+        heldUntil = 0;
+        cfg.walk = true;
         var p = petEl();
-        if (p) { p.style.left = ''; p.style.top = ''; }
+        if (p) { p.style.right = 'auto'; p.style.bottom = 'auto'; }
+        fillSheet(); save();
         try { note('（他回输入栏上去了）'); } catch (e3) {}
         return;
       }
       if (t.closest && t.closest('[data-pt-reset]')) {
         cfg = JSON.parse(JSON.stringify(DEF));
+        heldUntil = 0;
+        try { localStorage.removeItem('petPos'); } catch (e4) {}
         fillSheet(); save();
         return;
       }
@@ -471,7 +478,8 @@ CLIENT_SCRIPT = r"""
         var k = sw.getAttribute('data-sw');
         cfg[k] = !cfg[k];
         fillSheet(); save();
-        if (k === 'walk' && !cfg[k]) unmount();
+        if (k === 'walk' && !cfg[k]) stopWalk();
+        if (k === 'walk' && cfg[k]) heldUntil = 0;
       }
     });
 
@@ -497,7 +505,9 @@ CLIENT_SCRIPT = r"""
           if (!d || !d.ok) throw new Error((d && d.error) || 'bad');
           pics[st] = d.v;
           fillSheet();
-          overrideNow();
+          // 换的正好是当前这张，立刻生效
+          var im = petImg();
+          if (im) { im.setAttribute('src', im.getAttribute('src') || ''); overrideNow(); }
           try { note('（换好了）'); } catch (e2) {}
         })
         .catch(function () {
@@ -587,9 +597,12 @@ CLIENT_SCRIPT = r"""
 
     mountNav();
     bindBounce();
+    bindDrag();
     raf = requestAnimationFrame(frame);
     // 侧边栏和输入卡都是上游后来才画的
-    setInterval(function () { mountNav(); bindBounce(); wrapPetSet(); watchImg(); }, 1200);
+    setInterval(function () {
+      mountNav(); bindBounce(); bindDrag(); watchImg();
+    }, 1200);
   }
 
   window.dwellPet = {
@@ -597,8 +610,12 @@ CLIENT_SCRIPT = r"""
     close: closeSheet,
     get: function () { return cfg; },
     pics: function () { return pics; },
-    free: function () {
+    // 卡在哪儿了就跑这个
+    home: function () {
       try { localStorage.removeItem('petPos'); } catch (e) {}
+      heldUntil = 0;
+      cfg.walk = true;
+      save();
     }
   };
 
@@ -611,7 +628,7 @@ CLIENT_SCRIPT = r"""
 
 
 def register_pet_feature(server_module):
-    """接小家伙：三个接口 + 再包一层 index。
+    """接小家伙：四个接口 + 再包一层 index。
 
     要排在 frontend_feature 之后；排在 appearance 之后能让侧边栏那项
     跟在「外观」后面（取不到也会退回跟着「日记」）。
