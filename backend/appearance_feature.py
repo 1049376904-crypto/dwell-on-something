@@ -1,33 +1,42 @@
-"""dwell 外观：气泡拆分、头像、时间戳、日期条、引用，和一个能实时调的外观面板。
+"""dwell 外观：气泡拆分、头像、时间戳、日期条、引用、字体，和一个能实时调的面板。
 
 不改 web/index.html。在 index 视图外面再包一层，把客户端脚本注进去。
 
-字号是**四路分开**的：正文、语音条、工具行、引用各有自己的变量和滑块。
+字号是**分路**的：正文、语音条、工具行、引用、输入框各有自己的变量和滑块。
 一开始做成一个滑块牵着全部按比例缩，实际不好看 —— 那几处本来就不是
 一个量级的东西，同一个比例套上去总有一处别扭。
 
-⚠️ 样式选择器一律锁进 `#log` 或 `#apvSheet`，一条都不能漏。`.row` 这个
-class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd .row`、
-`.rc-add .row`，锁屏那层里也有）。写成裸 `.row{display:flex}` 会把锁屏的
-布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
+⚠️ CSS 变量挂在 `html` 上（`--apv-` 前缀撞不着别人），所以 `#log` 外面的
+输入框、引用条也能用。但那几个 `apv-hide-*` 开关 class 仍然挂在 `#log`
+上 —— 挂到 body 上有溢出风险。
+
+⚠️ 样式选择器一律锁进 `#log`、`#apvSheet` 或 `.composer`，一条都不能漏。
+`.row` 这个 class 名在 index.html 里被复用了至少四处（`.hd-write .row`、
+`.hadd .row`、`.rc-add .row`，锁屏那层里也有）。写成裸 `.row{display:flex}`
+会把锁屏的布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
 而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
+
+⚠️ 输入框字号别低于 16px：iOS Safari 聚焦一个字号小于 16px 的输入框时
+会自动放大整个页面，回不去。滑块下限因此钉在 16。
 
 ⚠️ 要盖住 voice_feature 里写死的字号（`.vz-dur` 那些）得靠**特异性**：
 那边是 `.vz-dur`（0,1,0），这边必须写成 `#log .row.apv .vz-dur`（1,2,0）。
 只写 `.vz-dur` 是同特异性，而这段样式注入在它前面，会输。
 
-⚠️ 上游 `.sheet` 自己**没有**左右内边距 —— 内容本该放进 `.sheet .body`
-（那个才有 `padding: 6px 20px`）。往 `.sheet` 里直接塞东西的话必须自己
-补上内边距，否则 `margin-left:auto` 的开关会顶到屏幕外面去。
+⚠️ `@font-face` 的 `src` 一定要带 `format()`，Safari 少了它有时整条规则
+都不认。字体文件的地址带 mtime 版本号，换同名字体才会重新拉。
 
-⚠️ 气泡圆角别用 999px。那个值对单行是圆条，对多行就是椭圆。用 20px。
+⚠️ 上游 `.sheet` 自己**没有**左右内边距 —— 内容本该放进 `.sheet .body`。
+往 `.sheet` 里直接塞东西必须自己补内边距，否则 `margin-left:auto` 的开关
+会顶到屏幕外面。
+
+⚠️ 气泡圆角别用 999px：单行是圆条，多行会撑成椭圆。用 20px。
 
 ⚠️ 拆气泡只拆定稿的（`el._final`）。流式那条边写边拆会一帧一个样。
 代码块里的空行不算分割点 —— 按 ``` 的奇偶记状态，围栏内跳过。
 
 ⚠️ 引用的发送要走**捕获阶段**插队：上游是 `sendBtn.onclick = send`，
-捕获阶段的监听比 onclick 先跑，在那儿把引用拼进 `box.value` 即可，
-不用碰上游一行代码。
+捕获阶段的监听比 onclick 先跑，在那儿把引用拼进 `box.value` 即可。
 
 设置存在 settings 表里，不用 localStorage：换个设备就没了。
 
@@ -37,6 +46,7 @@ class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd 
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -53,6 +63,9 @@ DEFAULTS = {
     "voiceSize": 14.5,      # 语音条转写文字 px（时长自动取 .82 倍）
     "toolSize": 14,         # 工具行 px（Thought process 那种）
     "quoteSize": 13,        # 气泡里那段引用 px
+    "composerSize": 16,     # 输入框字号 px（低于 16 iOS 会放大页面）
+    "composerPad": 12,      # 输入框内边距 px
+    "btnSize": 36,          # 输入框那排圆按钮 px
     "bubbleRadius": 18,     # 气泡圆角 px
     "rowGap": 16,           # 两条消息之间 px
     "splitGap": 6,          # 同一条消息拆出来的段之间 px
@@ -64,6 +77,7 @@ DEFAULTS = {
     "split": True,          # 空行拆成独立气泡
     "quote": True,          # 长按气泡能引用
     "toolMode": "align",    # 工具行：align 跟气泡对齐 / full 独占一行 / hide 藏起来
+    "fontFamily": "",       # 传上来的字体名；空 = 用系统字体
     "css": "",              # 自由 CSS，原样注入
 }
 
@@ -73,6 +87,10 @@ NUM_RANGE = {
     "voiceSize": (10, 22),
     "toolSize": (9, 20),
     "quoteSize": (9, 20),
+    # ⚠️ 下限 16：iOS Safari 聚焦小于 16px 的输入框会放大整个页面
+    "composerSize": (16, 22),
+    "composerPad": (4, 20),
+    "btnSize": (28, 48),
     "bubbleRadius": (0, 28),
     "rowGap": (2, 40),
     "splitGap": (0, 24),
@@ -84,6 +102,18 @@ TOOL_MODES = ("align", "full", "hide")
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".webp": "image/webp", ".gif": "image/gif"}
+
+# 中文字体动辄好几兆，所以比头像那条宽得多
+FONT_MAX = 12 * 1024 * 1024
+# ⚠️ format() 是 @font-face 的必需品，Safari 少了它有时整条规则不认
+FONT_EXT = {
+    ".ttf": ("font/ttf", "truetype"),
+    ".otf": ("font/otf", "opentype"),
+    ".woff": ("font/woff", "woff"),
+    ".woff2": ("font/woff2", "woff2"),
+    ".ttc": ("font/collection", "collection"),
+}
+SAFE_NAME = re.compile(r"[^A-Za-z0-9._\u4e00-\u9fff-]+")
 
 
 def _clean(raw: dict) -> dict:
@@ -106,6 +136,8 @@ def _clean(raw: dict) -> dict:
             out[key] = bool(raw[key])
     if raw.get("toolMode") in TOOL_MODES:
         out["toolMode"] = raw["toolMode"]
+    if isinstance(raw.get("fontFamily"), str):
+        out["fontFamily"] = SAFE_NAME.sub("", raw["fontFamily"])[:80]
     if "css" in raw and isinstance(raw["css"], str):
         out["css"] = raw["css"][:CSS_MAX]
     return out
@@ -113,22 +145,25 @@ def _clean(raw: dict) -> dict:
 
 CLIENT_SCRIPT = r"""
 <style id="apv-base">
-/* 变量挂在 #log 上，不放 :root —— 免得名字撞上别处。
-   字号四路分开：正文 / 语音 / 工具行 / 引用，谁也不牵着谁。 */
-#log{
+/* ⚠️ 变量挂在 html 上，不是 #log —— 输入框和引用条在 #log 外面，
+   也得能用。前缀 --apv- 撞不着别人的名字。 */
+html{
   --apv-av:34px; --apv-font:14.5px; --apv-voice:14.5px;
   --apv-tool:14px; --apv-quote:13px;
+  --apv-cfont:16px; --apv-cpad:12px; --apv-btn:36px;
   --apv-radius:18px; --apv-gap:16px; --apv-split:6px; --apv-time:10.5px;
+  --apv-family:inherit;
 }
 
-/* ⚠️ 下面每一条都必须带 #log 前缀。
+/* ⚠️ 下面每一条都必须带 #log / .composer 前缀。
    .row 这个名字在 index.html 里被复用了至少四处，锁屏那层也有 ——
    写成裸 .row 会把锁屏滑块的布局压掉，解锁手势直接失效。 */
 #log .row.apv{display:flex;align-items:flex-start;gap:9px;
   margin-bottom:var(--apv-gap)}
 #log .row.me.apv{flex-direction:row-reverse;justify-content:flex-start}
 #log .row.apv > .bubble,
-#log .row.apv > .gu{min-width:0;font-size:var(--apv-font)}
+#log .row.apv > .gu{min-width:0;font-size:var(--apv-font);
+  font-family:var(--apv-family)}
 #log .row.apv > .bubble{border-radius:var(--apv-radius)}
 /* 同一条消息拆出来的几段之间收紧，跟"两条消息"区分开 */
 #log .row.apv.apv-split{margin-bottom:var(--apv-split)}
@@ -158,10 +193,11 @@ CLIENT_SCRIPT = r"""
 #log .row.apv .vz-wave{height:calc(var(--apv-voice) * 1.04)}
 #log .row.apv .vz-dur{font-size:calc(var(--apv-voice) * .82)}
 #log .row.apv .vz-txt{font-size:var(--apv-voice);
+  font-family:var(--apv-family);
   margin-top:calc(var(--apv-voice) * .48)}
 
 /* ── 工具行：自己一路字号。上游写死 14.5px，这儿接过来 ── */
-#log .row .toolline{font-size:var(--apv-tool)}
+#log .row .toolline{font-size:var(--apv-tool);font-family:var(--apv-family)}
 #log .row .toolline .ic,
 #log .row .toolline .spin{width:calc(var(--apv-tool) * .94);
   height:calc(var(--apv-tool) * .94)}
@@ -188,17 +224,40 @@ CLIENT_SCRIPT = r"""
   margin-left:calc(var(--apv-av) + 9px)}
 #log.apv-tool-hide .row:not(.apv) > .toolline{display:none}
 
-/* 开关那几个 class 也挂在 #log 上，不挂 body */
+/* 开关那几个 class 挂在 #log 上，不挂 body（挂 body 有溢出风险） */
 #log.apv-hide-av .apv-av{display:none}
 #log.apv-hide-av .apv-side{width:auto}
 #log.apv-hide-time .apv-time{display:none}
 #log.apv-hide-av.apv-hide-time .apv-side{display:none}
 #log.apv-hide-day .apv-day{display:none}
 
+/* ── 输入框那一坨 ──────────────────────────────────────────────
+   ⚠️ #box 的字号别低于 16px：iOS Safari 聚焦时会放大整个页面。
+   滑块下限已经钉在 16，这儿只是接住那个值。 */
+.composer{padding:var(--apv-cpad) calc(var(--apv-cpad) + 2px)
+          calc(var(--apv-cpad) - 2px)}
+.composer #box{font-size:var(--apv-cfont);font-family:var(--apv-family);
+  padding:2px 2px calc(var(--apv-cpad) * .6)}
+.composer .ctlrow{gap:calc(var(--apv-btn) * .22)}
+.composer #plusBtn,
+.composer #vzMic,
+.composer #vcBtn{width:var(--apv-btn);height:var(--apv-btn);flex:0 0 auto}
+.composer #plusBtn .ic,
+.composer #vzMic svg,
+.composer #vcBtn svg{width:calc(var(--apv-btn) * .47);
+  height:calc(var(--apv-btn) * .47)}
+.composer #send{width:calc(var(--apv-btn) * 1.06);
+  height:calc(var(--apv-btn) * 1.06)}
+.composer #send .ic{width:calc(var(--apv-btn) * .47);
+  height:calc(var(--apv-btn) * .47)}
+.composer .pill{font-size:calc(var(--apv-cfont) * .86);
+  font-family:var(--apv-family);
+  padding:calc(var(--apv-btn) * .2) calc(var(--apv-btn) * .38)}
+
 /* ── 长按气泡弹出来那个小菜单 ── */
 #apvMenu{position:fixed;z-index:12500;display:none;gap:2px;
   background:var(--card,#fff);border:1px solid var(--line,#e8e5dc);
-  border-radius:14px;padding:5px;
+  border-radius:14px;padding:5px;font-family:var(--apv-family);
   box-shadow:0 8px 28px rgba(0,0,0,.14)}
 #apvMenu.on{display:flex}
 #apvMenu button{border:0;background:transparent;color:var(--text,#2b2a27);
@@ -206,16 +265,15 @@ CLIENT_SCRIPT = r"""
   cursor:pointer;white-space:nowrap}
 #apvMenu button:active{background:var(--panel,#f0eee6)}
 
-/* ── 输入框上方那条引用。字号跟着 --apv-quote，
-      但它在 .composer 里、不在 #log 里，所以变量要单独挂一份 ── */
+/* ── 输入框上方那条引用 ── */
 #apvQuote{display:none;align-items:flex-start;gap:9px;
-  --apv-quote:13px;
   margin:0 0 8px;padding:8px 10px 8px 0;
   border-left:2.5px solid var(--accent,#c96442);
   background:transparent}
 #apvQuote.on{display:flex}
 #apvQuote .qt{flex:1 1 auto;min-width:0;padding-left:10px;
-  font-size:var(--apv-quote);line-height:1.55;color:var(--dim,#8a867c);
+  font-size:var(--apv-quote);font-family:var(--apv-family);
+  line-height:1.55;color:var(--dim,#8a867c);
   max-height:3.4em;overflow:hidden}
 #apvQuote .qt b{display:block;color:var(--text,#2b2a27);opacity:.8;
   font-weight:600;font-size:calc(var(--apv-quote) * .9);margin-bottom:1px}
@@ -235,12 +293,12 @@ CLIENT_SCRIPT = r"""
 #apvSheet .grabber{width:38px;margin-left:auto;margin-right:auto}
 #apvSheet .apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;
   color:var(--text,#2b2a27)}
-/* 小节标题：九个滑块堆一起找不到要调哪个，分成"多大"和"多远"两组 */
+/* 小节标题：十几个滑块堆一起找不到要调哪个，分成几组 */
 #apvSheet .apv-grp{font-size:11px;letter-spacing:.12em;
-  color:var(--dim,#8a867c);opacity:.7;margin:14px 0 2px}
+  color:var(--dim,#8a867c);opacity:.7;margin:15px 0 2px}
 #apvSheet .apv-line{display:flex;align-items:center;gap:10px;padding:7px 0;
   min-width:0}
-#apvSheet .apv-line > label{flex:0 0 60px;min-width:0;font-size:13.5px;
+#apvSheet .apv-line > label{flex:0 0 66px;min-width:0;font-size:13.5px;
   color:var(--dim,#8a867c);overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
 #apvSheet .apv-line input[type=range]{flex:1 1 0;min-width:0;width:auto;
@@ -282,27 +340,48 @@ CLIENT_SCRIPT = r"""
   display:flex;align-items:center;justify-content:center;font-style:normal;
   font-size:14px;color:var(--dim,#8a867c);overflow:hidden}
 #apvSheet .apv-pick input{display:none}
+/* 字体那一块 */
+#apvSheet .apv-font{border:1px dashed var(--line,#e8e5dc);border-radius:14px;
+  padding:11px 13px;margin-top:4px}
+#apvSheet .apv-font .fname{font-size:13.5px;color:var(--text,#2b2a27);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-family:var(--apv-family)}
+#apvSheet .apv-font .fsub{font-size:11.5px;color:var(--dim,#8a867c);
+  opacity:.85;margin-top:3px;line-height:1.6}
+#apvSheet .apv-font .frow{display:flex;gap:8px;margin-top:10px;min-width:0}
+#apvSheet .apv-font label.up,
+#apvSheet .apv-font button{flex:1 1 0;min-width:0;min-height:38px;
+  border-radius:999px;border:0;background:var(--panel,#f0eee6);
+  color:var(--text,#2b2a27);font-size:13px;font-family:inherit;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;padding:0 10px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#apvSheet .apv-font input[type=file]{display:none}
+#apvSheet .apv-font .try{font-size:calc(var(--apv-font) * 1);
+  font-family:var(--apv-family);color:var(--text,#2b2a27);
+  margin-top:10px;line-height:1.7;opacity:.9}
 #apvSheet .apv-css{display:block;width:100%;min-width:0;min-height:104px;
   resize:vertical;background:var(--panel,#f0eee6);border:1px solid transparent;
   border-radius:14px;padding:11px 13px;color:var(--text,#2b2a27);
   font-size:12.5px;line-height:1.6;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 #apvSheet .apv-note{font-size:11.5px;color:var(--dim,#8a867c);opacity:.85;
-  margin:8px 0 0;line-height:1.7;word-break:break-word}
+  margin:8px 0 0;line-height:1.75;word-break:break-word}
 #apvSheet .apv-note code{background:var(--panel,#f0eee6);border-radius:5px;
   padding:1px 5px;font-size:11px;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-#apvSheet .apv-note b{display:block;margin:9px 0 3px;font-weight:600;
+#apvSheet .apv-note b{display:block;margin:10px 0 3px;font-weight:600;
   color:var(--text,#2b2a27);opacity:.72;font-size:11.5px}
+#apvSheet .apv-note i{font-style:normal;opacity:.72}
 #apvSheet .apv-btns{display:flex;gap:9px;margin-top:16px;min-width:0}
 #apvSheet .apv-btns button{flex:1 1 0;min-width:0;min-height:44px;
   border-radius:999px;border:0;background:var(--panel,#f0eee6);
   color:var(--text,#2b2a27);font-size:14px;font-family:inherit;cursor:pointer;
   padding:0 12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #apvSheet .apv-btns button.go{background:var(--accent,#c96442);color:#fff}
-#apvSheet .apv-sep{height:1px;background:var(--line,#e8e5dc);margin:13px 0;
+#apvSheet .apv-sep{height:1px;background:var(--line,#e8e5dc);margin:14px 0;
   opacity:.7}
 </style>
+<style id="apv-font"></style>
 <style id="apv-user"></style>
 <script>
 (function () {
@@ -310,18 +389,18 @@ CLIENT_SCRIPT = r"""
 
   var DEF = {
     avatarSize: 34, fontSize: 14.5, voiceSize: 14.5, toolSize: 14, quoteSize: 13,
+    composerSize: 16, composerPad: 12, btnSize: 36,
     bubbleRadius: 18, rowGap: 16, splitGap: 6, timeSize: 10.5, gapHours: 5,
     showAvatar: true, showTime: true, showDay: true, split: true, quote: true,
-    toolMode: 'align', css: ''
+    toolMode: 'align', fontFamily: '', css: ''
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
 
-  /* 滑块分两组：上面管"多大"，下面管"多远"。
-     每项：[键, 标签, 最小, 最大, 步长] */
+  /* 滑块分三组。每项：[键, 标签, 最小, 最大, 步长] */
   var SIZE_META = [
     ['fontSize', '正文', 11, 22, 0.5],
     ['voiceSize', '语音', 10, 22, 0.5],
-    ['toolSize', '工具', 9, 20, 0.5],
+    ['toolSize', '工具行', 9, 20, 0.5],
     ['quoteSize', '引用', 9, 20, 0.5],
     ['timeSize', '时间', 8, 16, 0.5],
     ['avatarSize', '头像', 18, 72, 1]
@@ -332,9 +411,16 @@ CLIENT_SCRIPT = r"""
     ['splitGap', '段距', 0, 24, 1],
     ['gapHours', '隔多久', 0.5, 24, 0.5]
   ];
-  var META = SIZE_META.concat(GAP_META);
+  /* ⚠️ composerSize 最低 16：iOS Safari 聚焦更小的输入框会放大整页 */
+  var BOX_META = [
+    ['composerSize', '输入字号', 16, 22, 0.5],
+    ['composerPad', '内边距', 4, 20, 1],
+    ['btnSize', '按钮', 28, 48, 1]
+  ];
+  var META = SIZE_META.concat(GAP_META, BOX_META);
   var TOOLS = [['align', '对齐'], ['full', '整行'], ['hide', '藏起来']];
   var NAME = { me: '妍妍', gu: '沐' };
+  var FONT_OK = '.ttf,.otf,.woff,.woff2,.ttc';
 
   var PRESET = [
     '/* 圆条气泡 · 不想要了就清空这一栏 */',
@@ -359,13 +445,16 @@ CLIENT_SCRIPT = r"""
     '}',
     '',
     '/* 表情包和图片：别包壳，也别被圆角切了 */',
-    '#log .row.apv > .bubble:has(img),',
-    '#log .row.apv > .gu:has(img) {',
+    '#log .row.apv-img > .bubble,',
+    '#log .row.apv-img > .gu {',
     '  padding: 0;',
     '  background: transparent;',
     '  border: 0;',
     '}',
-    '#log .row.apv img { border-radius: 14px; }'
+    '#log .row.apv img { border-radius: 14px; }',
+    '',
+    '/* 拆出来的中间几段：头像淡一点，一组看着才连贯 */',
+    '#log .row.apv-split:not(.apv-first) .apv-av { opacity: .45; }'
   ].join('\n');
 
   function logEl() { return document.getElementById('log'); }
@@ -427,28 +516,51 @@ CLIENT_SCRIPT = r"""
     return head + ' ' + hm;
   }
 
-  /* ── 应用设置 ─────────────────────────────────────────────────
-     变量挂在 #log 上；输入框上方那条引用不在 #log 里，单独再挂一份。 */
+  /* ── 字体 ──────────────────────────────────────────────────────
+     ⚠️ src 一定要带 format()，Safari 少了它有时整条 @font-face 都不认。
+     地址带 v= 版本号（服务端给的 mtime），换同名字体才会重新拉。 */
+  var fontInfo = { name: '', v: '', fmt: '' };
+
+  function applyFont() {
+    var tag = document.getElementById('apv-font');
+    var use = cfg.fontFamily && fontInfo.name === cfg.fontFamily;
+    if (tag) {
+      tag.textContent = use ?
+        '@font-face{font-family:"apvUser";' +
+        'src:url("api/appearance/font?v=' + fontInfo.v + '")' +
+        (fontInfo.fmt ? ' format("' + fontInfo.fmt + '")' : '') + ';' +
+        'font-display:swap}' : '';
+    }
+    document.documentElement.style.setProperty(
+      '--apv-family',
+      use ? '"apvUser", -apple-system, "PingFang SC", sans-serif' : 'inherit');
+  }
+
+  /* ── 应用设置 ───────────────────────────────────────────────── */
   function apply() {
+    var s = document.documentElement.style;
+    s.setProperty('--apv-av', cfg.avatarSize + 'px');
+    s.setProperty('--apv-font', cfg.fontSize + 'px');
+    s.setProperty('--apv-voice', cfg.voiceSize + 'px');
+    s.setProperty('--apv-tool', cfg.toolSize + 'px');
+    s.setProperty('--apv-quote', cfg.quoteSize + 'px');
+    s.setProperty('--apv-cfont', cfg.composerSize + 'px');
+    s.setProperty('--apv-cpad', cfg.composerPad + 'px');
+    s.setProperty('--apv-btn', cfg.btnSize + 'px');
+    s.setProperty('--apv-radius', cfg.bubbleRadius + 'px');
+    s.setProperty('--apv-gap', cfg.rowGap + 'px');
+    s.setProperty('--apv-split', cfg.splitGap + 'px');
+    s.setProperty('--apv-time', cfg.timeSize + 'px');
+
     var L = logEl();
     if (L) {
-      var s = L.style;
-      s.setProperty('--apv-av', cfg.avatarSize + 'px');
-      s.setProperty('--apv-font', cfg.fontSize + 'px');
-      s.setProperty('--apv-voice', cfg.voiceSize + 'px');
-      s.setProperty('--apv-tool', cfg.toolSize + 'px');
-      s.setProperty('--apv-quote', cfg.quoteSize + 'px');
-      s.setProperty('--apv-radius', cfg.bubbleRadius + 'px');
-      s.setProperty('--apv-gap', cfg.rowGap + 'px');
-      s.setProperty('--apv-split', cfg.splitGap + 'px');
-      s.setProperty('--apv-time', cfg.timeSize + 'px');
       L.classList.toggle('apv-hide-av', !cfg.showAvatar);
       L.classList.toggle('apv-hide-time', !cfg.showTime);
       L.classList.toggle('apv-hide-day', !cfg.showDay);
       L.classList.toggle('apv-tool-align', cfg.toolMode === 'align');
       L.classList.toggle('apv-tool-hide', cfg.toolMode === 'hide');
     }
-    if (quoteBar) quoteBar.style.setProperty('--apv-quote', cfg.quoteSize + 'px');
+    applyFont();
     var tag = document.getElementById('apv-user');
     if (tag) tag.textContent = cfg.css || '';
   }
@@ -504,7 +616,7 @@ CLIENT_SCRIPT = r"""
   }
 
   /* 气泡里那段引用：包成左边一道竖线的块 */
-  function dressQuote(bub) {
+  function dressQuote(bub, row) {
     if (bub._apvQ) return;
     var raw = bub._raw != null ? bub._raw : bub.textContent;
     var got = splitQuote(raw);
@@ -526,6 +638,19 @@ CLIENT_SCRIPT = r"""
       box.textContent = got.quote;
     }
     bub.insertBefore(box, bub.firstChild);
+    if (row) row.classList.add('apv-quoted');
+  }
+
+  /* ── 给一行挂上所有能当选择器用的钩子 ──────────────────────────
+     原来只有 .apv / .apv-split 两个，能改的地方太少。 */
+  function tagRow(row, bub, mine, at) {
+    row.classList.add('apv', mine ? 'apv-me' : 'apv-gu');
+    row.setAttribute('data-who', mine ? 'me' : 'gu');
+    row.setAttribute('data-at', String(at));
+    var raw = (bub._raw != null ? bub._raw : bub.textContent) || '';
+    if (raw.indexOf('[voice') === 0) row.classList.add('apv-voice');
+    if (bub.querySelector('img')) row.classList.add('apv-img');
+    if (bub.querySelector('.cbk, pre')) row.classList.add('apv-code');
   }
 
   /* 建一个跟母气泡同款的行。第一段留在原位，其余走这条。 */
@@ -541,11 +666,12 @@ CLIENT_SCRIPT = r"""
     try { renderRich(bub); } catch (e) {}
     row.appendChild(bub);
     stamps.set(row, at);
+    tagRow(row, bub, mine, at);
     dressRow(row, mine, at);
     return row;
   }
 
-  /* 给一行挂上头像和时间戳那一列 */
+  /* 头像和时间戳那一列 */
   function dressRow(row, mine, at) {
     if (row.querySelector('.apv-side')) return;
     var who = mine ? 'me' : 'gu';
@@ -588,28 +714,33 @@ CLIENT_SCRIPT = r"""
       if (!mine && !text.trim() && !loaded) continue;
 
       row.setAttribute('data-apv', '1');
-      row.classList.add('apv');
       var at = stampFor(row, mine, text);
+      tagRow(row, bub, mine, at);
       dressRow(row, mine, at);
 
       /* 拆段：只拆定稿的。流式那条边写边拆会一帧一个样。
          拆出来的段共用母消息的时间戳。 */
-      if (!bub._final) continue;
+      if (!bub._final) { row.classList.add('apv-solo'); continue; }
       var segs = cfg.split ? segments(text) : [text];
       if (segs.length > 1) {
         bub._raw = segs[0];
         bub.textContent = segs[0];
         bub.removeAttribute('data-rich');
         try { renderRich(bub); } catch (e) {}
-        row.classList.add('apv-split');
+        row.classList.add('apv-split', 'apv-first');
         var anchor = row.nextSibling;
         for (var k = 1; k < segs.length; k++) {
           var nr = makeRow(mine, segs[k], at);
-          if (k === segs.length - 1) nr.classList.remove('apv-split');
+          if (k === segs.length - 1) {
+            nr.classList.remove('apv-split');
+            nr.classList.add('apv-last');
+          }
           L.insertBefore(nr, anchor);
         }
+      } else {
+        row.classList.add('apv-solo');
       }
-      dressQuote(bub);
+      dressQuote(bub, row);
     }
     if (touched) dayMarks();
   }
@@ -658,16 +789,14 @@ CLIENT_SCRIPT = r"""
 
      ⚠️ 长按不用 contextmenu：iOS Safari 上那个会连带弹系统的
      「复制/查找」菜单，两个叠在一起。自己数 touchstart→touchend 的
-     时间，超过 480ms 且手指没动超过 10px 才算。手指一动就取消，
-     不然滑列表会误触发。 */
+     时间，超过 480ms 且手指没动超过 10px 才算。 */
   var LONG_MS = 480, MOVE_TOL = 10;
   var menu = null, quoteBar = null, quoted = null;
   var lt = null;
 
   function bubbleOf(node) {
     if (!node || !node.closest) return null;
-    var b = node.closest('#log .row.apv > .bubble, #log .row.apv > .gu');
-    return b || null;
+    return node.closest('#log .row.apv > .bubble, #log .row.apv > .gu') || null;
   }
 
   function rawOf(bub) {
@@ -698,7 +827,6 @@ CLIENT_SCRIPT = r"""
     buildMenu();
     menu._bub = bub;
     menu.classList.add('on');
-    // 先显示再量尺寸，才能把它按在屏幕里
     var r = menu.getBoundingClientRect();
     var left = Math.max(8, Math.min(window.innerWidth - r.width - 8, x - r.width / 2));
     var top = y - r.height - 12;
@@ -736,10 +864,8 @@ CLIENT_SCRIPT = r"""
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
       'stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/>' +
       '<line x1="18" y1="6" x2="6" y2="18"/></svg></button>';
-    // 塞在附件条前面，也就是输入框正上方
     composer.insertBefore(quoteBar, composer.firstChild);
     quoteBar.querySelector('.qx').onclick = clearQuote;
-    quoteBar.style.setProperty('--apv-quote', cfg.quoteSize + 'px');
     return quoteBar;
   }
 
@@ -780,7 +906,6 @@ CLIENT_SCRIPT = r"""
     var head = quoted.text.split('\n')
       .map(function (l) { return '> ' + l; }).join('\n');
     box.value = '> ' + quoted.who + '：\n' + head.replace(/^> /, '') + '\n\n' + body;
-    // 上游靠 input 事件调高度，补一下
     box.dispatchEvent(new Event('input', { bubbles: true }));
     clearQuote();
   }
@@ -795,10 +920,9 @@ CLIENT_SCRIPT = r"""
       var bub = bubbleOf(e.target);
       if (!bub) return;
       var t = e.touches[0];
-      lt = { x: t.clientX, y: t.clientY, bub: bub, fired: false };
+      lt = { x: t.clientX, y: t.clientY, bub: bub };
       lt.timer = setTimeout(function () {
         if (!lt) return;
-        lt.fired = true;
         showMenu(lt.bub, lt.x, lt.y);
         try { if (navigator.vibrate) navigator.vibrate(12); } catch (e2) {}
       }, LONG_MS);
@@ -872,9 +996,10 @@ CLIENT_SCRIPT = r"""
     sheet.className = 'sheetWrap';
     sheet.id = 'apvSheet';
 
-    var sizes = '', gaps = '', i;
+    var sizes = '', gaps = '', boxes = '', i;
     for (i = 0; i < SIZE_META.length; i++) sizes += sliderRow(SIZE_META[i]);
     for (i = 0; i < GAP_META.length; i++) gaps += sliderRow(GAP_META[i]);
+    for (i = 0; i < BOX_META.length; i++) boxes += sliderRow(BOX_META[i]);
 
     var seg = '<div class="apv-line"><label>工具行</label><div class="apv-seg">';
     for (var t = 0; t < TOOLS.length; t++) {
@@ -893,10 +1018,24 @@ CLIENT_SCRIPT = r"""
           '<label class="apv-pick"><i data-pick="gu"></i><span class="t">他的头像</span>' +
             '<input type="file" accept="image/*" data-up="gu"></label>' +
         '</div>' +
-        '<div class="apv-grp">多大</div>' +
-        sizes +
-        '<div class="apv-grp">多远</div>' +
-        gaps +
+
+        '<div class="apv-grp">字体</div>' +
+        '<div class="apv-font">' +
+          '<div class="fname" data-fname>还是系统字体</div>' +
+          '<div class="fsub" data-fsub>传个 ttf / otf / woff 上来就换 —— ' +
+            '不用直链，直接选文件。中文字体几兆是常事，上限 12MB。</div>' +
+          '<div class="try">好看的字，说给你听的话。0123456789</div>' +
+          '<div class="frow">' +
+            '<label class="up">选字体文件' +
+              '<input type="file" accept="' + FONT_OK + '" data-fontup></label>' +
+            '<button type="button" data-fontoff>用系统字体</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="apv-grp">多大</div>' + sizes +
+        '<div class="apv-grp">多远</div>' + gaps +
+        '<div class="apv-grp">输入框</div>' + boxes +
+
         '<div class="apv-sep"></div>' +
         '<div class="apv-line"><label>拆气泡</label>' +
           '<button type="button" class="apv-sw" data-sw="split" ' +
@@ -914,6 +1053,7 @@ CLIENT_SCRIPT = r"""
           '<button type="button" class="apv-sw" data-sw="showDay" ' +
           'role="switch" aria-label="显示日期分隔"></button></div>' +
         seg +
+
         '<div class="apv-sep"></div>' +
         '<textarea class="apv-css" spellcheck="false" autocapitalize="off" ' +
           'autocorrect="off" placeholder="在这儿写 CSS"></textarea>' +
@@ -921,35 +1061,63 @@ CLIENT_SCRIPT = r"""
           '<button type="button" data-apv-preset="1">用一下圆条样式</button>' +
         '</div>' +
         '<p class="apv-note">' +
-          '<b>能用的选择器</b>' +
-          '<code>#log .row.apv &gt; .bubble</code> 你说的话<br>' +
-          '<code>#log .row.apv &gt; .gu</code> 他说的话<br>' +
-          '<code>#log .row.me.apv</code> 你那一行（整行）<br>' +
-          '<code>#log .row.apv.apv-split</code> 拆出来的段（不是头一段）<br>' +
-          '<code>#log .apv-qbox</code> 气泡里那段引用<br>' +
-          '<code>#log .row.apv .vz</code> 语音条那颗药丸<br>' +
-          '<code>#log .row.apv .vz-txt</code> 语音的转写文字<br>' +
-          '<code>#log .row.apv .vz-dur</code> 语音的时长<br>' +
-          '<code>#log .row.apv img</code> 图片和表情包<br>' +
+          '<b>行（这些 class 都在 .row 上）</b>' +
+          '<code>.apv</code> 认过的行　<code>.apv-me</code> 你说的　' +
+          '<code>.apv-gu</code> 他说的<br>' +
+          '<code>.apv-first</code> 拆出来那组的头一段<br>' +
+          '<code>.apv-last</code> 最后一段　<code>.apv-solo</code> 没拆的<br>' +
+          '<code>.apv-split</code> 中间几段（不含最后一段）<br>' +
+          '<code>.apv-voice</code> 语音　<code>.apv-img</code> 带图<br>' +
+          '<code>.apv-code</code> 带代码块　<code>.apv-quoted</code> 带引用<br>' +
+          '<code>[data-who="gu"]</code>　<code>[data-at]</code> 秒级时间戳' +
+
+          '<b>行里面</b>' +
+          '<code>#log .row.apv &gt; .bubble</code> 你的气泡<br>' +
+          '<code>#log .row.apv &gt; .gu</code> 他的气泡<br>' +
           '<code>#log .apv-av</code> 头像　<code>#log .apv-time</code> 时间<br>' +
+          '<code>#log .apv-side</code> 头像和时间那一列<br>' +
+          '<code>#log .apv-qbox</code> 气泡里那段引用<br>' +
           '<code>#log .apv-day &gt; span</code> 中间那个日期条<br>' +
-          '<code>#log .row .toolline</code> 思考那一行' +
-          '<b>能用的变量</b>' +
+          '<code>#log .row .toolline</code> 思考那一行<br>' +
+          '<code>#log .row.apv .vz</code> 语音条　' +
+          '<code>.vz-txt</code> 转写　<code>.vz-dur</code> 时长<br>' +
+          '<code>#log .row.apv img</code> 图片和表情包' +
+
+          '<b>输入框那一坨</b>' +
+          '<code>.composer</code> 整块　<code>.composer #box</code> 输入框<br>' +
+          '<code>.composer .pill</code> 模型名那颗<br>' +
+          '<code>#plusBtn</code> <code>#vzMic</code> <code>#vcBtn</code> ' +
+          '<code>#send</code> 四颗按钮<br>' +
+          '<code>#apvQuote</code> 引用条　<code>#apvMenu</code> 长按菜单' +
+
+          '<b>变量（挂在 html 上，哪儿都能用）</b>' +
           '<code>--apv-font</code> 正文　<code>--apv-voice</code> 语音<br>' +
           '<code>--apv-tool</code> 工具行　<code>--apv-quote</code> 引用<br>' +
-          '<code>--apv-av</code> 头像　<code>--apv-time</code> 时间<br>' +
+          '<code>--apv-cfont</code> 输入字号　<code>--apv-cpad</code> 内边距<br>' +
+          '<code>--apv-btn</code> 按钮　<code>--apv-av</code> 头像　' +
+          '<code>--apv-time</code> 时间<br>' +
           '<code>--apv-radius</code> 圆角　<code>--apv-gap</code> 行距　' +
           '<code>--apv-split</code> 段距<br>' +
+          '<code>--apv-family</code> 你传的那个字体<br>' +
           '上游的：<code>--bg</code> <code>--card</code> <code>--panel</code> ' +
           '<code>--line</code> <code>--text</code> <code>--dim</code> ' +
           '<code>--accent</code>' +
+
+          '<b>抄两句</b>' +
+          '<i>他的气泡换个底色：</i><br>' +
+          '<code>#log .apv-gu &gt; .gu{background:#f3efe6}</code><br>' +
+          '<i>语音那颗药丸换色：</i><br>' +
+          '<code>#log .apv-voice .vz{background:rgba(201,100,66,.12)}</code><br>' +
+          '<i>拆出来的中间几段头像淡一点：</i><br>' +
+          '<code>#log .apv-split:not(.apv-first) .apv-av{opacity:.45}</code>' +
+
           '<b>三个坑</b>' +
           '圆角别写 <code>999px</code> —— 单行好看，多行会撑成椭圆，' +
           '<code>20px</code> 上下都对。<br>' +
           '选择器前面那个 <code>#log</code> 别省 —— <code>.row</code> 这名字' +
           '页面里别处也在用，写宽了会把锁屏弄坏。<br>' +
-          '改语音条要写足前缀（<code>#log .row.apv .vz-dur</code>），' +
-          '光写 <code>.vz-dur</code> 盖不住它自带的字号。' +
+          '<code>#box</code> 的字号别写到 16px 以下 —— iOS 一聚焦就会' +
+          '把整页放大，退不回来。' +
         '</p>' +
         '<div class="apv-btns">' +
           '<button type="button" data-apv-reset="1">还原默认</button>' +
@@ -962,12 +1130,19 @@ CLIENT_SCRIPT = r"""
       var t = e.target;
       if (t.closest && t.closest('[data-apv-close]')) { closeSheet(); return; }
       if (t.closest && t.closest('[data-apv-reset]')) {
+        var keepFont = cfg.fontFamily;
         cfg = JSON.parse(JSON.stringify(DEF));
+        cfg.fontFamily = keepFont;      // 还原样式，但别把字体也退掉
         apply(); fillSheet(); dayMarks(); save();
         return;
       }
       if (t.closest && t.closest('[data-apv-preset]')) {
         cfg.css = PRESET;
+        apply(); fillSheet(); save();
+        return;
+      }
+      if (t.closest && t.closest('[data-fontoff]')) {
+        cfg.fontFamily = '';
         apply(); fillSheet(); save();
         return;
       }
@@ -1009,21 +1184,46 @@ CLIENT_SCRIPT = r"""
 
     sheet.addEventListener('change', function (e) {
       var el = e.target;
+      // 头像
       var who = el.getAttribute && el.getAttribute('data-up');
-      if (!who || !el.files || !el.files[0]) return;
-      var fd = new FormData();
-      fd.append('file', el.files[0]);
-      fetch('api/appearance/avatar/' + who, { method: 'POST', body: fd })
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (!d || !d.ok) throw new Error('bad');
-          avSrc[who] = d.v;
-          paintAvatars();
-        })
-        .catch(function () {
-          try { note('（头像没传上去）', 'err'); } catch (e2) {}
-        });
-      el.value = '';
+      if (who && el.files && el.files[0]) {
+        var fd = new FormData();
+        fd.append('file', el.files[0]);
+        fetch('api/appearance/avatar/' + who, { method: 'POST', body: fd })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (!d || !d.ok) throw new Error('bad');
+            avSrc[who] = d.v;
+            paintAvatars();
+          })
+          .catch(function () {
+            try { note('（头像没传上去）', 'err'); } catch (e2) {}
+          });
+        el.value = '';
+        return;
+      }
+      // 字体
+      if (el.hasAttribute && el.hasAttribute('data-fontup') && el.files && el.files[0]) {
+        var f = el.files[0];
+        var sub = sheet.querySelector('[data-fsub]');
+        if (sub) sub.textContent = '正在传 ' + f.name + '…';
+        var ff = new FormData();
+        ff.append('file', f);
+        fetch('api/appearance/font', { method: 'POST', body: ff })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (!d || !d.ok) throw new Error((d && d.error) || 'bad');
+            fontInfo = { name: d.name, v: d.v, fmt: d.fmt };
+            cfg.fontFamily = d.name;
+            apply(); fillSheet(); save();
+            try { note('（换好了，字体是 ' + d.name + '）'); } catch (e2) {}
+          })
+          .catch(function (err) {
+            if (sub) sub.textContent = '没传上去（' + (err.message || '不知道为什么')
+              + '）。ttf / otf / woff / woff2，12MB 以内。';
+          });
+        el.value = '';
+      }
     });
   }
 
@@ -1045,6 +1245,18 @@ CLIENT_SCRIPT = r"""
     var tls = sheet.querySelectorAll('[data-tool]');
     for (var n = 0; n < tls.length; n++) {
       tls[n].classList.toggle('on', tls[n].getAttribute('data-tool') === cfg.toolMode);
+    }
+    var fn = sheet.querySelector('[data-fname]');
+    if (fn) {
+      fn.textContent = (cfg.fontFamily && fontInfo.name === cfg.fontFamily)
+        ? cfg.fontFamily : '还是系统字体';
+    }
+    var fs = sheet.querySelector('[data-fsub]');
+    if (fs) {
+      fs.textContent = fontInfo.name
+        ? ('传上来的是 ' + fontInfo.name +
+           (cfg.fontFamily ? '，正在用' : '，现在没在用'))
+        : '传个 ttf / otf / woff 上来就换 —— 不用直链，直接选文件。中文字体几兆是常事，上限 12MB。';
     }
     var ta = sheet.querySelector('.apv-css');
     if (ta && ta.value !== cfg.css) ta.value = cfg.css || '';
@@ -1093,6 +1305,7 @@ CLIENT_SCRIPT = r"""
           cfg = d.cfg;
           avSrc.me = (d.avatars && d.avatars.me) || '';
           avSrc.gu = (d.avatars && d.avatars.gu) || '';
+          if (d.font) fontInfo = d.font;
         }
         apply(); paintAvatars(); fillSheet();
         decorate();
@@ -1121,6 +1334,7 @@ CLIENT_SCRIPT = r"""
     split: segments,
     quote: setQuote,
     unquote: clearQuote,
+    font: function () { return fontInfo; },
     redraw: function () { decorate(); dayMarks(); }
   };
 
@@ -1133,7 +1347,7 @@ CLIENT_SCRIPT = r"""
 
 
 def register_appearance_feature(server_module):
-    """接外观设置：四个接口 + 再包一层 index。
+    """接外观设置：六个接口 + 再包一层 index。
 
     要排在 frontend_feature 之后（它包的是那一层 index）。
     """
@@ -1143,6 +1357,8 @@ def register_appearance_feature(server_module):
     data_dir = Path(server_module.DB_PATH).resolve().parent
     av_dir = data_dir / "avatars"
     av_dir.mkdir(parents=True, exist_ok=True)
+    font_dir = data_dir / "fonts"
+    font_dir.mkdir(parents=True, exist_ok=True)
 
     def read_cfg() -> dict:
         try:
@@ -1185,11 +1401,40 @@ def register_appearance_feature(server_module):
         except OSError:
             return ""
 
+    def font_path():
+        """当前那个字体文件。只留一个 —— 传新的就把旧的顶掉。"""
+        for ext in FONT_EXT:
+            p = font_dir / ("user" + ext)
+            if p.exists():
+                return p
+        return None
+
+    def font_meta() -> dict:
+        """给前端拼 @font-face 用：显示名、版本号、format()。"""
+        p = font_path()
+        if p is None:
+            return {"name": "", "v": "", "fmt": ""}
+        label = ""
+        try:
+            label = (font_dir / "user.name").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        try:
+            v = str(int(p.stat().st_mtime))
+        except OSError:
+            v = ""
+        return {
+            "name": label or p.name,
+            "v": v,
+            "fmt": FONT_EXT.get(p.suffix.lower(), ("", ""))[1],
+        }
+
     def api_get():
         return jsonify({
             "ok": True,
             "cfg": read_cfg(),
             "avatars": {"me": avatar_stamp("me"), "gu": avatar_stamp("gu")},
+            "font": font_meta(),
         })
 
     def api_post():
@@ -1226,6 +1471,55 @@ def register_appearance_feature(server_module):
         return send_file(str(p), mimetype=ALLOWED_EXT.get(p.suffix.lower()),
                          max_age=0, conditional=True)
 
+    def api_font_put():
+        """收一个字体文件。只留一份，传新的顶掉旧的。
+
+        原始文件名单独存一行当显示名 —— 文件本身一律叫 user.xxx，
+        免得中文名在路径上出岔子。
+        """
+        f = request.files.get("file")
+        if f is None or not f.filename:
+            return jsonify({"ok": False, "error": "没选文件"}), 400
+        ext = Path(f.filename).suffix.lower()
+        if ext not in FONT_EXT:
+            return jsonify({"ok": False, "error": "只收 ttf/otf/woff/woff2"}), 400
+
+        blob = f.read()
+        if not blob:
+            return jsonify({"ok": False, "error": "文件是空的"}), 400
+        if len(blob) > FONT_MAX:
+            return jsonify({"ok": False, "error": "超过 12MB"}), 413
+
+        for old in FONT_EXT:
+            p = font_dir / ("user" + old)
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        (font_dir / ("user" + ext)).write_bytes(blob)
+        label = SAFE_NAME.sub("", Path(f.filename).stem)[:80] or ("字体" + ext)
+        try:
+            (font_dir / "user.name").write_text(label, encoding="utf-8")
+        except OSError:
+            pass
+
+        cfg = read_cfg()
+        cfg["fontFamily"] = label
+        write_cfg(cfg)
+
+        meta = font_meta()
+        meta["ok"] = True
+        return jsonify(meta)
+
+    def api_font_get():
+        p = font_path()
+        if p is None:
+            return jsonify({"ok": False}), 404
+        mime = FONT_EXT.get(p.suffix.lower(), ("font/ttf", ""))[0]
+        # 带版本号的地址可以放心让浏览器缓存
+        return send_file(str(p), mimetype=mime, max_age=86400, conditional=True)
+
     app.add_url_rule("/api/appearance", endpoint="api_appearance_get",
                      view_func=api_get, methods=["GET"])
     app.add_url_rule("/api/appearance", endpoint="api_appearance_post",
@@ -1234,6 +1528,10 @@ def register_appearance_feature(server_module):
                      view_func=api_avatar_put, methods=["POST"])
     app.add_url_rule("/api/appearance/avatar/<who>", endpoint="api_appearance_avatar_get",
                      view_func=api_avatar_get, methods=["GET"])
+    app.add_url_rule("/api/appearance/font", endpoint="api_appearance_font_put",
+                     view_func=api_font_put, methods=["POST"])
+    app.add_url_rule("/api/appearance/font", endpoint="api_appearance_font_get",
+                     view_func=api_font_get, methods=["GET"])
 
     server_module.appearance_client_script = CLIENT_SCRIPT
 
