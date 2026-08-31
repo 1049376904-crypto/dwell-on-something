@@ -6,18 +6,22 @@
 一开始做成一个滑块牵着全部按比例缩，实际不好看 —— 那几处本来就不是
 一个量级的东西，同一个比例套上去总有一处别扭。
 
+滑块的上下限一律给宽，宁可让你调出难看的样子，也别把好看的那一档挡在外面。
+
 ⚠️ CSS 变量挂在 `html` 上（`--apv-` 前缀撞不着别人），所以 `#log` 外面的
 输入框、引用条也能用。但那几个 `apv-hide-*` 开关 class 仍然挂在 `#log`
 上 —— 挂到 body 上有溢出风险。
+
+⚠️ 上游 `.sheet::after` 是个 `position:absolute; top:100%; height:80px` 的
+挡板（"往上拽时底下不露缝"）。而这里把 `.sheet` 自己变成了滚动容器，
+绝对定位的伪元素会跟着内容滚，跑到内容中间拿背景色盖掉一条 80px。
+所以必须 `display:none` 掉它 —— 滚动容器不需要那个挡板。
 
 ⚠️ 样式选择器一律锁进 `#log`、`#apvSheet` 或 `.composer`，一条都不能漏。
 `.row` 这个 class 名在 index.html 里被复用了至少四处（`.hd-write .row`、
 `.hadd .row`、`.rc-add .row`，锁屏那层里也有）。写成裸 `.row{display:flex}`
 会把锁屏的布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
 而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
-
-⚠️ 输入框字号别低于 16px：iOS Safari 聚焦一个字号小于 16px 的输入框时
-会自动放大整个页面，回不去。滑块下限因此钉在 16。
 
 ⚠️ 要盖住 voice_feature 里写死的字号（`.vz-dur` 那些）得靠**特异性**：
 那边是 `.vz-dur`（0,1,0），这边必须写成 `#log .row.apv .vz-dur`（1,2,0）。
@@ -26,11 +30,7 @@
 ⚠️ `@font-face` 的 `src` 一定要带 `format()`，Safari 少了它有时整条规则
 都不认。字体文件的地址带 mtime 版本号，换同名字体才会重新拉。
 
-⚠️ 上游 `.sheet` 自己**没有**左右内边距 —— 内容本该放进 `.sheet .body`。
-往 `.sheet` 里直接塞东西必须自己补内边距，否则 `margin-left:auto` 的开关
-会顶到屏幕外面。
-
-⚠️ 气泡圆角别用 999px：单行是圆条，多行会撑成椭圆。用 20px。
+⚠️ 气泡圆角别用 999px：单行是圆条，多行会撑成椭圆。
 
 ⚠️ 拆气泡只拆定稿的（`el._final`）。流式那条边写边拆会一帧一个样。
 代码块里的空行不算分割点 —— 按 ``` 的奇偶记状态，围栏内跳过。
@@ -63,7 +63,7 @@ DEFAULTS = {
     "voiceSize": 14.5,      # 语音条转写文字 px（时长自动取 .82 倍）
     "toolSize": 14,         # 工具行 px（Thought process 那种）
     "quoteSize": 13,        # 气泡里那段引用 px
-    "composerSize": 16,     # 输入框字号 px（低于 16 iOS 会放大页面）
+    "composerSize": 16,     # 输入框字号 px
     "composerPad": 12,      # 输入框内边距 px
     "btnSize": 36,          # 输入框那排圆按钮 px
     "bubbleRadius": 18,     # 气泡圆角 px
@@ -81,21 +81,21 @@ DEFAULTS = {
     "css": "",              # 自由 CSS，原样注入
 }
 
+# 范围一律给宽。宁可让人调出难看的样子，也别把好看的那一档挡在外面。
 NUM_RANGE = {
-    "avatarSize": (18, 72),
-    "fontSize": (11, 22),
-    "voiceSize": (10, 22),
-    "toolSize": (9, 20),
-    "quoteSize": (9, 20),
-    # ⚠️ 下限 16：iOS Safari 聚焦小于 16px 的输入框会放大整个页面
-    "composerSize": (16, 22),
-    "composerPad": (4, 20),
-    "btnSize": (28, 48),
-    "bubbleRadius": (0, 28),
-    "rowGap": (2, 40),
-    "splitGap": (0, 24),
-    "timeSize": (8, 16),
-    "gapHours": (0.5, 24),
+    "avatarSize": (14, 96),
+    "fontSize": (8, 32),
+    "voiceSize": (8, 32),
+    "toolSize": (7, 26),
+    "quoteSize": (7, 26),
+    "composerSize": (11, 28),
+    "composerPad": (0, 32),
+    "btnSize": (20, 64),
+    "bubbleRadius": (0, 40),
+    "rowGap": (0, 64),
+    "splitGap": (0, 40),
+    "timeSize": (6, 20),
+    "gapHours": (0.2, 72),
 }
 
 TOOL_MODES = ("align", "full", "hide")
@@ -103,8 +103,8 @@ TOOL_MODES = ("align", "full", "hide")
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".webp": "image/webp", ".gif": "image/gif"}
 
-# 中文字体动辄好几兆，所以比头像那条宽得多
-FONT_MAX = 12 * 1024 * 1024
+# 中文 ttf 动辄十几兆
+FONT_MAX = 20 * 1024 * 1024
 # ⚠️ format() 是 @font-face 的必需品，Safari 少了它有时整条规则不认
 FONT_EXT = {
     ".ttf": ("font/ttf", "truetype"),
@@ -231,11 +231,9 @@ html{
 #log.apv-hide-av.apv-hide-time .apv-side{display:none}
 #log.apv-hide-day .apv-day{display:none}
 
-/* ── 输入框那一坨 ──────────────────────────────────────────────
-   ⚠️ #box 的字号别低于 16px：iOS Safari 聚焦时会放大整个页面。
-   滑块下限已经钉在 16，这儿只是接住那个值。 */
+/* ── 输入框那一坨 ── */
 .composer{padding:var(--apv-cpad) calc(var(--apv-cpad) + 2px)
-          calc(var(--apv-cpad) - 2px)}
+          max(2px, calc(var(--apv-cpad) - 2px))}
 .composer #box{font-size:var(--apv-cfont);font-family:var(--apv-family);
   padding:2px 2px calc(var(--apv-cpad) * .6)}
 .composer .ctlrow{gap:calc(var(--apv-btn) * .22)}
@@ -283,12 +281,17 @@ html{
 #apvQuote .qx svg{width:15px;height:15px}
 
 /* ── 面板 ─────────────────────────────────────────────────────
-   ⚠️ 上游 .sheet 自己没有左右内边距（内容本该放进 .sheet .body）。
-   这儿直接往 .sheet 里塞东西，所以必须自己补 20px —— 不补的话
-   margin-left:auto 的开关会顶到屏幕外面，右半截被切掉。 */
+   ⚠️ 两处都得治：
+   1. 上游 .sheet 自己没有左右内边距（内容本该放进 .sheet .body），
+      不补的话 margin-left:auto 的开关会顶出屏幕。
+   2. 上游 .sheet::after 是个 position:absolute; top:100%; height:80px
+      的挡板（"往上拽时底下不露缝"）。这儿把 .sheet 变成了滚动容器，
+      那个伪元素会跟着内容滚，跑到中间拿背景色盖掉一条 80px ——
+      就是面板中间那道莫名的空白。滚动容器不需要它，关掉。 */
 #apvSheet .sheet{box-sizing:border-box;width:100%;max-width:100vw;
   overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;
   padding:0 20px calc(env(safe-area-inset-bottom,0px) + 18px)}
+#apvSheet .sheet::after{display:none}
 #apvSheet .sheet *{box-sizing:border-box}
 #apvSheet .grabber{width:38px;margin-left:auto;margin-right:auto}
 #apvSheet .apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;
@@ -309,7 +312,7 @@ html{
 #apvSheet .apv-line input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;
   width:20px;height:20px;border-radius:50%;background:#fff;margin-top:-8.5px;
   border:1px solid var(--line,#e8e5dc);box-shadow:0 1px 4px rgba(0,0,0,.14)}
-#apvSheet .apv-val{flex:0 0 38px;min-width:0;text-align:right;font-size:12.5px;
+#apvSheet .apv-val{flex:0 0 42px;min-width:0;text-align:right;font-size:12.5px;
   color:var(--dim,#8a867c);font-variant-numeric:tabular-nums}
 #apvSheet .apv-sw{flex:0 0 auto;margin-left:auto;-webkit-appearance:none;
   appearance:none;width:44px;height:26px;border-radius:999px;
@@ -356,7 +359,7 @@ html{
   display:flex;align-items:center;justify-content:center;padding:0 10px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #apvSheet .apv-font input[type=file]{display:none}
-#apvSheet .apv-font .try{font-size:calc(var(--apv-font) * 1);
+#apvSheet .apv-font .try{font-size:var(--apv-font);
   font-family:var(--apv-family);color:var(--text,#2b2a27);
   margin-top:10px;line-height:1.7;opacity:.9}
 #apvSheet .apv-css{display:block;width:100%;min-width:0;min-height:104px;
@@ -396,26 +399,26 @@ html{
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
 
-  /* 滑块分三组。每项：[键, 标签, 最小, 最大, 步长] */
+  /* 滑块分三组。每项：[键, 标签, 最小, 最大, 步长]
+     范围一律给宽 —— 宁可让你调出难看的样子，也别把好看的那一档挡在外面。 */
   var SIZE_META = [
-    ['fontSize', '正文', 11, 22, 0.5],
-    ['voiceSize', '语音', 10, 22, 0.5],
-    ['toolSize', '工具行', 9, 20, 0.5],
-    ['quoteSize', '引用', 9, 20, 0.5],
-    ['timeSize', '时间', 8, 16, 0.5],
-    ['avatarSize', '头像', 18, 72, 1]
+    ['fontSize', '正文', 8, 32, 0.5],
+    ['voiceSize', '语音', 8, 32, 0.5],
+    ['toolSize', '工具行', 7, 26, 0.5],
+    ['quoteSize', '引用', 7, 26, 0.5],
+    ['timeSize', '时间', 6, 20, 0.5],
+    ['avatarSize', '头像', 14, 96, 1]
   ];
   var GAP_META = [
-    ['bubbleRadius', '圆角', 0, 28, 1],
-    ['rowGap', '行距', 2, 40, 1],
-    ['splitGap', '段距', 0, 24, 1],
-    ['gapHours', '隔多久', 0.5, 24, 0.5]
+    ['bubbleRadius', '圆角', 0, 40, 1],
+    ['rowGap', '行距', 0, 64, 1],
+    ['splitGap', '段距', 0, 40, 1],
+    ['gapHours', '隔多久', 0.2, 72, 0.2]
   ];
-  /* ⚠️ composerSize 最低 16：iOS Safari 聚焦更小的输入框会放大整页 */
   var BOX_META = [
-    ['composerSize', '输入字号', 16, 22, 0.5],
-    ['composerPad', '内边距', 4, 20, 1],
-    ['btnSize', '按钮', 28, 48, 1]
+    ['composerSize', '输入字号', 11, 28, 0.5],
+    ['composerPad', '内边距', 0, 32, 1],
+    ['btnSize', '按钮', 20, 64, 1]
   ];
   var META = SIZE_META.concat(GAP_META, BOX_META);
   var TOOLS = [['align', '对齐'], ['full', '整行'], ['hide', '藏起来']];
@@ -641,8 +644,7 @@ html{
     if (row) row.classList.add('apv-quoted');
   }
 
-  /* ── 给一行挂上所有能当选择器用的钩子 ──────────────────────────
-     原来只有 .apv / .apv-split 两个，能改的地方太少。 */
+  /* ── 给一行挂上所有能当选择器用的钩子 ── */
   function tagRow(row, bub, mine, at) {
     row.classList.add('apv', mine ? 'apv-me' : 'apv-gu');
     row.setAttribute('data-who', mine ? 'me' : 'gu');
@@ -785,8 +787,6 @@ html{
   }
 
   /* ═══ 引用 ═══════════════════════════════════════════════════
-     长按气泡 → 小菜单 → 引用条挂在输入框上方 → 发送时拼进 box.value。
-
      ⚠️ 长按不用 contextmenu：iOS Safari 上那个会连带弹系统的
      「复制/查找」菜单，两个叠在一起。自己数 touchstart→touchend 的
      时间，超过 480ms 且手指没动超过 10px 才算。 */
@@ -1023,7 +1023,7 @@ html{
         '<div class="apv-font">' +
           '<div class="fname" data-fname>还是系统字体</div>' +
           '<div class="fsub" data-fsub>传个 ttf / otf / woff 上来就换 —— ' +
-            '不用直链，直接选文件。中文字体几兆是常事，上限 12MB。</div>' +
+            '不用直链，直接选文件。上限 20MB。</div>' +
           '<div class="try">好看的字，说给你听的话。0123456789</div>' +
           '<div class="frow">' +
             '<label class="up">选字体文件' +
@@ -1111,13 +1111,10 @@ html{
           '<i>拆出来的中间几段头像淡一点：</i><br>' +
           '<code>#log .apv-split:not(.apv-first) .apv-av{opacity:.45}</code>' +
 
-          '<b>三个坑</b>' +
-          '圆角别写 <code>999px</code> —— 单行好看，多行会撑成椭圆，' +
-          '<code>20px</code> 上下都对。<br>' +
+          '<b>两个坑</b>' +
+          '圆角别写 <code>999px</code> —— 单行好看，多行会撑成椭圆。<br>' +
           '选择器前面那个 <code>#log</code> 别省 —— <code>.row</code> 这名字' +
-          '页面里别处也在用，写宽了会把锁屏弄坏。<br>' +
-          '<code>#box</code> 的字号别写到 16px 以下 —— iOS 一聚焦就会' +
-          '把整页放大，退不回来。' +
+          '页面里别处也在用，写宽了会把锁屏弄坏。' +
         '</p>' +
         '<div class="apv-btns">' +
           '<button type="button" data-apv-reset="1">还原默认</button>' +
@@ -1206,7 +1203,8 @@ html{
       if (el.hasAttribute && el.hasAttribute('data-fontup') && el.files && el.files[0]) {
         var f = el.files[0];
         var sub = sheet.querySelector('[data-fsub]');
-        if (sub) sub.textContent = '正在传 ' + f.name + '…';
+        var mb = (f.size / 1048576).toFixed(1);
+        if (sub) sub.textContent = '正在传 ' + f.name + '（' + mb + 'MB）…';
         var ff = new FormData();
         ff.append('file', f);
         fetch('api/appearance/font', { method: 'POST', body: ff })
@@ -1220,7 +1218,7 @@ html{
           })
           .catch(function (err) {
             if (sub) sub.textContent = '没传上去（' + (err.message || '不知道为什么')
-              + '）。ttf / otf / woff / woff2，12MB 以内。';
+              + '）。ttf / otf / woff / woff2，20MB 以内。';
           });
         el.value = '';
       }
@@ -1256,7 +1254,7 @@ html{
       fs.textContent = fontInfo.name
         ? ('传上来的是 ' + fontInfo.name +
            (cfg.fontFamily ? '，正在用' : '，现在没在用'))
-        : '传个 ttf / otf / woff 上来就换 —— 不用直链，直接选文件。中文字体几兆是常事，上限 12MB。';
+        : '传个 ttf / otf / woff 上来就换 —— 不用直链，直接选文件。上限 20MB。';
     }
     var ta = sheet.querySelector('.apv-css');
     if (ta && ta.value !== cfg.css) ta.value = cfg.css || '';
@@ -1488,7 +1486,7 @@ def register_appearance_feature(server_module):
         if not blob:
             return jsonify({"ok": False, "error": "文件是空的"}), 400
         if len(blob) > FONT_MAX:
-            return jsonify({"ok": False, "error": "超过 12MB"}), 413
+            return jsonify({"ok": False, "error": "超过 20MB"}), 413
 
         for old in FONT_EXT:
             p = font_dir / ("user" + old)
