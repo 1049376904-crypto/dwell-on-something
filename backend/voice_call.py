@@ -8,7 +8,11 @@
 中间打断不了。要做到真通话得换整条底层，那是另一件事。
 
 ⚠️ 每一句都要合成，ElevenLabs 按字符收钱。界面上那个计数就是这通电话
-花掉的字符数，别当装饰看。
+花掉的字符数，别当装饰看。服务端给 TTS 做了磁盘缓存，同一句重听不花钱。
+
+⚠️ 上传成功后必须把 `d.name` 记进 localStorage（键 `dwellVoiceFiles`），
+key 用那行标记的**原文**（含转写文字）—— 跟 voice_feature 里 `el._vzKey`
+的取法完全一致。差一个字就配不上，退出通话后那条语音就点不开。
 
 形状照 ChatGPT Voice Mode "Bloop" 的 GLSL 源码搬的（那份 shader 被人从
 Android APK 里反编译出来了），走 isNewBloop == false 那一支：纯黑扁平，
@@ -93,6 +97,11 @@ CLIENT_SCRIPT = r"""
   if (window.dwellCall) return;
   var TOKEN = '__VOICE_TOKEN__';
   var CALL_HINT = '[通话中]';
+  /* 这两个键名跟 voice_feature 那边是约定，改了就配不上。
+     FILES: 那行标记原文 → 存在服务器上的录音文件名
+     SAID : 他说的正文     → TTS 缓存键（复听不用再合成） */
+  var LS_FILES = 'dwellVoiceFiles';
+  var LS_SAID = 'dwellVoiceSaid';
 
   var E = 2.71828182846, PI = Math.PI;
 
@@ -162,6 +171,21 @@ CLIENT_SCRIPT = r"""
     return (inner < 0 ? inner : 0) + Math.sqrt(mx * mx + my * my) - r;
   }
 
+  /* ═══ 存那两张表 ═══════════════════════════════════════════════
+     ⚠️ FILES 的 key 必须是标记原文（含转写文字），跟 voice_feature 里
+     el._vzKey 的取法完全一致 —— 差一个字，退出通话后就点不开那条语音。 */
+  function lsGet(k) {
+    try { return JSON.parse(localStorage.getItem(k) || '{}'); } catch (e) { return {}; }
+  }
+  function lsPut(k, key, val) {
+    if (!key || !val) return;
+    var m = lsGet(k);
+    m[key] = val;
+    var ks = Object.keys(m);
+    while (ks.length > 400) { delete m[ks.shift()]; }
+    try { localStorage.setItem(k, JSON.stringify(m)); } catch (e) {}
+  }
+
   /* ═══ 状态 ═══════════════════════════════════════════════════ */
   var LABEL = { idle: 'Idle', listening: 'Listening',
                 thinking: 'Thinking', speaking: 'Speaking' };
@@ -182,6 +206,7 @@ CLIENT_SCRIPT = r"""
     if (TOKEN) h['X-Voice-Token'] = TOKEN;
     return h;
   }
+  function qtok() { return TOKEN ? '?t=' + encodeURIComponent(TOKEN) : ''; }
   function fmt(s) {
     s = Math.max(0, Math.round(s));
     return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
@@ -325,9 +350,7 @@ CLIENT_SCRIPT = r"""
       }
     }
 
-    /* ── alpha：源码里每个态各管各的，不是一个全局透明度。
-       idle 按 0.7 秒周期呼吸，listen 音量越大越淡，
-       think 硬置 1.0，speak 混到 displayColor 的 1.0。 */
+    /* ── alpha：源码里每个态各管各的，不是一个全局透明度。 */
     var al = Math.sin((PI / 0.7) * t) * 0.175 + 0.825;
     if (L.amount > 0.001) {
       var listenAnim = Math.max(0, Math.min(1, spring(scaled(0, 0.9, t - L.ts), 1)));
@@ -399,12 +422,10 @@ CLIENT_SCRIPT = r"""
     if (!ctx || !live || !img) return;
     var time = (now - T0) / 1000;
 
-    // 各态 amount 往目标滑：这就是 shader 里 stateXxx 的作用
     for (var k in ST) {
       ST[k].amount += ((phase === k ? 1 : 0) - ST[k].amount) * 0.14;
     }
 
-    // 安静程度：speaking 时用它驱动那点小摆动
     if (phase === 'speaking') {
       if (micLevel < 0.02) {
         if (silenceAmount === 0) silenceTs = time;
@@ -429,7 +450,7 @@ CLIENT_SCRIPT = r"""
       }
     }
 
-    /* ── 第二遍：全分辨率双线性插值 + smoothstep，边缘一个半像素收干净 */
+    /* ── 第二遍：全分辨率双线性插值 + smoothstep */
     var data = img.data;
     data.fill(0);
     var ink0 = P.ink[0], ink1 = P.ink[1], ink2 = P.ink[2];
@@ -449,7 +470,6 @@ CLIENT_SCRIPT = r"""
         var d01 = dfield[rowB + ix], d11 = dfield[rowB + ix + 1];
         var d = (d00 + (d10 - d00) * tx) + ((d01 + (d11 - d01) * tx)
                                           - (d00 + (d10 - d00) * tx)) * ty;
-        // smoothstep(tol, 0, d)：形状内为 1，往外一个半像素淡到 0
         var u = (tol - d) / tol;
         if (u <= 0) continue;
         var al = (u >= 1 ? 1 : u * u * (3 - 2 * u)) * frameAlpha;
@@ -581,7 +601,6 @@ CLIENT_SCRIPT = r"""
     }
     node.getByteFrequencyData(fq);
     var n = fq.length;
-    // 四段：低 / 中低 / 中高 / 高，对应 shader 里 avgMag 的四个通道
     var edges = [0, (n * .06) | 0, (n * .18) | 0, (n * .42) | 0, n];
     for (var b = 0; b < 4; b++) {
       var s = 0, c = edges[b + 1] - edges[b];
@@ -738,15 +757,22 @@ CLIENT_SCRIPT = r"""
     fd.append('file', blob, 'voice' + extOf(mime));
     fd.append('duration', String(dur));
     var line = '[voice · ' + fmt(dur) + ']';
+    var name = '';
     try {
       var up = await fetch('api/voice/message', { method: 'POST', headers: hdr(), body: fd });
       if (up.ok) {
         var d = await up.json();
         if (d.message) line = d.message;
+        name = d.name || '';
       }
       var ms = Date.now() - t0;
       signal(ms < 900 ? 4 : ms < 2000 ? 3 : ms < 4000 ? 2 : 1);
     } catch (e) { signal(1); }
+
+    /* ⚠️ 这一句是复听的关键：把录音文件名记进 localStorage。
+       key 必须是标记原文（含转写文字），跟 voice_feature 里 el._vzKey
+       的取法一致 —— 之前漏了这一步，所以退出通话后只剩一行字。 */
+    if (name) lsPut(LS_FILES, line.trim(), name);
 
     var mine = line.replace(/^\[voice[^\]]*\]\s*/, '');
     say(mine || '说了 ' + fmt(dur), true);
@@ -774,6 +800,7 @@ CLIENT_SCRIPT = r"""
     say(text);
     chars += text.length;
     meta();
+    var url = '', blobUrl = '';
     try {
       var r = await fetch('api/voice/tts', {
         method: 'POST',
@@ -781,7 +808,20 @@ CLIENT_SCRIPT = r"""
         body: JSON.stringify({ text: text })
       });
       if (!r.ok) throw new Error('tts ' + r.status);
-      var url = URL.createObjectURL(await r.blob());
+      /* 服务端在响应头里给了缓存键。记下来 → 以后复听走
+         GET /api/voice/say/{key}，不再花钱重合成。
+         拿不到就退回 blob（老版本服务端没这个头）。 */
+      var key = r.headers.get('X-TTS-Key') || '';
+      if (key) {
+        lsPut(LS_SAID, text.trim(), key);
+        url = 'api/voice/say/' + key + qtok();
+        // 响应体已经在手上，直接用它播，省一次往返
+        blobUrl = URL.createObjectURL(await r.blob());
+        url = blobUrl;
+      } else {
+        blobUrl = URL.createObjectURL(await r.blob());
+        url = blobUrl;
+      }
       watchPlayer();
       await new Promise(function (res) {
         player.onended = res;
@@ -790,7 +830,6 @@ CLIENT_SCRIPT = r"""
         var p = player.play();
         if (p && p.catch) p.catch(function () { res(); });
       });
-      try { URL.revokeObjectURL(url); } catch (e) {}
     } catch (e) {
       // 合成挂了就让设备自己念，别把电话弄断
       try {
@@ -804,6 +843,8 @@ CLIENT_SCRIPT = r"""
           });
         }
       } catch (e2) {}
+    } finally {
+      if (blobUrl) { try { URL.revokeObjectURL(blobUrl); } catch (e3) {} }
     }
     micLevel = 0;
     AM[0] = AM[1] = AM[2] = AM[3] = 0;
@@ -875,6 +916,8 @@ CLIENT_SCRIPT = r"""
     for (var k in ST) { ST[k].amount = 0; }
     setPhase('idle', '');
     if (box) box.classList.remove('on');
+    // 挂断后让语音条重新扫一遍：刚存进 localStorage 的那几条能点开了
+    try { if (window.dwellVoice && window.dwellVoice.scan) window.dwellVoice.scan(); } catch (e) {}
   }
 
   function mountBtn() {
@@ -914,7 +957,9 @@ CLIENT_SCRIPT = r"""
     // 手动喂音量，不打电话也能看四颗方块跳：dwellCall.fake(0.7)
     fake: function (v) { micLevel = v; AM[0] = AM[1] = AM[2] = AM[3] = v; },
     // 改了 ss / 尺寸之后重建缓冲
-    refit: fit
+    refit: fit,
+    // 那两张表，查复听配没配上用
+    tables: function () { return { files: lsGet(LS_FILES), said: lsGet(LS_SAID) }; }
   };
 
   function boot() {
