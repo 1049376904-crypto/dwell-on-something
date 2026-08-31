@@ -8,7 +8,12 @@
 
 ⚠️ 自己那条语音的音频文件名存在浏览器 localStorage 里 —— 那行标记里不能
 带文件名，否则模型会读到一串乱码。清了浏览器数据，旧语音就只剩文字。
-他那条不受影响，是每次拿正文现合成的。
+
+⚠️ 两张表跟 voice_call.py 是共用的，键名和取键方式都得一致：
+- `dwellVoiceFiles`：标记原文（含转写文字）→ 服务器上的录音文件名
+- `dwellVoiceSaid` ：他说的正文 → TTS 缓存键（复听不用重新合成）
+通话那边上传完会往第一张表写，所以退出通话后那条语音这边直接能播。
+差一个空格就配不上，那条语音就只剩文字。
 """
 
 import os
@@ -71,13 +76,18 @@ CLIENT_SCRIPT = r"""
   if (window.dwellVoice) return;
   var TOKEN = '__VOICE_TOKEN__';
   var MARK = /^\[voice(?:\s*·\s*(\d+:\d+))?(?:\s*·\s*([a-z]+))?\]\s*/;
+  /* ⚠️ 这两个键名跟 voice_call.py 是共用约定，改了两边就对不上。
+     LSKEY : 标记原文（含转写文字）→ 服务器上的录音文件名
+     LSSAID: 他说的正文           → TTS 缓存键 */
   var LSKEY = 'dwellVoiceFiles';
+  var LSSAID = 'dwellVoiceSaid';
 
   function hdr(extra) {
     var h = extra || {};
     if (TOKEN) h['X-Voice-Token'] = TOKEN;
     return h;
   }
+  function qtok() { return TOKEN ? '?t=' + encodeURIComponent(TOKEN) : ''; }
   function fmt(s) {
     s = Math.max(0, Math.round(s));
     return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
@@ -89,16 +99,19 @@ CLIENT_SCRIPT = r"""
 
   /* 自己那条语音的音频文件名存本地：那行标记里不能带文件名，
      否则模型会读到一串乱码。清了浏览器数据就只剩文字。 */
-  function fileMap() {
-    try { return JSON.parse(localStorage.getItem(LSKEY) || '{}'); } catch (e) { return {}; }
+  function lsGet(k) {
+    try { return JSON.parse(localStorage.getItem(k) || '{}'); } catch (e) { return {}; }
   }
-  function remember(key, name) {
-    var m = fileMap();
-    m[key] = name;
+  function lsPut(k, key, val) {
+    if (!key || !val) return;
+    var m = lsGet(k);
+    m[key] = val;
     var ks = Object.keys(m);
     while (ks.length > 400) { delete m[ks.shift()]; }
-    try { localStorage.setItem(LSKEY, JSON.stringify(m)); } catch (e) {}
+    try { localStorage.setItem(k, JSON.stringify(m)); } catch (e) {}
   }
+  function fileMap() { return lsGet(LSKEY); }
+  function remember(key, name) { lsPut(LSKEY, key, name); }
 
   /* ── 录音 ───────────────────────────────────────────── */
   var rec = null, chunks = [], micStream = null, t0 = 0, tick = null;
@@ -331,7 +344,13 @@ CLIENT_SCRIPT = r"""
   var ttsCache = new Map();
   var playing = null;
 
-  async function ttsUrl(text) {
+  /* 他那条的音频地址。
+     先看本地有没有存过 TTS 缓存键 —— 有就走 GET /api/voice/say/{key}，
+     服务端直接吐磁盘上那份，一个字符都不花。
+     没有才调合成，顺手把响应头里的键记下来，下次就免费了。 */
+  async function saidUrl(text) {
+    var key = lsGet(LSSAID)[text.trim()];
+    if (key) return 'api/voice/say/' + key + qtok();
     if (ttsCache.has(text)) return ttsCache.get(text);
     var r = await fetch('api/voice/tts', {
       method: 'POST',
@@ -339,6 +358,8 @@ CLIENT_SCRIPT = r"""
       body: JSON.stringify({ text: text })
     });
     if (!r.ok) throw new Error('tts ' + r.status);
+    var got = r.headers.get('X-TTS-Key') || '';
+    if (got) lsPut(LSSAID, text.trim(), got);
     var url = URL.createObjectURL(await r.blob());
     ttsCache.set(text, url);
     return url;
@@ -394,7 +415,7 @@ CLIENT_SCRIPT = r"""
                 (TOKEN ? '?t=' + encodeURIComponent(TOKEN) : '');
         } else {
           if (!transcript) { toast('（没有文字，念不出来）'); return; }
-          url = await ttsUrl(transcript);
+          url = await saidUrl(transcript);
         }
         audio = new Audio(url);
         audio.onloadedmetadata = function () {
@@ -486,7 +507,11 @@ CLIENT_SCRIPT = r"""
     setInterval(function () { mountMic(); scan(); }, 900);
   }
 
-  window.dwellVoice = { start: start, finish: finish, cancel: cancel, scan: scan };
+  window.dwellVoice = {
+    start: start, finish: finish, cancel: cancel, scan: scan,
+    // 查复听配没配上：files 是录音，said 是合成缓存键
+    tables: function () { return { files: lsGet(LSKEY), said: lsGet(LSSAID) }; }
+  };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
   } else { boot(); }
