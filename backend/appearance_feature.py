@@ -8,6 +8,10 @@ class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd 
 布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
 而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
 
+⚠️ 气泡圆角别用 999px。那个值对单行是圆条，对多行就是椭圆 —— 长段落
+两侧会鼓出巨大的弧。用 20px 这种固定值：单行高度约 40px，20px 已经是
+两头半圆；多行也只是四角圆，不变形。
+
 ⚠️ 面板借了上游 `.sheet` 的壳，那个壳自带 padding 和布局。往里塞
 `width:100%` 的 textarea 或 `flex:1` 的滑块，加起来超过内容宽度就会把壳
 顶开。所以 `#apvSheet .sheet` 上写死了 box-sizing / width / max-width /
@@ -110,7 +114,8 @@ CLIENT_SCRIPT = r"""
   opacity:.72;white-space:nowrap;font-variant-numeric:tabular-nums;
   text-align:center;letter-spacing:.01em}
 
-/* 日期分隔条。是 #log 的直接子元素，不进 .row —— 免得又踩到那一层 */
+/* 日期分隔条。是 #log 的直接子元素，不进 .row —— 免得又踩到那一层。
+   这里 999px 是对的：单行短文本，两头半圆正好。 */
 #log .apv-day{display:flex;justify-content:center;
   margin:calc(var(--apv-gap) + 6px) auto;max-width:720px}
 #log .apv-day > span{font-size:calc(var(--apv-time) + .5px);
@@ -212,30 +217,44 @@ CLIENT_SCRIPT = r"""
     ['gapHours', '隔多久', 0.5, 24, 0.5]
   ];
 
-  /* 圆条气泡：两边都是纯圆角胶囊，不带小尖角。
-     灌进自由 CSS 那栏，之后就是普通的用户 CSS，可以随便改、清空即恢复。 */
+  /* 圆条气泡。
+     ⚠️ 圆角是 20px 不是 999px：999px 单行好看，多行会撑成椭圆 ——
+     长段落两侧鼓出巨大的弧，实际就是个药丸裹着一段话。20px 时单行
+     高度约 40px、两头正好半圆，多行也只是四角圆。
+     图片和表情包单独挑出来去掉内边距和背景，不然会被切圆。
+     颜色写死不用 color-mix()：那函数 Safari 16.4 起才有。 */
   var PRESET = [
-    '/* 圆条气泡 · 改坏了按「还原默认」或者清空这里 */',
+    '/* 圆条气泡 · 不想要了就清空这一栏 */',
     '#log .row.apv > .bubble,',
     '#log .row.apv > .gu {',
     '  padding: 9px 15px;',
-    '  border-radius: 999px;',
+    '  border-radius: 20px;',
     '  line-height: 1.62;',
     '}',
+    '',
     '/* 你说的 */',
     '#log .row.apv > .bubble {',
-    '  background: color-mix(in srgb, var(--accent) 14%, var(--bg));',
-    '  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);',
+    '  background: rgba(201, 100, 66, .10);',
+    '  border: 1px solid rgba(201, 100, 66, .16);',
     '  color: var(--text);',
     '}',
+    '',
     '/* 他说的 */',
     '#log .row.apv > .gu {',
     '  background: var(--card);',
     '  border: 1px solid var(--line);',
     '}',
-    '/* 多行的时候圆角收一点，不然长段落看着怪 */',
-    '#log .row.apv > .bubble:not(:has(br)),',
-    '#log .row.apv > .gu:not(:has(br)) { border-radius: 999px; }'
+    '',
+    '/* 表情包和图片：别包壳，也别被圆角切了 */',
+    '#log .row.apv > .bubble:has(img),',
+    '#log .row.apv > .gu:has(img) {',
+    '  padding: 0;',
+    '  background: transparent;',
+    '  border: 0;',
+    '}',
+    '#log .row.apv img {',
+    '  border-radius: 14px;',
+    '}'
   ].join('\n');
 
   function logEl() { return document.getElementById('log'); }
@@ -484,6 +503,7 @@ CLIENT_SCRIPT = r"""
           '<code>#log .row.apv &gt; .bubble</code> 你说的话<br>' +
           '<code>#log .row.apv &gt; .gu</code> 他说的话<br>' +
           '<code>#log .row.me.apv</code> 你那一行（整行）<br>' +
+          '<code>#log .row.apv img</code> 图片和表情包<br>' +
           '<code>#log .apv-av</code> 头像　<code>#log .apv-time</code> 时间<br>' +
           '<code>#log .apv-day &gt; span</code> 中间那个日期条<br>' +
           '<code>#log .toolline</code> 思考那一行' +
@@ -493,10 +513,11 @@ CLIENT_SCRIPT = r"""
           '上游的：<code>--bg</code> <code>--card</code> <code>--panel</code> ' +
           '<code>--line</code> <code>--text</code> <code>--dim</code> ' +
           '<code>--accent</code>' +
-          '<b>说明</b>' +
-          '这一栏原样注进页面，写坏了页面会难看，清空就好。' +
-          '选择器前面那个 <code>#log</code> 别省 —— ' +
-          '<code>.row</code> 这名字页面里别处也在用，写宽了会把锁屏弄坏。' +
+          '<b>两个坑</b>' +
+          '圆角别写 <code>999px</code> —— 单行好看，多行会撑成椭圆。' +
+          '<code>20px</code> 上下都对。<br>' +
+          '选择器前面那个 <code>#log</code> 别省 —— <code>.row</code> 这名字' +
+          '页面里别处也在用，写宽了会把锁屏弄坏。' +
         '</p>' +
         '<div class="apv-btns">' +
           '<button type="button" data-apv-reset="1">还原默认</button>' +
