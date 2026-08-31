@@ -2,6 +2,10 @@
 
 不改 web/index.html。在 index 视图外面再包一层，把客户端脚本注进去。
 
+字号是**四路分开**的：正文、语音条、工具行、引用各有自己的变量和滑块。
+一开始做成一个滑块牵着全部按比例缩，实际不好看 —— 那几处本来就不是
+一个量级的东西，同一个比例套上去总有一处别扭。
+
 ⚠️ 样式选择器一律锁进 `#log` 或 `#apvSheet`，一条都不能漏。`.row` 这个
 class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd .row`、
 `.rc-add .row`，锁屏那层里也有）。写成裸 `.row{display:flex}` 会把锁屏的
@@ -46,6 +50,9 @@ SETTINGS_KEY = "appearance"
 DEFAULTS = {
     "avatarSize": 34,       # 头像直径 px
     "fontSize": 14.5,       # 气泡正文 px
+    "voiceSize": 14.5,      # 语音条转写文字 px（时长自动取 .82 倍）
+    "toolSize": 14,         # 工具行 px（Thought process 那种）
+    "quoteSize": 13,        # 气泡里那段引用 px
     "bubbleRadius": 18,     # 气泡圆角 px
     "rowGap": 16,           # 两条消息之间 px
     "splitGap": 6,          # 同一条消息拆出来的段之间 px
@@ -63,6 +70,9 @@ DEFAULTS = {
 NUM_RANGE = {
     "avatarSize": (18, 72),
     "fontSize": (11, 22),
+    "voiceSize": (10, 22),
+    "toolSize": (9, 20),
+    "quoteSize": (9, 20),
     "bubbleRadius": (0, 28),
     "rowGap": (2, 40),
     "splitGap": (0, 24),
@@ -77,7 +87,11 @@ ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 
 
 def _clean(raw: dict) -> dict:
-    """把传进来的设置钳到合法范围。坏值一律回落到默认，不报错。"""
+    """把传进来的设置钳到合法范围。坏值一律回落到默认，不报错。
+
+    旧设置里没有新加的那几个键，这儿会用默认值补上 —— 升级后看着
+    跟原来一样，想分开调再动滑块。
+    """
     out = dict(DEFAULTS)
     if not isinstance(raw, dict):
         return out
@@ -99,10 +113,12 @@ def _clean(raw: dict) -> dict:
 
 CLIENT_SCRIPT = r"""
 <style id="apv-base">
-/* 变量挂在 #log 上，不放 :root —— 免得名字撞上别处 */
+/* 变量挂在 #log 上，不放 :root —— 免得名字撞上别处。
+   字号四路分开：正文 / 语音 / 工具行 / 引用，谁也不牵着谁。 */
 #log{
-  --apv-av:34px; --apv-font:14.5px; --apv-radius:18px;
-  --apv-gap:16px; --apv-split:6px; --apv-time:10.5px;
+  --apv-av:34px; --apv-font:14.5px; --apv-voice:14.5px;
+  --apv-tool:14px; --apv-quote:13px;
+  --apv-radius:18px; --apv-gap:16px; --apv-split:6px; --apv-time:10.5px;
 }
 
 /* ⚠️ 下面每一条都必须带 #log 前缀。
@@ -128,29 +144,28 @@ CLIENT_SCRIPT = r"""
   opacity:.72;white-space:nowrap;font-variant-numeric:tabular-nums;
   text-align:center;letter-spacing:.01em}
 
-/* ── 语音条也跟着字号走 ────────────────────────────────────────
+/* ── 语音条：自己一路字号 ──────────────────────────────────────
    ⚠️ voice_feature 那边把 .vz-dur 写死成 12px、.vz-txt 写死成 14.5px。
    要盖住它得靠特异性：那边是 (0,1,0)，这边 #log .row.apv .vz-dur 是
    (1,2,0)。只写 .vz-dur 是平手，而这段注入在它前面，会输。 */
-#log .row.apv .vz{font-size:var(--apv-font);
-  min-width:calc(var(--apv-font) * 7.2);
-  gap:calc(var(--apv-font) * .62);
-  padding:calc(var(--apv-font) * .48) calc(var(--apv-font) * .9)
-          calc(var(--apv-font) * .48) calc(var(--apv-font) * .76)}
-#log .row.apv .vz-ico{width:calc(var(--apv-font) * 1.04);
-  height:calc(var(--apv-font) * 1.04)}
-#log .row.apv .vz-wave{height:calc(var(--apv-font) * 1.04)}
-#log .row.apv .vz-dur{font-size:calc(var(--apv-font) * .82)}
-#log .row.apv .vz-txt{font-size:var(--apv-font);
-  margin-top:calc(var(--apv-font) * .48)}
+#log .row.apv .vz{font-size:var(--apv-voice);
+  min-width:calc(var(--apv-voice) * 7.2);
+  gap:calc(var(--apv-voice) * .62);
+  padding:calc(var(--apv-voice) * .48) calc(var(--apv-voice) * .9)
+          calc(var(--apv-voice) * .48) calc(var(--apv-voice) * .76)}
+#log .row.apv .vz-ico{width:calc(var(--apv-voice) * 1.04);
+  height:calc(var(--apv-voice) * 1.04)}
+#log .row.apv .vz-wave{height:calc(var(--apv-voice) * 1.04)}
+#log .row.apv .vz-dur{font-size:calc(var(--apv-voice) * .82)}
+#log .row.apv .vz-txt{font-size:var(--apv-voice);
+  margin-top:calc(var(--apv-voice) * .48)}
 
-/* 工具行（Thought process 那种）：上游写死 14.5px，这儿也接过来。
-   前面那个转圈/时钟图标一起缩，不然字大了图标显得小一号。 */
-#log .row .toolline{font-size:calc(var(--apv-font) * .98)}
+/* ── 工具行：自己一路字号。上游写死 14.5px，这儿接过来 ── */
+#log .row .toolline{font-size:var(--apv-tool)}
 #log .row .toolline .ic,
-#log .row .toolline .spin{width:calc(var(--apv-font) * .92);
-  height:calc(var(--apv-font) * .92)}
-#log .row .toolline .chev{font-size:calc(var(--apv-font) * .88)}
+#log .row .toolline .spin{width:calc(var(--apv-tool) * .94);
+  height:calc(var(--apv-tool) * .94)}
+#log .row .toolline .chev{font-size:calc(var(--apv-tool) * .9)}
 
 /* 日期分隔条。是 #log 的直接子元素，不进 .row。 */
 #log .apv-day{display:flex;justify-content:center;
@@ -160,12 +175,13 @@ CLIENT_SCRIPT = r"""
   border:1px solid var(--line,#e8e5dc);background:transparent;
   letter-spacing:.02em;white-space:nowrap;font-variant-numeric:tabular-nums}
 
-/* 气泡里那段引用：左边一道竖线，文字压淡 */
+/* ── 引用：自己一路字号（气泡里那段 + 输入框上方那条） ── */
 #log .apv-qbox{border-left:2.5px solid var(--line,#e8e5dc);
   padding:1px 0 1px 10px;margin:0 0 7px;opacity:.78;
-  font-size:.92em;line-height:1.6;white-space:pre-wrap;word-break:break-word}
-#log .apv-qbox b{display:block;font-weight:600;font-size:.9em;opacity:.7;
-  margin-bottom:2px}
+  font-size:var(--apv-quote);line-height:1.6;
+  white-space:pre-wrap;word-break:break-word}
+#log .apv-qbox b{display:block;font-weight:600;
+  font-size:calc(var(--apv-quote) * .9);opacity:.7;margin-bottom:2px}
 
 /* 工具行缩进：默认跟气泡左边对齐 */
 #log.apv-tool-align .row:not(.apv) > .toolline{
@@ -190,17 +206,19 @@ CLIENT_SCRIPT = r"""
   cursor:pointer;white-space:nowrap}
 #apvMenu button:active{background:var(--panel,#f0eee6)}
 
-/* ── 输入框上方那条引用 ── */
+/* ── 输入框上方那条引用。字号跟着 --apv-quote，
+      但它在 .composer 里、不在 #log 里，所以变量要单独挂一份 ── */
 #apvQuote{display:none;align-items:flex-start;gap:9px;
+  --apv-quote:13px;
   margin:0 0 8px;padding:8px 10px 8px 0;
   border-left:2.5px solid var(--accent,#c96442);
   background:transparent}
 #apvQuote.on{display:flex}
 #apvQuote .qt{flex:1 1 auto;min-width:0;padding-left:10px;
-  font-size:12.5px;line-height:1.55;color:var(--dim,#8a867c);
-  max-height:3.2em;overflow:hidden}
+  font-size:var(--apv-quote);line-height:1.55;color:var(--dim,#8a867c);
+  max-height:3.4em;overflow:hidden}
 #apvQuote .qt b{display:block;color:var(--text,#2b2a27);opacity:.8;
-  font-weight:600;font-size:11.5px;margin-bottom:1px}
+  font-weight:600;font-size:calc(var(--apv-quote) * .9);margin-bottom:1px}
 #apvQuote .qx{flex:0 0 auto;width:28px;height:28px;border:0;padding:0;
   background:transparent;color:var(--dim,#8a867c);cursor:pointer;
   display:flex;align-items:center;justify-content:center}
@@ -217,7 +235,10 @@ CLIENT_SCRIPT = r"""
 #apvSheet .grabber{width:38px;margin-left:auto;margin-right:auto}
 #apvSheet .apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;
   color:var(--text,#2b2a27)}
-#apvSheet .apv-line{display:flex;align-items:center;gap:10px;padding:8px 0;
+/* 小节标题：九个滑块堆一起找不到要调哪个，分成"多大"和"多远"两组 */
+#apvSheet .apv-grp{font-size:11px;letter-spacing:.12em;
+  color:var(--dim,#8a867c);opacity:.7;margin:14px 0 2px}
+#apvSheet .apv-line{display:flex;align-items:center;gap:10px;padding:7px 0;
   min-width:0}
 #apvSheet .apv-line > label{flex:0 0 60px;min-width:0;font-size:13.5px;
   color:var(--dim,#8a867c);overflow:hidden;text-overflow:ellipsis;
@@ -288,21 +309,30 @@ CLIENT_SCRIPT = r"""
   if (window.dwellAppearance) return;
 
   var DEF = {
-    avatarSize: 34, fontSize: 14.5, bubbleRadius: 18, rowGap: 16, splitGap: 6,
-    timeSize: 10.5, gapHours: 5,
+    avatarSize: 34, fontSize: 14.5, voiceSize: 14.5, toolSize: 14, quoteSize: 13,
+    bubbleRadius: 18, rowGap: 16, splitGap: 6, timeSize: 10.5, gapHours: 5,
     showAvatar: true, showTime: true, showDay: true, split: true, quote: true,
     toolMode: 'align', css: ''
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
-  var META = [
-    ['avatarSize', '头像', 18, 72, 1],
-    ['fontSize', '字号', 11, 22, 0.5],
+
+  /* 滑块分两组：上面管"多大"，下面管"多远"。
+     每项：[键, 标签, 最小, 最大, 步长] */
+  var SIZE_META = [
+    ['fontSize', '正文', 11, 22, 0.5],
+    ['voiceSize', '语音', 10, 22, 0.5],
+    ['toolSize', '工具', 9, 20, 0.5],
+    ['quoteSize', '引用', 9, 20, 0.5],
+    ['timeSize', '时间', 8, 16, 0.5],
+    ['avatarSize', '头像', 18, 72, 1]
+  ];
+  var GAP_META = [
     ['bubbleRadius', '圆角', 0, 28, 1],
     ['rowGap', '行距', 2, 40, 1],
     ['splitGap', '段距', 0, 24, 1],
-    ['timeSize', '时间', 8, 16, 0.5],
     ['gapHours', '隔多久', 0.5, 24, 0.5]
   ];
+  var META = SIZE_META.concat(GAP_META);
   var TOOLS = [['align', '对齐'], ['full', '整行'], ['hide', '藏起来']];
   var NAME = { me: '妍妍', gu: '沐' };
 
@@ -397,13 +427,17 @@ CLIENT_SCRIPT = r"""
     return head + ' ' + hm;
   }
 
-  /* ── 应用设置：变量和开关 class 都挂在 #log 上 ───────────────── */
+  /* ── 应用设置 ─────────────────────────────────────────────────
+     变量挂在 #log 上；输入框上方那条引用不在 #log 里，单独再挂一份。 */
   function apply() {
     var L = logEl();
     if (L) {
       var s = L.style;
       s.setProperty('--apv-av', cfg.avatarSize + 'px');
       s.setProperty('--apv-font', cfg.fontSize + 'px');
+      s.setProperty('--apv-voice', cfg.voiceSize + 'px');
+      s.setProperty('--apv-tool', cfg.toolSize + 'px');
+      s.setProperty('--apv-quote', cfg.quoteSize + 'px');
       s.setProperty('--apv-radius', cfg.bubbleRadius + 'px');
       s.setProperty('--apv-gap', cfg.rowGap + 'px');
       s.setProperty('--apv-split', cfg.splitGap + 'px');
@@ -414,6 +448,7 @@ CLIENT_SCRIPT = r"""
       L.classList.toggle('apv-tool-align', cfg.toolMode === 'align');
       L.classList.toggle('apv-tool-hide', cfg.toolMode === 'hide');
     }
+    if (quoteBar) quoteBar.style.setProperty('--apv-quote', cfg.quoteSize + 'px');
     var tag = document.getElementById('apv-user');
     if (tag) tag.textContent = cfg.css || '';
   }
@@ -704,6 +739,7 @@ CLIENT_SCRIPT = r"""
     // 塞在附件条前面，也就是输入框正上方
     composer.insertBefore(quoteBar, composer.firstChild);
     quoteBar.querySelector('.qx').onclick = clearQuote;
+    quoteBar.style.setProperty('--apv-quote', cfg.quoteSize + 'px');
     return quoteBar;
   }
 
@@ -823,20 +859,22 @@ CLIENT_SCRIPT = r"""
     }, 420);
   }
 
+  function sliderRow(m) {
+    return '<div class="apv-line"><label for="apv-' + m[0] + '">' + m[1] + '</label>' +
+      '<input type="range" id="apv-' + m[0] + '" data-k="' + m[0] + '" min="' + m[2] +
+      '" max="' + m[3] + '" step="' + m[4] + '">' +
+      '<span class="apv-val" data-v="' + m[0] + '"></span></div>';
+  }
+
   function buildSheet() {
     if (sheet) return;
     sheet = document.createElement('div');
     sheet.className = 'sheetWrap';
     sheet.id = 'apvSheet';
 
-    var lines = '';
-    for (var i = 0; i < META.length; i++) {
-      var m = META[i];
-      lines += '<div class="apv-line"><label for="apv-' + m[0] + '">' + m[1] + '</label>' +
-        '<input type="range" id="apv-' + m[0] + '" data-k="' + m[0] + '" min="' + m[2] +
-        '" max="' + m[3] + '" step="' + m[4] + '">' +
-        '<span class="apv-val" data-v="' + m[0] + '"></span></div>';
-    }
+    var sizes = '', gaps = '', i;
+    for (i = 0; i < SIZE_META.length; i++) sizes += sliderRow(SIZE_META[i]);
+    for (i = 0; i < GAP_META.length; i++) gaps += sliderRow(GAP_META[i]);
 
     var seg = '<div class="apv-line"><label>工具行</label><div class="apv-seg">';
     for (var t = 0; t < TOOLS.length; t++) {
@@ -855,8 +893,10 @@ CLIENT_SCRIPT = r"""
           '<label class="apv-pick"><i data-pick="gu"></i><span class="t">他的头像</span>' +
             '<input type="file" accept="image/*" data-up="gu"></label>' +
         '</div>' +
-        '<div class="apv-sep"></div>' +
-        lines +
+        '<div class="apv-grp">多大</div>' +
+        sizes +
+        '<div class="apv-grp">多远</div>' +
+        gaps +
         '<div class="apv-sep"></div>' +
         '<div class="apv-line"><label>拆气泡</label>' +
           '<button type="button" class="apv-sw" data-sw="split" ' +
@@ -895,8 +935,11 @@ CLIENT_SCRIPT = r"""
           '<code>#log .apv-day &gt; span</code> 中间那个日期条<br>' +
           '<code>#log .row .toolline</code> 思考那一行' +
           '<b>能用的变量</b>' +
-          '<code>--apv-av</code> <code>--apv-font</code> <code>--apv-radius</code> ' +
-          '<code>--apv-gap</code> <code>--apv-split</code> <code>--apv-time</code><br>' +
+          '<code>--apv-font</code> 正文　<code>--apv-voice</code> 语音<br>' +
+          '<code>--apv-tool</code> 工具行　<code>--apv-quote</code> 引用<br>' +
+          '<code>--apv-av</code> 头像　<code>--apv-time</code> 时间<br>' +
+          '<code>--apv-radius</code> 圆角　<code>--apv-gap</code> 行距　' +
+          '<code>--apv-split</code> 段距<br>' +
           '上游的：<code>--bg</code> <code>--card</code> <code>--panel</code> ' +
           '<code>--line</code> <code>--text</code> <code>--dim</code> ' +
           '<code>--accent</code>' +
@@ -905,8 +948,8 @@ CLIENT_SCRIPT = r"""
           '<code>20px</code> 上下都对。<br>' +
           '选择器前面那个 <code>#log</code> 别省 —— <code>.row</code> 这名字' +
           '页面里别处也在用，写宽了会把锁屏弄坏。<br>' +
-          '改语音条和工具行要写足前缀（<code>#log .row.apv .vz-dur</code>），' +
-          '光写 <code>.vz-dur</code> 盖不住它们自带的字号。' +
+          '改语音条要写足前缀（<code>#log .row.apv .vz-dur</code>），' +
+          '光写 <code>.vz-dur</code> 盖不住它自带的字号。' +
         '</p>' +
         '<div class="apv-btns">' +
           '<button type="button" data-apv-reset="1">还原默认</button>' +
