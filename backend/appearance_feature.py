@@ -1,4 +1,4 @@
-"""dwell 外观：气泡头像、时间戳、日期分隔条，和一个能实时调的外观面板。
+"""dwell 外观：气泡拆分、头像、时间戳、日期分隔条，和一个能实时调的外观面板。
 
 不改 web/index.html。在 index 视图外面再包一层，把客户端脚本注进去。
 
@@ -9,20 +9,15 @@ class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd 
 而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
 
 ⚠️ 气泡圆角别用 999px。那个值对单行是圆条，对多行就是椭圆 —— 长段落
-两侧会鼓出巨大的弧。用 20px 这种固定值：单行高度约 40px，20px 已经是
-两头半圆；多行也只是四角圆，不变形。
+两侧会鼓出巨大的弧。用 20px 这种固定值。
 
-⚠️ 面板借了上游 `.sheet` 的壳，那个壳自带 padding 和布局。往里塞
-`width:100%` 的 textarea 或 `flex:1` 的滑块，加起来超过内容宽度就会把壳
-顶开。所以 `#apvSheet .sheet` 上写死了 box-sizing / width / max-width /
-overflow-x，内部所有横向元素都得 `min-width:0`。
+⚠️ 拆气泡只拆定稿的（`el._final`）。流式那条边写边拆会一帧一个样。
+代码块里的空行不算分割点 —— 按 ``` 的奇偶记状态，围栏内跳过。
 
-⚠️ 头像插进上游 `.row` 的结构里（`row()` 建行、`addMe()` 塞 `.bubble`、
-他那条是 `.gu`）。上游哪天改了那几个函数，头像就不显示了 —— 不会崩，
-但会静默失效。这是注入路线的代价。
+⚠️ 面板借了上游 `.sheet` 的壳，那个壳自带 padding。往里塞 `width:100%`
+的 textarea 会把壳顶开，所以盒模型写死、横向元素一律 `min-width:0`。
 
-设置存在 settings 表里，不用 localStorage：换个设备就没了，而且
-iPad 和手机会看到不一样的样子。
+设置存在 settings 表里，不用 localStorage：换个设备就没了。
 
 删掉 run.py 里那一行就完全没有这个功能，别的都不受影响。
 """
@@ -45,11 +40,14 @@ DEFAULTS = {
     "fontSize": 14.5,       # 气泡正文 px
     "bubbleRadius": 18,     # 气泡圆角 px
     "rowGap": 16,           # 两条消息之间 px
+    "splitGap": 6,          # 同一条消息拆出来的段之间 px
     "timeSize": 10.5,       # 时间戳 px
     "gapHours": 5,          # 隔这么久才插日期分隔条
     "showAvatar": True,
     "showTime": True,
     "showDay": True,
+    "split": True,          # 空行拆成独立气泡
+    "toolMode": "align",    # 工具行：align 跟气泡对齐 / full 独占一行 / hide 藏起来
     "css": "",              # 自由 CSS，原样注入
 }
 
@@ -58,9 +56,12 @@ NUM_RANGE = {
     "fontSize": (11, 22),
     "bubbleRadius": (0, 28),
     "rowGap": (2, 40),
+    "splitGap": (0, 24),
     "timeSize": (8, 16),
     "gapHours": (0.5, 24),
 }
+
+TOOL_MODES = ("align", "full", "hide")
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".webp": "image/webp", ".gif": "image/gif"}
@@ -77,9 +78,11 @@ def _clean(raw: dict) -> dict:
                 out[key] = max(low, min(high, float(raw[key])))
             except (TypeError, ValueError):
                 pass
-    for key in ("showAvatar", "showTime", "showDay"):
+    for key in ("showAvatar", "showTime", "showDay", "split"):
         if key in raw:
             out[key] = bool(raw[key])
+    if raw.get("toolMode") in TOOL_MODES:
+        out["toolMode"] = raw["toolMode"]
     if "css" in raw and isinstance(raw["css"], str):
         out["css"] = raw["css"][:CSS_MAX]
     return out
@@ -90,7 +93,7 @@ CLIENT_SCRIPT = r"""
 /* 变量挂在 #log 上，不放 :root —— 免得名字撞上别处 */
 #log{
   --apv-av:34px; --apv-font:14.5px; --apv-radius:18px;
-  --apv-gap:16px; --apv-time:10.5px;
+  --apv-gap:16px; --apv-split:6px; --apv-time:10.5px;
 }
 
 /* ⚠️ 下面每一条都必须带 #log 前缀。
@@ -102,6 +105,8 @@ CLIENT_SCRIPT = r"""
 #log .row.apv > .bubble,
 #log .row.apv > .gu{min-width:0;font-size:var(--apv-font)}
 #log .row.apv > .bubble{border-radius:var(--apv-radius)}
+/* 同一条消息拆出来的几段之间收紧，跟"两条消息"区分开 */
+#log .row.apv.apv-split{margin-bottom:var(--apv-split)}
 
 #log .apv-side{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;
   gap:3px;width:var(--apv-av);padding-top:2px}
@@ -114,7 +119,7 @@ CLIENT_SCRIPT = r"""
   opacity:.72;white-space:nowrap;font-variant-numeric:tabular-nums;
   text-align:center;letter-spacing:.01em}
 
-/* 日期分隔条。是 #log 的直接子元素，不进 .row —— 免得又踩到那一层。
+/* 日期分隔条。是 #log 的直接子元素，不进 .row。
    这里 999px 是对的：单行短文本，两头半圆正好。 */
 #log .apv-day{display:flex;justify-content:center;
   margin:calc(var(--apv-gap) + 6px) auto;max-width:720px}
@@ -122,6 +127,12 @@ CLIENT_SCRIPT = r"""
   color:var(--dim,#8a867c);opacity:.78;padding:3px 11px;border-radius:999px;
   border:1px solid var(--line,#e8e5dc);background:transparent;
   letter-spacing:.02em;white-space:nowrap;font-variant-numeric:tabular-nums}
+
+/* 工具行（Thought process 那种）。默认缩进到跟气泡左边对齐 ——
+   顶在最左边看着跟气泡是断开的。 */
+#log.apv-tool-align .row:not(.apv) > .toolline{
+  margin-left:calc(var(--apv-av) + 9px)}
+#log.apv-tool-hide .row:not(.apv) > .toolline{display:none}
 
 /* 开关那几个 class 也挂在 #log 上，不挂 body */
 #log.apv-hide-av .apv-av{display:none}
@@ -142,7 +153,7 @@ CLIENT_SCRIPT = r"""
   color:var(--text,#2b2a27)}
 #apvSheet .apv-line{display:flex;align-items:center;gap:10px;padding:8px 0;
   min-width:0}
-#apvSheet .apv-line > label{flex:0 0 64px;min-width:0;font-size:13.5px;
+#apvSheet .apv-line > label{flex:0 0 60px;min-width:0;font-size:13.5px;
   color:var(--dim,#8a867c);overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
 #apvSheet .apv-line input[type=range]{flex:1 1 0;min-width:0;width:auto;
@@ -164,6 +175,15 @@ CLIENT_SCRIPT = r"""
   transition:transform .2s ease;box-shadow:0 1px 3px rgba(0,0,0,.18)}
 #apvSheet .apv-sw.on{background:var(--accent,#c96442)}
 #apvSheet .apv-sw.on::after{transform:translateX(18px)}
+/* 三档那个：一排小药丸 */
+#apvSheet .apv-seg{flex:1 1 0;min-width:0;display:flex;gap:4px;padding:3px;
+  background:var(--panel,#f0eee6);border-radius:999px}
+#apvSheet .apv-seg button{flex:1 1 0;min-width:0;border:0;background:transparent;
+  color:var(--dim,#8a867c);font-family:inherit;font-size:12.5px;padding:7px 4px;
+  border-radius:999px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+#apvSheet .apv-seg button.on{background:var(--card,#fff);color:var(--text,#2b2a27);
+  font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 #apvSheet .apv-avs{display:flex;gap:10px;padding:6px 0 2px;min-width:0}
 #apvSheet .apv-pick{flex:1 1 0;min-width:0;display:flex;align-items:center;
   gap:9px;padding:9px;border:1px dashed var(--line,#e8e5dc);border-radius:14px;
@@ -203,9 +223,10 @@ CLIENT_SCRIPT = r"""
   if (window.dwellAppearance) return;
 
   var DEF = {
-    avatarSize: 34, fontSize: 14.5, bubbleRadius: 18, rowGap: 16,
+    avatarSize: 34, fontSize: 14.5, bubbleRadius: 18, rowGap: 16, splitGap: 6,
     timeSize: 10.5, gapHours: 5,
-    showAvatar: true, showTime: true, showDay: true, css: ''
+    showAvatar: true, showTime: true, showDay: true, split: true,
+    toolMode: 'align', css: ''
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
   var META = [
@@ -213,14 +234,14 @@ CLIENT_SCRIPT = r"""
     ['fontSize', '字号', 11, 22, 0.5],
     ['bubbleRadius', '圆角', 0, 28, 1],
     ['rowGap', '行距', 2, 40, 1],
+    ['splitGap', '段距', 0, 24, 1],
     ['timeSize', '时间', 8, 16, 0.5],
     ['gapHours', '隔多久', 0.5, 24, 0.5]
   ];
+  var TOOLS = [['align', '对齐'], ['full', '整行'], ['hide', '藏起来']];
 
   /* 圆条气泡。
-     ⚠️ 圆角是 20px 不是 999px：999px 单行好看，多行会撑成椭圆 ——
-     长段落两侧鼓出巨大的弧，实际就是个药丸裹着一段话。20px 时单行
-     高度约 40px、两头正好半圆，多行也只是四角圆。
+     ⚠️ 圆角是 20px 不是 999px：999px 单行好看，多行会撑成椭圆。
      图片和表情包单独挑出来去掉内边距和背景，不然会被切圆。
      颜色写死不用 color-mix()：那函数 Safari 16.4 起才有。 */
   var PRESET = [
@@ -252,9 +273,7 @@ CLIENT_SCRIPT = r"""
     '  background: transparent;',
     '  border: 0;',
     '}',
-    '#log .row.apv img {',
-    '  border-radius: 14px;',
-    '}'
+    '#log .row.apv img { border-radius: 14px; }'
   ].join('\n');
 
   function logEl() { return document.getElementById('log'); }
@@ -325,10 +344,13 @@ CLIENT_SCRIPT = r"""
       s.setProperty('--apv-font', cfg.fontSize + 'px');
       s.setProperty('--apv-radius', cfg.bubbleRadius + 'px');
       s.setProperty('--apv-gap', cfg.rowGap + 'px');
+      s.setProperty('--apv-split', cfg.splitGap + 'px');
       s.setProperty('--apv-time', cfg.timeSize + 'px');
       L.classList.toggle('apv-hide-av', !cfg.showAvatar);
       L.classList.toggle('apv-hide-time', !cfg.showTime);
       L.classList.toggle('apv-hide-day', !cfg.showDay);
+      L.classList.toggle('apv-tool-align', cfg.toolMode === 'align');
+      L.classList.toggle('apv-tool-hide', cfg.toolMode === 'hide');
     }
     var tag = document.getElementById('apv-user');
     if (tag) tag.textContent = cfg.css || '';
@@ -353,11 +375,81 @@ CLIENT_SCRIPT = r"""
     }
   }
 
-  /* ── 往每一行插头像和时间戳，顺带补日期分隔条 ─────────────────── */
+  /* ── 按空行切段 ────────────────────────────────────────────────
+     ⚠️ 代码块里的空行不算分割点。按 ``` 的奇偶记状态，围栏内跳过 ——
+     不然一段代码会被腰斩成两个气泡，语法高亮和复制按钮都跟着废。 */
+  function segments(text) {
+    var lines = String(text || '').split('\n');
+    var out = [], cur = [], fence = false, blanks = 0;
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      if (/^\s*```/.test(ln)) fence = !fence;
+      if (!fence && !ln.trim()) {
+        blanks++;
+        continue;
+      }
+      // 攒够一个空行、且前面已经有内容，就在这儿断开
+      if (blanks > 0 && cur.length) {
+        out.push(cur.join('\n'));
+        cur = [];
+      }
+      blanks = 0;
+      cur.push(ln);
+    }
+    if (cur.length) out.push(cur.join('\n'));
+    return out.filter(function (s) { return s.trim(); });
+  }
+
+  /* 建一个跟母气泡同款的行。第一段留在原位，其余走这条。 */
+  function makeRow(proto, mine, text, at) {
+    var row = document.createElement('div');
+    row.className = 'row' + (mine ? ' me' : '') + ' apv apv-split';
+    row.setAttribute('data-apv', '1');
+
+    var bub = document.createElement('div');
+    bub.className = mine ? 'bubble' : 'gu';
+    bub._raw = text;
+    bub._final = true;
+    bub.textContent = text;
+    // 上游的 renderRich：加粗、代码块、图片、歌卡片全靠它
+    try { renderRich(bub); } catch (e) {}
+
+    row.appendChild(bub);
+    stamps.set(row, at);
+    dressRow(row, bub, mine, at);
+    return row;
+  }
+
+  /* 给一行挂上头像和时间戳那一列 */
+  function dressRow(row, bub, mine, at) {
+    if (row.querySelector('.apv-side')) return;
+    var who = mine ? 'me' : 'gu';
+    var side = document.createElement('div');
+    side.className = 'apv-side';
+    var av = document.createElement('div');
+    av.className = 'apv-av';
+    av.setAttribute('data-who', who);
+    av.setAttribute('aria-hidden', 'true');
+    if (avSrc[who]) {
+      av.style.backgroundImage = 'url("' + avatarUrl(who) + '")';
+    } else {
+      av.textContent = mine ? '妍' : '沐';
+    }
+    var tm = document.createElement('div');
+    tm.className = 'apv-time';
+    tm.textContent = clock(at);
+    side.appendChild(av);
+    side.appendChild(tm);
+    row.insertBefore(side, row.firstChild);
+  }
+
+  /* ── 主循环：挂头像时间，顺带拆段、补日期条 ─────────────────── */
   function decorate() {
     var L = logEl();
     if (!L) return;
     var rows = L.querySelectorAll('.row:not([data-apv])');
+    var touched = rows.length;
+
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
       // 只认直接挂着气泡的行。思考行和工具行没有 .bubble/.gu，跳过
@@ -368,34 +460,37 @@ CLIENT_SCRIPT = r"""
         if (c.classList.contains('gu')) { bub = c; break; }
       }
       if (!bub) continue;
-      // 他那条是流式写出来的，还没拉到时间表之前先别配 —— 配了就配到空串上
+
       var text = (bub._raw != null ? bub._raw : bub.textContent) || '';
+      // 他那条是流式写出来的，还没拉到时间表之前先别配 —— 配了就配到空串上
       if (!mine && !text.trim() && !loaded) continue;
 
       row.setAttribute('data-apv', '1');
       row.classList.add('apv');
-      var who = mine ? 'me' : 'gu';
       var at = stampFor(row, mine, text);
+      dressRow(row, bub, mine, at);
 
-      var side = document.createElement('div');
-      side.className = 'apv-side';
-      var av = document.createElement('div');
-      av.className = 'apv-av';
-      av.setAttribute('data-who', who);
-      av.setAttribute('aria-hidden', 'true');
-      if (avSrc[who]) {
-        av.style.backgroundImage = 'url("' + avatarUrl(who) + '")';
-      } else {
-        av.textContent = mine ? '妍' : '沐';
+      /* 拆段：只拆定稿的。流式那条边写边拆会一帧一个样，闪得没法看。
+         拆出来的段共用母消息的时间戳 —— 同一条消息本来就是一个时刻发的。 */
+      if (!cfg.split || !bub._final) continue;
+      var segs = segments(text);
+      if (segs.length < 2) continue;
+
+      bub._raw = segs[0];
+      bub.textContent = segs[0];
+      bub.removeAttribute('data-rich');
+      try { renderRich(bub); } catch (e) {}
+      row.classList.add('apv-split');
+
+      var anchor = row.nextSibling;
+      for (var k = 1; k < segs.length; k++) {
+        var nr = makeRow(row, mine, segs[k], at);
+        // 最后一段恢复正常行距，跟下一条消息拉开
+        if (k === segs.length - 1) nr.classList.remove('apv-split');
+        L.insertBefore(nr, anchor);
       }
-      var tm = document.createElement('div');
-      tm.className = 'apv-time';
-      tm.textContent = clock(at);
-      side.appendChild(av);
-      side.appendChild(tm);
-      row.insertBefore(side, row.firstChild);
     }
-    if (rows.length) dayMarks();
+    if (touched) dayMarks();
   }
 
   /* 相邻两条间隔超过 gapHours 就在中间插一行。
@@ -413,6 +508,7 @@ CLIENT_SCRIPT = r"""
       var row = rows[j];
       if (!stamps.has(row)) continue;
       var at = stamps.get(row);
+      // 同一条消息拆出来的段不算"隔了多久"
       if (prev === null || at - prev > gap) {
         var d = document.createElement('div');
         d.className = 'apv-day';
@@ -438,6 +534,12 @@ CLIENT_SCRIPT = r"""
       dirty = false;
       decorate();
     });
+  }
+
+  /* 改了拆分开关要重新念一遍历史 —— 已经拆过的合不回去，
+     所以直接重载。比在 DOM 里拼回原文可靠得多。 */
+  function needReload() {
+    try { note('（改好了，刷一下就看到）'); } catch (e) {}
   }
 
   /* ── 面板 ───────────────────────────────────────────────────── */
@@ -470,6 +572,12 @@ CLIENT_SCRIPT = r"""
         '<span class="apv-val" data-v="' + m[0] + '"></span></div>';
     }
 
+    var seg = '<div class="apv-line"><label>工具行</label><div class="apv-seg">';
+    for (var t = 0; t < TOOLS.length; t++) {
+      seg += '<button type="button" data-tool="' + TOOLS[t][0] + '">' + TOOLS[t][1] + '</button>';
+    }
+    seg += '</div></div>';
+
     sheet.innerHTML =
       '<div class="shade" data-apv-close="1"></div>' +
       '<div class="sheet" role="dialog" aria-label="外观">' +
@@ -483,6 +591,10 @@ CLIENT_SCRIPT = r"""
         '</div>' +
         '<div class="apv-sep"></div>' +
         lines +
+        '<div class="apv-sep"></div>' +
+        '<div class="apv-line"><label>拆气泡</label>' +
+          '<button type="button" class="apv-sw" data-sw="split" ' +
+          'role="switch" aria-label="空行拆成独立气泡"></button></div>' +
         '<div class="apv-line"><label>头像</label>' +
           '<button type="button" class="apv-sw" data-sw="showAvatar" ' +
           'role="switch" aria-label="显示头像"></button></div>' +
@@ -492,6 +604,7 @@ CLIENT_SCRIPT = r"""
         '<div class="apv-line"><label>日期条</label>' +
           '<button type="button" class="apv-sw" data-sw="showDay" ' +
           'role="switch" aria-label="显示日期分隔"></button></div>' +
+        seg +
         '<div class="apv-sep"></div>' +
         '<textarea class="apv-css" spellcheck="false" autocapitalize="off" ' +
           'autocorrect="off" placeholder="在这儿写 CSS"></textarea>' +
@@ -503,18 +616,19 @@ CLIENT_SCRIPT = r"""
           '<code>#log .row.apv &gt; .bubble</code> 你说的话<br>' +
           '<code>#log .row.apv &gt; .gu</code> 他说的话<br>' +
           '<code>#log .row.me.apv</code> 你那一行（整行）<br>' +
+          '<code>#log .row.apv.apv-split</code> 拆出来的段（不是头一段）<br>' +
           '<code>#log .row.apv img</code> 图片和表情包<br>' +
           '<code>#log .apv-av</code> 头像　<code>#log .apv-time</code> 时间<br>' +
           '<code>#log .apv-day &gt; span</code> 中间那个日期条<br>' +
           '<code>#log .toolline</code> 思考那一行' +
           '<b>能用的变量</b>' +
           '<code>--apv-av</code> <code>--apv-font</code> <code>--apv-radius</code> ' +
-          '<code>--apv-gap</code> <code>--apv-time</code><br>' +
+          '<code>--apv-gap</code> <code>--apv-split</code> <code>--apv-time</code><br>' +
           '上游的：<code>--bg</code> <code>--card</code> <code>--panel</code> ' +
           '<code>--line</code> <code>--text</code> <code>--dim</code> ' +
           '<code>--accent</code>' +
           '<b>两个坑</b>' +
-          '圆角别写 <code>999px</code> —— 单行好看，多行会撑成椭圆。' +
+          '圆角别写 <code>999px</code> —— 单行好看，多行会撑成椭圆，' +
           '<code>20px</code> 上下都对。<br>' +
           '选择器前面那个 <code>#log</code> 别省 —— <code>.row</code> 这名字' +
           '页面里别处也在用，写宽了会把锁屏弄坏。' +
@@ -541,11 +655,20 @@ CLIENT_SCRIPT = r"""
         apply(); fillSheet(); save();
         return;
       }
+      var tl = t.closest && t.closest('[data-tool]');
+      if (tl) {
+        cfg.toolMode = tl.getAttribute('data-tool');
+        apply(); fillSheet(); save();
+        return;
+      }
       var sw = t.closest && t.closest('[data-sw]');
       if (sw) {
         var k = sw.getAttribute('data-sw');
         cfg[k] = !cfg[k];
         apply(); fillSheet(); save();
+        // 拆过的合不回去，得刷一下才能看到关掉之后的样子
+        if (k === 'split' && !cfg[k]) needReload();
+        if (k === 'split' && cfg[k]) decorate();
       }
     });
 
@@ -602,6 +725,10 @@ CLIENT_SCRIPT = r"""
       sws[j].classList.toggle('on', on);
       sws[j].setAttribute('aria-checked', on ? 'true' : 'false');
     }
+    var tls = sheet.querySelectorAll('[data-tool]');
+    for (var n = 0; n < tls.length; n++) {
+      tls[n].classList.toggle('on', tls[n].getAttribute('data-tool') === cfg.toolMode);
+    }
     var ta = sheet.querySelector('.apv-css');
     if (ta && ta.value !== cfg.css) ta.value = cfg.css || '';
     paintAvatars();
@@ -651,7 +778,9 @@ CLIENT_SCRIPT = r"""
           avSrc.me = (d.avatars && d.avatars.me) || '';
           avSrc.gu = (d.avatars && d.avatars.gu) || '';
         }
-        apply(); paintAvatars(); fillSheet(); dayMarks();
+        apply(); paintAvatars(); fillSheet();
+        // 设置到手之后再念一遍：拆不拆得等 cfg.split 有了才知道
+        decorate();
       })
       .catch(function () {});
 
@@ -673,6 +802,7 @@ CLIENT_SCRIPT = r"""
     close: closeSheet,
     get: function () { return cfg; },
     preset: PRESET,
+    split: segments,
     redraw: function () { decorate(); dayMarks(); }
   };
 
