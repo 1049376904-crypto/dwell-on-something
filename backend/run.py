@@ -34,6 +34,7 @@ from voice_feature import register_voice_feature
 from voice_call import register_voice_call
 from voice_prompt import register_voice_prompt
 from appearance_feature import register_appearance_feature
+from pet_feature import register_pet_feature
 
 
 register_compat(server)
@@ -96,9 +97,12 @@ register_panel_shell(server)
 register_voice_feature(server)
 # 通话再包一层，要在 voice_feature 之后：那颗话筒键得先在，电话键才挨着它长。
 register_voice_call(server)
-# 外观（气泡头像、时间戳、可调的那些）也是包一层 index。
+# 外观（气泡头像、时间戳、字体、可调的那些）也是包一层 index。
 # 跟语音那两层互不干涉，谁先谁后都行，但必须在 frontend 之后。
 register_appearance_feature(server)
+# 小家伙（上游那只螃蟹会走路了）。排在 appearance 之后，侧边栏那项
+# 就跟在「外观」后面；取不到 navLook 也会退回跟着「日记」，顺序不是硬的。
+register_pet_feature(server)
 # 告诉模型那行 [voice] 和 [通话中] 是什么。要在 agent_tools 之后：
 # 它包的是那个模块的 build_context_snapshot。不接这一行，
 # 语音条依旧能录能发，只是模型不知道那行标记是什么意思。
@@ -133,5 +137,6 @@ if __name__ == "__main__":
     print("  voice   : 语音条；TTS 在 /api/voice（独立服务，不经过 Flask）")
     print("  call    : 语音通话·对讲机模式（回合制，一轮 5~8 秒）")
     print("  vprompt : [voice] 与 [通话中] 已接进 system 提示词")
-    print("  look    : 侧边栏「外观」；头像存 data/avatars，设置在 settings 表")
+    print("  look    : 侧边栏「外观」；头像存 data/avatars，字体存 data/fonts")
+    print("  pet     : 侧边栏「小家伙」；沿输入栏走动，换的图存 data/pet")
     server.app.run(host="0.0.0.0", port=server.PORT, threaded=True)
