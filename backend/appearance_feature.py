@@ -1,4 +1,4 @@
-"""dwell 外观：气泡拆分、头像、时间戳、日期分隔条，和一个能实时调的外观面板。
+"""dwell 外观：气泡拆分、头像、时间戳、日期条、引用，和一个能实时调的外观面板。
 
 不改 web/index.html。在 index 视图外面再包一层，把客户端脚本注进去。
 
@@ -8,14 +8,18 @@ class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd 
 布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
 而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
 
-⚠️ 气泡圆角别用 999px。那个值对单行是圆条，对多行就是椭圆 —— 长段落
-两侧会鼓出巨大的弧。用 20px 这种固定值。
+⚠️ 上游 `.sheet` 自己**没有**左右内边距 —— 内容本该放进 `.sheet .body`
+（那个才有 `padding: 6px 20px`）。往 `.sheet` 里直接塞东西的话必须自己
+补上内边距，否则 `margin-left:auto` 的开关会顶到屏幕外面去。
+
+⚠️ 气泡圆角别用 999px。那个值对单行是圆条，对多行就是椭圆。用 20px。
 
 ⚠️ 拆气泡只拆定稿的（`el._final`）。流式那条边写边拆会一帧一个样。
 代码块里的空行不算分割点 —— 按 ``` 的奇偶记状态，围栏内跳过。
 
-⚠️ 面板借了上游 `.sheet` 的壳，那个壳自带 padding。往里塞 `width:100%`
-的 textarea 会把壳顶开，所以盒模型写死、横向元素一律 `min-width:0`。
+⚠️ 引用的发送要走**捕获阶段**插队：上游是 `sendBtn.onclick = send`，
+捕获阶段的监听比 onclick 先跑，在那儿把引用拼进 `box.value` 即可，
+不用碰上游一行代码。
 
 设置存在 settings 表里，不用 localStorage：换个设备就没了。
 
@@ -47,6 +51,7 @@ DEFAULTS = {
     "showTime": True,
     "showDay": True,
     "split": True,          # 空行拆成独立气泡
+    "quote": True,          # 长按气泡能引用
     "toolMode": "align",    # 工具行：align 跟气泡对齐 / full 独占一行 / hide 藏起来
     "css": "",              # 自由 CSS，原样注入
 }
@@ -78,7 +83,7 @@ def _clean(raw: dict) -> dict:
                 out[key] = max(low, min(high, float(raw[key])))
             except (TypeError, ValueError):
                 pass
-    for key in ("showAvatar", "showTime", "showDay", "split"):
+    for key in ("showAvatar", "showTime", "showDay", "split", "quote"):
         if key in raw:
             out[key] = bool(raw[key])
     if raw.get("toolMode") in TOOL_MODES:
@@ -119,8 +124,7 @@ CLIENT_SCRIPT = r"""
   opacity:.72;white-space:nowrap;font-variant-numeric:tabular-nums;
   text-align:center;letter-spacing:.01em}
 
-/* 日期分隔条。是 #log 的直接子元素，不进 .row。
-   这里 999px 是对的：单行短文本，两头半圆正好。 */
+/* 日期分隔条。是 #log 的直接子元素，不进 .row。 */
 #log .apv-day{display:flex;justify-content:center;
   margin:calc(var(--apv-gap) + 6px) auto;max-width:720px}
 #log .apv-day > span{font-size:calc(var(--apv-time) + .5px);
@@ -128,8 +132,14 @@ CLIENT_SCRIPT = r"""
   border:1px solid var(--line,#e8e5dc);background:transparent;
   letter-spacing:.02em;white-space:nowrap;font-variant-numeric:tabular-nums}
 
-/* 工具行（Thought process 那种）。默认缩进到跟气泡左边对齐 ——
-   顶在最左边看着跟气泡是断开的。 */
+/* 气泡里那段引用：左边一道竖线，文字压淡 */
+#log .apv-qbox{border-left:2.5px solid var(--line,#e8e5dc);
+  padding:1px 0 1px 10px;margin:0 0 7px;opacity:.78;
+  font-size:.92em;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+#log .apv-qbox b{display:block;font-weight:600;font-size:.9em;opacity:.7;
+  margin-bottom:2px}
+
+/* 工具行（Thought process 那种）。默认缩进到跟气泡左边对齐。 */
 #log.apv-tool-align .row:not(.apv) > .toolline{
   margin-left:calc(var(--apv-av) + 9px)}
 #log.apv-tool-hide .row:not(.apv) > .toolline{display:none}
@@ -141,14 +151,44 @@ CLIENT_SCRIPT = r"""
 #log.apv-hide-av.apv-hide-time .apv-side{display:none}
 #log.apv-hide-day .apv-day{display:none}
 
+/* ── 长按气泡弹出来那个小菜单 ── */
+#apvMenu{position:fixed;z-index:12500;display:none;gap:2px;
+  background:var(--card,#fff);border:1px solid var(--line,#e8e5dc);
+  border-radius:14px;padding:5px;
+  box-shadow:0 8px 28px rgba(0,0,0,.14)}
+#apvMenu.on{display:flex}
+#apvMenu button{border:0;background:transparent;color:var(--text,#2b2a27);
+  font-family:inherit;font-size:14px;padding:9px 15px;border-radius:10px;
+  cursor:pointer;white-space:nowrap}
+#apvMenu button:active{background:var(--panel,#f0eee6)}
+
+/* ── 输入框上方那条引用 ── */
+#apvQuote{display:none;align-items:flex-start;gap:9px;
+  margin:0 0 8px;padding:8px 10px 8px 0;
+  border-left:2.5px solid var(--accent,#c96442);
+  background:transparent}
+#apvQuote.on{display:flex}
+#apvQuote .qt{flex:1 1 auto;min-width:0;padding-left:10px;
+  font-size:12.5px;line-height:1.55;color:var(--dim,#8a867c);
+  max-height:3.2em;overflow:hidden}
+#apvQuote .qt b{display:block;color:var(--text,#2b2a27);opacity:.8;
+  font-weight:600;font-size:11.5px;margin-bottom:1px}
+#apvQuote .qx{flex:0 0 auto;width:28px;height:28px;border:0;padding:0;
+  background:transparent;color:var(--dim,#8a867c);cursor:pointer;
+  display:flex;align-items:center;justify-content:center}
+#apvQuote .qx svg{width:15px;height:15px}
+
 /* ── 面板 ─────────────────────────────────────────────────────
-   ⚠️ 上游 .sheet 的壳自带 padding 和布局。里面塞 width:100% 的
-   textarea 或 flex:1 的滑块，加起来超过内容宽度就会把壳顶开。
-   所以这儿写死盒模型，内部所有横向元素一律 min-width:0。 */
+   ⚠️ 上游 .sheet 自己没有左右内边距（内容本该放进 .sheet .body）。
+   这儿直接往 .sheet 里塞东西，所以必须自己补 20px —— 不补的话
+   margin-left:auto 的开关会顶到屏幕外面，右半截被切掉。 */
 #apvSheet .sheet{box-sizing:border-box;width:100%;max-width:100vw;
   overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;
-  padding-bottom:calc(env(safe-area-inset-bottom,0px) + 18px)}
+  padding:0 20px calc(env(safe-area-inset-bottom,0px) + 18px)}
 #apvSheet .sheet *{box-sizing:border-box}
+/* 抓手是上游画的，它要横跨整宽，所以把内边距抵掉 */
+#apvSheet .grabber{margin-left:-20px;margin-right:-20px;width:auto;
+  max-width:38px;margin-left:auto;margin-right:auto}
 #apvSheet .apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;
   color:var(--text,#2b2a27)}
 #apvSheet .apv-line{display:flex;align-items:center;gap:10px;padding:8px 0;
@@ -195,8 +235,7 @@ CLIENT_SCRIPT = r"""
   display:flex;align-items:center;justify-content:center;font-style:normal;
   font-size:14px;color:var(--dim,#8a867c);overflow:hidden}
 #apvSheet .apv-pick input{display:none}
-/* width:100% 会把壳顶开；display:block + auto 让它自己撑到内容宽度 */
-#apvSheet .apv-css{display:block;width:auto;min-width:0;min-height:104px;
+#apvSheet .apv-css{display:block;width:100%;min-width:0;min-height:104px;
   resize:vertical;background:var(--panel,#f0eee6);border:1px solid transparent;
   border-radius:14px;padding:11px 13px;color:var(--text,#2b2a27);
   font-size:12.5px;line-height:1.6;
@@ -225,7 +264,7 @@ CLIENT_SCRIPT = r"""
   var DEF = {
     avatarSize: 34, fontSize: 14.5, bubbleRadius: 18, rowGap: 16, splitGap: 6,
     timeSize: 10.5, gapHours: 5,
-    showAvatar: true, showTime: true, showDay: true, split: true,
+    showAvatar: true, showTime: true, showDay: true, split: true, quote: true,
     toolMode: 'align', css: ''
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
@@ -239,11 +278,8 @@ CLIENT_SCRIPT = r"""
     ['gapHours', '隔多久', 0.5, 24, 0.5]
   ];
   var TOOLS = [['align', '对齐'], ['full', '整行'], ['hide', '藏起来']];
+  var NAME = { me: '妍妍', gu: '沐' };
 
-  /* 圆条气泡。
-     ⚠️ 圆角是 20px 不是 999px：999px 单行好看，多行会撑成椭圆。
-     图片和表情包单独挑出来去掉内边距和背景，不然会被切圆。
-     颜色写死不用 color-mix()：那函数 Safari 16.4 起才有。 */
   var PRESET = [
     '/* 圆条气泡 · 不想要了就清空这一栏 */',
     '#log .row.apv > .bubble,',
@@ -384,15 +420,8 @@ CLIENT_SCRIPT = r"""
     for (var i = 0; i < lines.length; i++) {
       var ln = lines[i];
       if (/^\s*```/.test(ln)) fence = !fence;
-      if (!fence && !ln.trim()) {
-        blanks++;
-        continue;
-      }
-      // 攒够一个空行、且前面已经有内容，就在这儿断开
-      if (blanks > 0 && cur.length) {
-        out.push(cur.join('\n'));
-        cur = [];
-      }
+      if (!fence && !ln.trim()) { blanks++; continue; }
+      if (blanks > 0 && cur.length) { out.push(cur.join('\n')); cur = []; }
       blanks = 0;
       cur.push(ln);
     }
@@ -400,28 +429,63 @@ CLIENT_SCRIPT = r"""
     return out.filter(function (s) { return s.trim(); });
   }
 
+  /* 开头连着的 > 那几行是引用，切出来单独渲染 */
+  function splitQuote(text) {
+    var lines = String(text || '').split('\n');
+    var q = [], i = 0;
+    while (i < lines.length && /^\s*>/.test(lines[i])) {
+      q.push(lines[i].replace(/^\s*>\s?/, ''));
+      i++;
+    }
+    if (!q.length) return null;
+    while (i < lines.length && !lines[i].trim()) i++;
+    return { quote: q.join('\n').trim(), rest: lines.slice(i).join('\n') };
+  }
+
+  /* 气泡里那段引用：包成左边一道竖线的块 */
+  function dressQuote(bub) {
+    if (bub._apvQ) return;
+    var raw = bub._raw != null ? bub._raw : bub.textContent;
+    var got = splitQuote(raw);
+    if (!got) return;
+    bub._apvQ = 1;
+    bub._raw = got.rest;
+    bub.textContent = got.rest;
+    bub.removeAttribute('data-rich');
+    try { renderRich(bub); } catch (e) {}
+    var box = document.createElement('div');
+    box.className = 'apv-qbox';
+    var m = got.quote.match(/^([^\n：:]{1,12})[：:]\s*([\s\S]*)$/);
+    if (m) {
+      var who = document.createElement('b');
+      who.textContent = m[1];
+      box.appendChild(who);
+      box.appendChild(document.createTextNode(m[2]));
+    } else {
+      box.textContent = got.quote;
+    }
+    bub.insertBefore(box, bub.firstChild);
+  }
+
   /* 建一个跟母气泡同款的行。第一段留在原位，其余走这条。 */
-  function makeRow(proto, mine, text, at) {
+  function makeRow(mine, text, at) {
     var row = document.createElement('div');
     row.className = 'row' + (mine ? ' me' : '') + ' apv apv-split';
     row.setAttribute('data-apv', '1');
-
     var bub = document.createElement('div');
     bub.className = mine ? 'bubble' : 'gu';
     bub._raw = text;
     bub._final = true;
     bub.textContent = text;
-    // 上游的 renderRich：加粗、代码块、图片、歌卡片全靠它
     try { renderRich(bub); } catch (e) {}
-
     row.appendChild(bub);
     stamps.set(row, at);
-    dressRow(row, bub, mine, at);
+    dressRow(row, mine, at);
     return row;
   }
 
   /* 给一行挂上头像和时间戳那一列 */
-  function dressRow(row, bub, mine, at) {
+  function dressRow(row, mine, at) {
     if (row.querySelector('.apv-side')) return;
     var who = mine ? 'me' : 'gu';
     var side = document.createElement('div');
@@ -430,11 +494,8 @@ CLIENT_SCRIPT = r"""
     av.className = 'apv-av';
     av.setAttribute('data-who', who);
     av.setAttribute('aria-hidden', 'true');
-    if (avSrc[who]) {
-      av.style.backgroundImage = 'url("' + avatarUrl(who) + '")';
-    } else {
-      av.textContent = mine ? '妍' : '沐';
-    }
+    if (avSrc[who]) av.style.backgroundImage = 'url("' + avatarUrl(who) + '")';
+    else av.textContent = mine ? '妍' : '沐';
     var tm = document.createElement('div');
     tm.className = 'apv-time';
     tm.textContent = clock(at);
@@ -443,7 +504,7 @@ CLIENT_SCRIPT = r"""
     row.insertBefore(side, row.firstChild);
   }
 
-  /* ── 主循环：挂头像时间，顺带拆段、补日期条 ─────────────────── */
+  /* ── 主循环：挂头像时间，顺带拆段、包引用、补日期条 ───────────── */
   function decorate() {
     var L = logEl();
     if (!L) return;
@@ -462,45 +523,42 @@ CLIENT_SCRIPT = r"""
       if (!bub) continue;
 
       var text = (bub._raw != null ? bub._raw : bub.textContent) || '';
-      // 他那条是流式写出来的，还没拉到时间表之前先别配 —— 配了就配到空串上
+      // 他那条是流式写出来的，还没拉到时间表之前先别配
       if (!mine && !text.trim() && !loaded) continue;
 
       row.setAttribute('data-apv', '1');
       row.classList.add('apv');
       var at = stampFor(row, mine, text);
-      dressRow(row, bub, mine, at);
+      dressRow(row, mine, at);
 
-      /* 拆段：只拆定稿的。流式那条边写边拆会一帧一个样，闪得没法看。
-         拆出来的段共用母消息的时间戳 —— 同一条消息本来就是一个时刻发的。 */
-      if (!cfg.split || !bub._final) continue;
-      var segs = segments(text);
-      if (segs.length < 2) continue;
-
-      bub._raw = segs[0];
-      bub.textContent = segs[0];
-      bub.removeAttribute('data-rich');
-      try { renderRich(bub); } catch (e) {}
-      row.classList.add('apv-split');
-
-      var anchor = row.nextSibling;
-      for (var k = 1; k < segs.length; k++) {
-        var nr = makeRow(row, mine, segs[k], at);
-        // 最后一段恢复正常行距，跟下一条消息拉开
-        if (k === segs.length - 1) nr.classList.remove('apv-split');
-        L.insertBefore(nr, anchor);
+      /* 拆段：只拆定稿的。流式那条边写边拆会一帧一个样。
+         拆出来的段共用母消息的时间戳。 */
+      if (!bub._final) continue;
+      var segs = cfg.split ? segments(text) : [text];
+      if (segs.length > 1) {
+        bub._raw = segs[0];
+        bub.textContent = segs[0];
+        bub.removeAttribute('data-rich');
+        try { renderRich(bub); } catch (e) {}
+        row.classList.add('apv-split');
+        var anchor = row.nextSibling;
+        for (var k = 1; k < segs.length; k++) {
+          var nr = makeRow(mine, segs[k], at);
+          if (k === segs.length - 1) nr.classList.remove('apv-split');
+          L.insertBefore(nr, anchor);
+        }
       }
+      dressQuote(bub);
     }
     if (touched) dayMarks();
   }
 
-  /* 相邻两条间隔超过 gapHours 就在中间插一行。
-     每次全量重算：行会被往前插（看更早的消息），只补末尾会漏。 */
+  /* 相邻两条间隔超过 gapHours 就在中间插一行。全量重算：行会被往前插。 */
   function dayMarks() {
     var L = logEl();
     if (!L) return;
     var old = L.querySelectorAll('.apv-day');
     for (var i = 0; i < old.length; i++) old[i].remove();
-
     var rows = L.querySelectorAll('.row[data-apv]');
     var gap = cfg.gapHours * 3600;
     var prev = null;
@@ -508,7 +566,6 @@ CLIENT_SCRIPT = r"""
       var row = rows[j];
       if (!stamps.has(row)) continue;
       var at = stamps.get(row);
-      // 同一条消息拆出来的段不算"隔了多久"
       if (prev === null || at - prev > gap) {
         var d = document.createElement('div');
         d.className = 'apv-day';
@@ -521,8 +578,7 @@ CLIENT_SCRIPT = r"""
     }
   }
 
-  /* MutationObserver 只置脏标记，由 rAF 合并后再扫。
-     流式输出时 DOM 一秒能变几十次，每次都跑一遍太重。 */
+  /* MutationObserver 只置脏标记，rAF 合并后再扫 —— 流式时 DOM 一秒变几十次 */
   var dirty = false, pending = false;
   function markDirty() {
     dirty = true;
@@ -536,10 +592,194 @@ CLIENT_SCRIPT = r"""
     });
   }
 
-  /* 改了拆分开关要重新念一遍历史 —— 已经拆过的合不回去，
-     所以直接重载。比在 DOM 里拼回原文可靠得多。 */
-  function needReload() {
-    try { note('（改好了，刷一下就看到）'); } catch (e) {}
+  /* ═══ 引用 ═══════════════════════════════════════════════════
+     长按气泡 → 小菜单 → 引用条挂在输入框上方 → 发送时拼进 box.value。
+
+     ⚠️ 长按不用 contextmenu：iOS Safari 上那个会连带弹系统的
+     「复制/查找」菜单，两个叠在一起。自己数 touchstart→touchend 的
+     时间，超过 480ms 且手指没动超过 10px 才算。手指一动就取消，
+     不然滑列表会误触发。 */
+  var LONG_MS = 480, MOVE_TOL = 10;
+  var menu = null, quoteBar = null, quoted = null;
+  var lt = null;
+
+  function bubbleOf(node) {
+    if (!node || !node.closest) return null;
+    var b = node.closest('#log .row.apv > .bubble, #log .row.apv > .gu');
+    return b || null;
+  }
+
+  function rawOf(bub) {
+    var t = bub._raw != null ? bub._raw : bub.textContent;
+    return String(t || '').trim();
+  }
+
+  function buildMenu() {
+    if (menu) return;
+    menu = document.createElement('div');
+    menu.id = 'apvMenu';
+    menu.innerHTML = '<button type="button" data-q="quote">引用</button>' +
+      '<button type="button" data-q="copy">复制</button>';
+    document.body.appendChild(menu);
+    menu.addEventListener('click', function (e) {
+      var b = e.target.closest && e.target.closest('[data-q]');
+      if (!b) return;
+      var act = b.getAttribute('data-q');
+      var bub = menu._bub;
+      hideMenu();
+      if (!bub) return;
+      if (act === 'quote') setQuote(bub);
+      else if (act === 'copy') copyText(rawOf(bub));
+    });
+  }
+
+  function showMenu(bub, x, y) {
+    buildMenu();
+    menu._bub = bub;
+    menu.classList.add('on');
+    // 先显示再量尺寸，才能把它按在屏幕里
+    var r = menu.getBoundingClientRect();
+    var left = Math.max(8, Math.min(window.innerWidth - r.width - 8, x - r.width / 2));
+    var top = y - r.height - 12;
+    if (top < 8) top = y + 16;
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+  }
+  function hideMenu() {
+    if (menu) { menu.classList.remove('on'); menu._bub = null; }
+  }
+
+  function copyText(t) {
+    var done = function () { try { note('（复制好了）'); } catch (e) {} };
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(t).then(done).catch(function () {});
+      return;
+    }
+    var ta = document.createElement('textarea');
+    ta.value = t;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    ta.remove();
+  }
+
+  function buildQuoteBar() {
+    if (quoteBar) return quoteBar;
+    var composer = document.querySelector('.composer');
+    if (!composer) return null;
+    quoteBar = document.createElement('div');
+    quoteBar.id = 'apvQuote';
+    quoteBar.innerHTML = '<div class="qt"></div>' +
+      '<button type="button" class="qx" aria-label="不引用了">' +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+      'stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/>' +
+      '<line x1="18" y1="6" x2="6" y2="18"/></svg></button>';
+    // 塞在附件条前面，也就是输入框正上方
+    composer.insertBefore(quoteBar, composer.firstChild);
+    quoteBar.querySelector('.qx').onclick = clearQuote;
+    return quoteBar;
+  }
+
+  function setQuote(bub) {
+    var bar = buildQuoteBar();
+    if (!bar) return;
+    var mine = bub.classList.contains('bubble');
+    var t = rawOf(bub);
+    // 引用里再套引用会越滚越长，把对方引的那层剥掉
+    var inner = splitQuote(t);
+    if (inner) t = inner.rest.trim() || t;
+    quoted = { who: mine ? NAME.me : NAME.gu, text: t };
+    var qt = bar.querySelector('.qt');
+    qt.textContent = '';
+    var b = document.createElement('b');
+    b.textContent = quoted.who;
+    qt.appendChild(b);
+    qt.appendChild(document.createTextNode(t.length > 90 ? t.slice(0, 90) + '…' : t));
+    bar.classList.add('on');
+    var box = document.getElementById('box');
+    if (box) box.focus();
+  }
+
+  function clearQuote() {
+    quoted = null;
+    if (quoteBar) quoteBar.classList.remove('on');
+  }
+
+  /* 发送前把引用拼到正文前面。
+     ⚠️ 走捕获阶段：上游是 sendBtn.onclick = send，直接读 box.value；
+     捕获比 onclick 先跑，在这儿改完 value 上游就拿到带引用的那份。 */
+  function injectQuote() {
+    if (!quoted) return;
+    var box = document.getElementById('box');
+    if (!box) return;
+    var body = (box.value || '').trim();
+    if (!body) return;                 // 空的不发，也不消耗引用
+    var head = quoted.text.split('\n')
+      .map(function (l) { return '> ' + l; }).join('\n');
+    box.value = '> ' + quoted.who + '：\n' + head.replace(/^> /, '') + '\n\n' + body;
+    // 上游靠 input 事件调高度，补一下
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    clearQuote();
+  }
+
+  function bindQuote() {
+    var L = logEl();
+    if (!L || L._apvQuoteBound) return;
+    L._apvQuoteBound = 1;
+
+    L.addEventListener('touchstart', function (e) {
+      if (!cfg.quote || e.touches.length !== 1) return;
+      var bub = bubbleOf(e.target);
+      if (!bub) return;
+      var t = e.touches[0];
+      lt = { x: t.clientX, y: t.clientY, bub: bub, fired: false };
+      lt.timer = setTimeout(function () {
+        if (!lt) return;
+        lt.fired = true;
+        showMenu(lt.bub, lt.x, lt.y);
+        try { if (navigator.vibrate) navigator.vibrate(12); } catch (e2) {}
+      }, LONG_MS);
+    }, { passive: true });
+
+    L.addEventListener('touchmove', function (e) {
+      if (!lt) return;
+      var t = e.touches[0];
+      if (Math.abs(t.clientX - lt.x) + Math.abs(t.clientY - lt.y) > MOVE_TOL) {
+        clearTimeout(lt.timer);
+        lt = null;
+      }
+    }, { passive: true });
+
+    var end = function () {
+      if (!lt) return;
+      clearTimeout(lt.timer);
+      lt = null;
+    };
+    L.addEventListener('touchend', end, { passive: true });
+    L.addEventListener('touchcancel', end, { passive: true });
+
+    // 鼠标那边（iPad 接键盘、或者电脑上看）走右键
+    L.addEventListener('contextmenu', function (e) {
+      if (!cfg.quote) return;
+      var bub = bubbleOf(e.target);
+      if (!bub) return;
+      e.preventDefault();
+      showMenu(bub, e.clientX, e.clientY);
+    });
+
+    document.addEventListener('click', function (e) {
+      if (menu && menu.classList.contains('on') && !menu.contains(e.target)) hideMenu();
+    }, true);
+
+    var sendBtn = document.getElementById('send');
+    if (sendBtn) sendBtn.addEventListener('click', injectQuote, true);
+    var box = document.getElementById('box');
+    if (box) {
+      box.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) injectQuote();
+      }, true);
+    }
   }
 
   /* ── 面板 ───────────────────────────────────────────────────── */
@@ -595,6 +835,9 @@ CLIENT_SCRIPT = r"""
         '<div class="apv-line"><label>拆气泡</label>' +
           '<button type="button" class="apv-sw" data-sw="split" ' +
           'role="switch" aria-label="空行拆成独立气泡"></button></div>' +
+        '<div class="apv-line"><label>长按引用</label>' +
+          '<button type="button" class="apv-sw" data-sw="quote" ' +
+          'role="switch" aria-label="长按气泡引用"></button></div>' +
         '<div class="apv-line"><label>头像</label>' +
           '<button type="button" class="apv-sw" data-sw="showAvatar" ' +
           'role="switch" aria-label="显示头像"></button></div>' +
@@ -617,6 +860,7 @@ CLIENT_SCRIPT = r"""
           '<code>#log .row.apv &gt; .gu</code> 他说的话<br>' +
           '<code>#log .row.me.apv</code> 你那一行（整行）<br>' +
           '<code>#log .row.apv.apv-split</code> 拆出来的段（不是头一段）<br>' +
+          '<code>#log .apv-qbox</code> 气泡里那段引用<br>' +
           '<code>#log .row.apv img</code> 图片和表情包<br>' +
           '<code>#log .apv-av</code> 头像　<code>#log .apv-time</code> 时间<br>' +
           '<code>#log .apv-day &gt; span</code> 中间那个日期条<br>' +
@@ -640,8 +884,6 @@ CLIENT_SCRIPT = r"""
       '</div>';
     document.body.appendChild(sheet);
 
-    // 只在面板自己身上监听，不用文档级捕获 ——
-    // 那个会跟锁屏的 setPointerCapture 抢事件
     sheet.addEventListener('click', function (e) {
       var t = e.target;
       if (t.closest && t.closest('[data-apv-close]')) { closeSheet(); return; }
@@ -666,9 +908,10 @@ CLIENT_SCRIPT = r"""
         var k = sw.getAttribute('data-sw');
         cfg[k] = !cfg[k];
         apply(); fillSheet(); save();
-        // 拆过的合不回去，得刷一下才能看到关掉之后的样子
-        if (k === 'split' && !cfg[k]) needReload();
-        if (k === 'split' && cfg[k]) decorate();
+        if (k === 'split') {
+          if (cfg[k]) decorate();
+          else { try { note('（改好了，刷一下就看到）'); } catch (e2) {} }
+        }
       }
     });
 
@@ -678,7 +921,7 @@ CLIENT_SCRIPT = r"""
       if (k) {
         cfg[k] = parseFloat(el.value);
         var v = sheet.querySelector('[data-v="' + k + '"]');
-        if (v) v.textContent = cfg[k];
+        if (v) v.textContent = k === 'gapHours' ? (cfg[k] + 'h') : cfg[k];
         apply();
         if (k === 'gapHours') dayMarks();
         save();
@@ -743,7 +986,6 @@ CLIENT_SCRIPT = r"""
   function closeSheet() {
     if (!sheet) return;
     sheet.classList.remove('open');
-    // 跟上游浮层一个行为：关掉回到侧边栏
     try { if (typeof openDrawer === 'function') openDrawer(); } catch (e) {}
   }
 
@@ -779,7 +1021,6 @@ CLIENT_SCRIPT = r"""
           avSrc.gu = (d.avatars && d.avatars.gu) || '';
         }
         apply(); paintAvatars(); fillSheet();
-        // 设置到手之后再念一遍：拆不拆得等 cfg.split 有了才知道
         decorate();
       })
       .catch(function () {});
@@ -787,14 +1028,15 @@ CLIENT_SCRIPT = r"""
     loadStamps().then(decorate);
 
     mountNav();
+    bindQuote();
     var L = logEl();
     if (L && window.MutationObserver) {
       new MutationObserver(markDirty).observe(L, {
         childList: true, subtree: true, characterData: true
       });
     }
-    // 侧边栏是上游后来才画的；也兜住流式那条空气泡后来才有字的情况
-    setInterval(function () { mountNav(); decorate(); }, 1400);
+    // 侧边栏和输入卡都是上游后来才画的；也兜住流式那条空气泡后来才有字
+    setInterval(function () { mountNav(); bindQuote(); decorate(); }, 1400);
   }
 
   window.dwellAppearance = {
@@ -803,6 +1045,8 @@ CLIENT_SCRIPT = r"""
     get: function () { return cfg; },
     preset: PRESET,
     split: segments,
+    quote: setQuote,
+    unquote: clearQuote,
     redraw: function () { decorate(); dayMarks(); }
   };
 
