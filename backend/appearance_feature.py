@@ -2,9 +2,15 @@
 
 不改 web/index.html。在 index 视图外面再包一层，把客户端脚本注进去。
 
-⚠️ 这一层比语音那套深：头像要插进上游 `.row` 的结构里（`row()` 建行、
-`addMe()` 往里塞 `.bubble`、`ensureGu()` 塞 `.gu`）。上游哪天改了那几个
-函数，头像就不显示了 —— 不会崩，但会静默失效。这是注入路线的代价。
+⚠️ 样式选择器一律锁进 `#log`，一条都不能漏。`.row` 这个 class 名在
+index.html 里被复用了至少四处（`.hd-write .row`、`.hadd .row`、
+`.rc-add .row`，锁屏那层里也有）。写成裸 `.row{display:flex}` 会把锁屏的
+布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
+而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
+
+⚠️ 这一层比语音那套深：头像插进上游 `.row` 的结构里（`row()` 建行、
+`addMe()` 塞 `.bubble`、他那条是 `.gu`）。上游哪天改了那几个函数，
+头像就不显示了 —— 不会崩，但会静默失效。这是注入路线的代价。
 
 设置存在 settings 表里，不用 localStorage：换个设备就没了，而且
 iPad 和手机会看到不一样的样子。
@@ -72,80 +78,86 @@ def _clean(raw: dict) -> dict:
 
 CLIENT_SCRIPT = r"""
 <style id="apv-base">
-:root{
+/* 变量挂在 #log 上，不放 :root —— 免得名字撞上别处 */
+#log{
   --apv-av:34px; --apv-font:14.5px; --apv-radius:18px;
   --apv-gap:16px; --apv-time:10.5px;
 }
-/* 挂了头像的行改成两列：头像那一列 + 气泡。
-   上游 .row 是块级、.row.me 是 flex 靠右，这里两种都统一成 flex。 */
+
+/* ⚠️ 下面每一条都必须带 #log 前缀。
+   .row 这个名字在 index.html 里被复用了至少四处，锁屏那层也有 ——
+   写成裸 .row 会把锁屏滑块的布局压掉，解锁手势直接失效。 */
 #log .row.apv{display:flex;align-items:flex-start;gap:9px;
   margin-bottom:var(--apv-gap)}
 #log .row.me.apv{flex-direction:row-reverse;justify-content:flex-start}
-#log .row.apv > .bubble,#log .row.apv > .gu{min-width:0}
+#log .row.apv > .bubble,
+#log .row.apv > .gu{min-width:0;font-size:var(--apv-font)}
+#log .row.apv > .bubble{border-radius:var(--apv-radius)}
 
-.apv-side{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;
+#log .apv-side{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;
   gap:3px;width:var(--apv-av);padding-top:2px}
-.apv-av{width:var(--apv-av);height:var(--apv-av);border-radius:50%;
+#log .apv-av{width:var(--apv-av);height:var(--apv-av);border-radius:50%;
   background:var(--panel,#f0eee6) center/cover no-repeat;
   display:flex;align-items:center;justify-content:center;
   font-size:calc(var(--apv-av) * .42);color:var(--dim,#8a867c);
   font-weight:500;overflow:hidden;-webkit-user-select:none;user-select:none}
-.apv-time{font-size:var(--apv-time);line-height:1.25;color:var(--dim,#8a867c);
+#log .apv-time{font-size:var(--apv-time);line-height:1.25;color:var(--dim,#8a867c);
   opacity:.72;white-space:nowrap;font-variant-numeric:tabular-nums;
   text-align:center;letter-spacing:.01em}
-.apv-hide-av .apv-av{display:none}
-.apv-hide-av .apv-side{width:auto}
-.apv-hide-time .apv-time{display:none}
+
+/* 开关那两个 class 也挂在 #log 上，不挂 body */
+#log.apv-hide-av .apv-av{display:none}
+#log.apv-hide-av .apv-side{width:auto}
+#log.apv-hide-time .apv-time{display:none}
 /* 两个都关掉时那一列就没用了，收掉免得留一道空隙 */
-.apv-hide-av.apv-hide-time .apv-side{display:none}
+#log.apv-hide-av.apv-hide-time .apv-side{display:none}
 
-#log .row.apv > .bubble,#log .row.apv > .gu{font-size:var(--apv-font)}
-#log .row.apv > .bubble{border-radius:var(--apv-radius)}
-
-/* ── 面板。借上游 .sheetWrap/.sheet 那套壳，样式跟日记那几页一致 ── */
+/* ── 面板。外壳借上游 .sheetWrap/.sheet（独立元素，不会溢出），
+      内部一律用 apv- 前缀的自有 class ── */
 #apvSheet .sheet{padding-bottom:calc(env(safe-area-inset-bottom,0px) + 18px)}
-.apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;color:var(--text,#2b2a27)}
-.apv-row{display:flex;align-items:center;gap:12px;padding:9px 0}
-.apv-row label{flex:0 0 78px;font-size:13.5px;color:var(--dim,#8a867c)}
-.apv-row input[type=range]{flex:1 1 auto;-webkit-appearance:none;appearance:none;
-  height:26px;background:transparent}
-.apv-row input[type=range]::-webkit-slider-runnable-track{height:3px;border-radius:2px;
-  background:var(--line,#e8e5dc)}
-.apv-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;
+#apvSheet .apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;
+  color:var(--text,#2b2a27)}
+#apvSheet .apv-line{display:flex;align-items:center;gap:12px;padding:9px 0}
+#apvSheet .apv-line label{flex:0 0 78px;font-size:13.5px;color:var(--dim,#8a867c)}
+#apvSheet .apv-line input[type=range]{flex:1 1 auto;-webkit-appearance:none;
+  appearance:none;height:26px;background:transparent}
+#apvSheet .apv-line input[type=range]::-webkit-slider-runnable-track{height:3px;
+  border-radius:2px;background:var(--line,#e8e5dc)}
+#apvSheet .apv-line input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;
   width:20px;height:20px;border-radius:50%;background:#fff;margin-top:-8.5px;
   border:1px solid var(--line,#e8e5dc);box-shadow:0 1px 4px rgba(0,0,0,.14)}
-.apv-val{flex:0 0 42px;text-align:right;font-size:12.5px;color:var(--dim,#8a867c);
-  font-variant-numeric:tabular-nums}
-.apv-sw{margin-left:auto;-webkit-appearance:none;appearance:none;width:44px;height:26px;
-  border-radius:999px;background:var(--line,#e8e5dc);position:relative;
-  transition:background .2s ease;flex:0 0 auto;border:0;cursor:pointer}
-.apv-sw::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;
-  border-radius:50%;background:#fff;transition:transform .2s ease;
-  box-shadow:0 1px 3px rgba(0,0,0,.18)}
-.apv-sw.on{background:var(--accent,#c96442)}
-.apv-sw.on::after{transform:translateX(18px)}
-.apv-avs{display:flex;gap:14px;padding:6px 0 2px}
-.apv-pick{flex:1 1 0;display:flex;align-items:center;gap:10px;padding:10px;
+#apvSheet .apv-val{flex:0 0 42px;text-align:right;font-size:12.5px;
+  color:var(--dim,#8a867c);font-variant-numeric:tabular-nums}
+#apvSheet .apv-sw{margin-left:auto;-webkit-appearance:none;appearance:none;
+  width:44px;height:26px;border-radius:999px;background:var(--line,#e8e5dc);
+  position:relative;transition:background .2s ease;flex:0 0 auto;border:0;cursor:pointer}
+#apvSheet .apv-sw::after{content:'';position:absolute;top:3px;left:3px;
+  width:20px;height:20px;border-radius:50%;background:#fff;
+  transition:transform .2s ease;box-shadow:0 1px 3px rgba(0,0,0,.18)}
+#apvSheet .apv-sw.on{background:var(--accent,#c96442)}
+#apvSheet .apv-sw.on::after{transform:translateX(18px)}
+#apvSheet .apv-avs{display:flex;gap:14px;padding:6px 0 2px}
+#apvSheet .apv-pick{flex:1 1 0;display:flex;align-items:center;gap:10px;padding:10px;
   border:1px dashed var(--line,#e8e5dc);border-radius:14px;cursor:pointer;
   font-size:13px;color:var(--dim,#8a867c);min-width:0}
-.apv-pick span.t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.apv-pick i{flex:0 0 auto;width:38px;height:38px;border-radius:50%;
+#apvSheet .apv-pick span.t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#apvSheet .apv-pick i{flex:0 0 auto;width:38px;height:38px;border-radius:50%;
   background:var(--panel,#f0eee6) center/cover no-repeat;
   display:flex;align-items:center;justify-content:center;font-style:normal;
   font-size:15px;color:var(--dim,#8a867c)}
-.apv-pick input{display:none}
-.apv-css{width:100%;box-sizing:border-box;min-height:104px;resize:vertical;
+#apvSheet .apv-pick input{display:none}
+#apvSheet .apv-css{width:100%;box-sizing:border-box;min-height:104px;resize:vertical;
   background:var(--panel,#f0eee6);border:1px solid transparent;border-radius:14px;
   padding:11px 13px;color:var(--text,#2b2a27);font-size:12.5px;line-height:1.6;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.apv-note{font-size:12px;color:var(--dim,#8a867c);opacity:.8;margin:7px 0 0;
-  line-height:1.6}
-.apv-btns{display:flex;gap:10px;margin-top:16px}
-.apv-btns button{flex:1 1 0;min-height:44px;border-radius:999px;border:0;
+#apvSheet .apv-note{font-size:12px;color:var(--dim,#8a867c);opacity:.8;
+  margin:7px 0 0;line-height:1.6}
+#apvSheet .apv-btns{display:flex;gap:10px;margin-top:16px}
+#apvSheet .apv-btns button{flex:1 1 0;min-height:44px;border-radius:999px;border:0;
   background:var(--panel,#f0eee6);color:var(--text,#2b2a27);font-size:14.5px;
   font-family:inherit;cursor:pointer}
-.apv-btns button.go{background:var(--accent,#c96442);color:#fff}
-.apv-sep{height:1px;background:var(--line,#e8e5dc);margin:14px 0;opacity:.7}
+#apvSheet .apv-btns button.go{background:var(--accent,#c96442);color:#fff}
+#apvSheet .apv-sep{height:1px;background:var(--line,#e8e5dc);margin:14px 0;opacity:.7}
 </style>
 <style id="apv-user"></style>
 <script>
@@ -156,7 +168,7 @@ CLIENT_SCRIPT = r"""
     avatarSize: 34, fontSize: 14.5, bubbleRadius: 18, rowGap: 16,
     timeSize: 10.5, showAvatar: true, showTime: true, css: ''
   };
-  var cfg = null;
+  var cfg = JSON.parse(JSON.stringify(DEF));
   var META = [
     ['avatarSize', '头像', 18, 72, 1],
     ['fontSize', '字号', 11, 22, 0.5],
@@ -165,10 +177,12 @@ CLIENT_SCRIPT = r"""
     ['timeSize', '时间', 8, 16, 0.5]
   ];
 
+  function logEl() { return document.getElementById('log'); }
+
   /* ── 时间戳来源 ────────────────────────────────────────────────
-     DOM 里的 row 不带 at，所以启动时拉一次 api/messages，按
-     kind|text 建队列去配。用队列而不是按序号对齐 —— 「看更早的消息」
-     会往前插行，序号会错位。配不上的（刚发的）用当下时间。 */
+     DOM 里的行不带 at，所以启动时拉一次 api/messages，按 kind|text
+     建队列去配。用队列而不是按序号对齐 —— 「看更早的消息」会往前插行，
+     序号会错位。配不上的（刚发的）用当下时间。 */
   var stampQ = Object.create(null);
   var stamps = new WeakMap();
   var loaded = false;
@@ -189,9 +203,9 @@ CLIENT_SCRIPT = r"""
           var k = keyOf(mine, m.text);
           (stampQ[k] || (stampQ[k] = [])).push(m.at);
         }
-        loaded = true;
       })
-      .catch(function () { loaded = true; });
+      .catch(function () {})
+      .then(function () { loaded = true; });
   }
 
   function stampFor(row, mine, text) {
@@ -211,18 +225,18 @@ CLIENT_SCRIPT = r"""
     return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm;
   }
 
-  /* ── 应用设置 ───────────────────────────────────────────────── */
+  /* ── 应用设置：变量和开关 class 都挂在 #log 上 ───────────────── */
   function apply() {
-    var s = document.documentElement.style;
-    s.setProperty('--apv-av', cfg.avatarSize + 'px');
-    s.setProperty('--apv-font', cfg.fontSize + 'px');
-    s.setProperty('--apv-radius', cfg.bubbleRadius + 'px');
-    s.setProperty('--apv-gap', cfg.rowGap + 'px');
-    s.setProperty('--apv-time', cfg.timeSize + 'px');
-    var b = document.body;
-    if (b) {
-      b.classList.toggle('apv-hide-av', !cfg.showAvatar);
-      b.classList.toggle('apv-hide-time', !cfg.showTime);
+    var L = logEl();
+    if (L) {
+      var s = L.style;
+      s.setProperty('--apv-av', cfg.avatarSize + 'px');
+      s.setProperty('--apv-font', cfg.fontSize + 'px');
+      s.setProperty('--apv-radius', cfg.bubbleRadius + 'px');
+      s.setProperty('--apv-gap', cfg.rowGap + 'px');
+      s.setProperty('--apv-time', cfg.timeSize + 'px');
+      L.classList.toggle('apv-hide-av', !cfg.showAvatar);
+      L.classList.toggle('apv-hide-time', !cfg.showTime);
     }
     var tag = document.getElementById('apv-user');
     if (tag) tag.textContent = cfg.css || '';
@@ -233,24 +247,25 @@ CLIENT_SCRIPT = r"""
     return 'api/appearance/avatar/' + who + '?v=' + (avSrc[who] || '0');
   }
   function paintAvatars() {
-    var els = document.querySelectorAll('.apv-av[data-who]');
+    var els = document.querySelectorAll('.apv-av[data-who],[data-pick]');
     for (var i = 0; i < els.length; i++) {
-      var who = els[i].getAttribute('data-who');
+      var el = els[i];
+      var who = el.getAttribute('data-who') || el.getAttribute('data-pick');
       if (avSrc[who]) {
-        els[i].style.backgroundImage = 'url("' + avatarUrl(who) + '")';
-        els[i].textContent = '';
+        el.style.backgroundImage = 'url("' + avatarUrl(who) + '")';
+        el.textContent = '';
       } else {
-        els[i].style.backgroundImage = '';
-        els[i].textContent = who === 'me' ? '妍' : '沐';
+        el.style.backgroundImage = '';
+        el.textContent = who === 'me' ? '妍' : '沐';
       }
     }
   }
 
   /* ── 往每一行插头像和时间戳 ─────────────────────────────────── */
   function decorate() {
-    var log = document.getElementById('log');
-    if (!log) return;
-    var rows = log.querySelectorAll('.row:not([data-apv])');
+    var L = logEl();
+    if (!L) return;
+    var rows = L.querySelectorAll('.row:not([data-apv])');
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
       // 只认直接挂着气泡的行。思考行和工具行没有 .bubble/.gu，跳过
@@ -261,7 +276,7 @@ CLIENT_SCRIPT = r"""
         if (c.classList.contains('gu')) { bub = c; break; }
       }
       if (!bub) continue;
-      // 他那条是流式写出来的，空的时候先别配时间 —— 配了就配到空串上
+      // 他那条是流式写出来的，还没拉到时间表之前先别配 —— 配了就配到空串上
       var text = (bub._raw != null ? bub._raw : bub.textContent) || '';
       if (!mine && !text.trim() && !loaded) continue;
 
@@ -274,6 +289,11 @@ CLIENT_SCRIPT = r"""
       av.className = 'apv-av';
       av.setAttribute('data-who', mine ? 'me' : 'gu');
       av.setAttribute('aria-hidden', 'true');
+      if (avSrc[mine ? 'me' : 'gu']) {
+        av.style.backgroundImage = 'url("' + avatarUrl(mine ? 'me' : 'gu') + '")';
+      } else {
+        av.textContent = mine ? '妍' : '沐';
+      }
       var tm = document.createElement('div');
       tm.className = 'apv-time';
       tm.textContent = fmt(stampFor(row, mine, text));
@@ -281,7 +301,21 @@ CLIENT_SCRIPT = r"""
       side.appendChild(tm);
       row.insertBefore(side, row.firstChild);
     }
-    paintAvatars();
+  }
+
+  /* MutationObserver 只置脏标记，由 rAF 合并后再扫。
+     流式输出时 DOM 一秒能变几十次，每次都跑一遍太重。 */
+  var dirty = false, pending = false;
+  function markDirty() {
+    dirty = true;
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(function () {
+      pending = false;
+      if (!dirty) return;
+      dirty = false;
+      decorate();
+    });
   }
 
   /* ── 面板 ───────────────────────────────────────────────────── */
@@ -305,10 +339,10 @@ CLIENT_SCRIPT = r"""
     sheet.className = 'sheetWrap';
     sheet.id = 'apvSheet';
 
-    var rows = '';
+    var lines = '';
     for (var i = 0; i < META.length; i++) {
       var m = META[i];
-      rows += '<div class="apv-row"><label for="apv-' + m[0] + '">' + m[1] + '</label>' +
+      lines += '<div class="apv-line"><label for="apv-' + m[0] + '">' + m[1] + '</label>' +
         '<input type="range" id="apv-' + m[0] + '" data-k="' + m[0] + '" min="' + m[2] +
         '" max="' + m[3] + '" step="' + m[4] + '">' +
         '<span class="apv-val" data-v="' + m[0] + '"></span></div>';
@@ -326,11 +360,11 @@ CLIENT_SCRIPT = r"""
             '<input type="file" accept="image/*" data-up="gu"></label>' +
         '</div>' +
         '<div class="apv-sep"></div>' +
-        rows +
-        '<div class="apv-row"><label>显示头像</label>' +
+        lines +
+        '<div class="apv-line"><label>显示头像</label>' +
           '<button type="button" class="apv-sw" data-sw="showAvatar" ' +
           'role="switch" aria-label="显示头像"></button></div>' +
-        '<div class="apv-row"><label>显示时间</label>' +
+        '<div class="apv-line"><label>显示时间</label>' +
           '<button type="button" class="apv-sw" data-sw="showTime" ' +
           'role="switch" aria-label="显示时间"></button></div>' +
         '<div class="apv-sep"></div>' +
@@ -345,11 +379,20 @@ CLIENT_SCRIPT = r"""
       '</div>';
     document.body.appendChild(sheet);
 
+    // 只在面板自己身上监听，不用文档级捕获 ——
+    // 那个会跟锁屏的 setPointerCapture 抢事件
     sheet.addEventListener('click', function (e) {
       var t = e.target;
       if (t.closest && t.closest('[data-apv-close]')) { closeSheet(); return; }
       if (t.closest && t.closest('[data-apv-reset]')) {
         cfg = JSON.parse(JSON.stringify(DEF));
+        apply(); fillSheet(); save();
+        return;
+      }
+      var sw = t.closest && t.closest('[data-sw]');
+      if (sw) {
+        var k = sw.getAttribute('data-sw');
+        cfg[k] = !cfg[k];
         apply(); fillSheet(); save();
       }
     });
@@ -381,20 +424,12 @@ CLIENT_SCRIPT = r"""
         .then(function (d) {
           if (!d || !d.ok) throw new Error('bad');
           avSrc[who] = d.v;
-          paintAvatars(); fillSheet();
+          paintAvatars();
         })
         .catch(function () {
           try { note('（头像没传上去）', 'err'); } catch (e2) {}
         });
       el.value = '';
-    });
-
-    sheet.querySelectorAll('[data-sw]').forEach(function (b) {
-      b.onclick = function () {
-        var k = b.getAttribute('data-sw');
-        cfg[k] = !cfg[k];
-        apply(); fillSheet(); save();
-      };
     });
   }
 
@@ -407,23 +442,15 @@ CLIENT_SCRIPT = r"""
       var v = sheet.querySelector('[data-v="' + k + '"]');
       if (v) v.textContent = cfg[k];
     }
-    sheet.querySelectorAll('[data-sw]').forEach(function (b) {
-      var on = !!cfg[b.getAttribute('data-sw')];
-      b.classList.toggle('on', on);
-      b.setAttribute('aria-checked', on ? 'true' : 'false');
-    });
+    var sws = sheet.querySelectorAll('[data-sw]');
+    for (var j = 0; j < sws.length; j++) {
+      var on = !!cfg[sws[j].getAttribute('data-sw')];
+      sws[j].classList.toggle('on', on);
+      sws[j].setAttribute('aria-checked', on ? 'true' : 'false');
+    }
     var ta = sheet.querySelector('.apv-css');
     if (ta && ta.value !== cfg.css) ta.value = cfg.css || '';
-    sheet.querySelectorAll('[data-pick]').forEach(function (el) {
-      var who = el.getAttribute('data-pick');
-      if (avSrc[who]) {
-        el.style.backgroundImage = 'url("' + avatarUrl(who) + '")';
-        el.textContent = '';
-      } else {
-        el.style.backgroundImage = '';
-        el.textContent = who === 'me' ? '妍' : '沐';
-      }
-    });
+    paintAvatars();
   }
 
   function openSheet() {
@@ -439,7 +466,7 @@ CLIENT_SCRIPT = r"""
     try { if (typeof openDrawer === 'function') openDrawer(); } catch (e) {}
   }
 
-  /* 侧边栏加一项。跟着 navWall 长，取不到就先不加，下一轮再试。 */
+  /* 侧边栏加一项，跟着 navWall 长。取不到就先不加，下一轮再试。 */
   function mountNav() {
     if (document.getElementById('navLook')) return;
     var anchor = document.getElementById('navWall');
@@ -460,7 +487,6 @@ CLIENT_SCRIPT = r"""
 
   /* ── 起 ─────────────────────────────────────────────────────── */
   function boot() {
-    cfg = JSON.parse(JSON.stringify(DEF));
     apply();
 
     fetch('api/appearance', { cache: 'no-store' })
@@ -468,8 +494,8 @@ CLIENT_SCRIPT = r"""
       .then(function (d) {
         if (d && d.ok) {
           cfg = d.cfg;
-          avSrc.me = d.avatars.me || '';
-          avSrc.gu = d.avatars.gu || '';
+          avSrc.me = (d.avatars && d.avatars.me) || '';
+          avSrc.gu = (d.avatars && d.avatars.gu) || '';
         }
         apply(); paintAvatars(); fillSheet();
       })
@@ -478,13 +504,14 @@ CLIENT_SCRIPT = r"""
     loadStamps().then(decorate);
 
     mountNav();
-    var log = document.getElementById('log');
-    if (log && window.MutationObserver) {
-      new MutationObserver(function () { decorate(); })
-        .observe(log, { childList: true, subtree: true, characterData: true });
+    var L = logEl();
+    if (L && window.MutationObserver) {
+      new MutationObserver(markDirty).observe(L, {
+        childList: true, subtree: true, characterData: true
+      });
     }
-    // 侧边栏是上游后来才画的；顺带兜住流式那条空气泡后来才有字的情况
-    setInterval(function () { mountNav(); decorate(); }, 1100);
+    // 侧边栏是上游后来才画的；也兜住流式那条空气泡后来才有字的情况
+    setInterval(function () { mountNav(); decorate(); }, 1400);
   }
 
   window.dwellAppearance = {
@@ -503,7 +530,7 @@ CLIENT_SCRIPT = r"""
 
 
 def register_appearance_feature(server_module):
-    """接外观设置：两个接口 + 再包一层 index。
+    """接外观设置：四个接口 + 再包一层 index。
 
     要排在 frontend_feature 之后（它包的是那一层 index）。
     """
@@ -525,7 +552,8 @@ def register_appearance_feature(server_module):
         if not row:
             return dict(DEFAULTS)
         try:
-            return _clean(json.loads(row[0] if not hasattr(row, "keys") else row["value"]))
+            raw = row["value"] if hasattr(row, "keys") else row[0]
+            return _clean(json.loads(raw))
         except Exception:
             return dict(DEFAULTS)
 
