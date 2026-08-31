@@ -1,22 +1,24 @@
-"""dwell 外观：气泡头像、时间戳，以及一个能实时调的外观面板。
+"""dwell 外观：气泡头像、时间戳、日期分隔条，和一个能实时调的外观面板。
 
 不改 web/index.html。在 index 视图外面再包一层，把客户端脚本注进去。
 
-⚠️ 样式选择器一律锁进 `#log`，一条都不能漏。`.row` 这个 class 名在
-index.html 里被复用了至少四处（`.hd-write .row`、`.hadd .row`、
+⚠️ 样式选择器一律锁进 `#log` 或 `#apvSheet`，一条都不能漏。`.row` 这个
+class 名在 index.html 里被复用了至少四处（`.hd-write .row`、`.hadd .row`、
 `.rc-add .row`，锁屏那层里也有）。写成裸 `.row{display:flex}` 会把锁屏的
 布局压掉 —— `track.clientWidth` 算错、`MAX()` 归零、滑块拖不动，
 而锁屏靠 `setPointerCapture` 抓指针，布局一崩解锁手势就整个没了。
 
-⚠️ 这一层比语音那套深：头像插进上游 `.row` 的结构里（`row()` 建行、
-`addMe()` 塞 `.bubble`、他那条是 `.gu`）。上游哪天改了那几个函数，
-头像就不显示了 —— 不会崩，但会静默失效。这是注入路线的代价。
+⚠️ 面板借了上游 `.sheet` 的壳，那个壳自带 padding 和布局。往里塞
+`width:100%` 的 textarea 或 `flex:1` 的滑块，加起来超过内容宽度就会把壳
+顶开。所以 `#apvSheet .sheet` 上写死了 box-sizing / width / max-width /
+overflow-x，内部所有横向元素都得 `min-width:0`。
+
+⚠️ 头像插进上游 `.row` 的结构里（`row()` 建行、`addMe()` 塞 `.bubble`、
+他那条是 `.gu`）。上游哪天改了那几个函数，头像就不显示了 —— 不会崩，
+但会静默失效。这是注入路线的代价。
 
 设置存在 settings 表里，不用 localStorage：换个设备就没了，而且
 iPad 和手机会看到不一样的样子。
-
-面板是主页里的抽屉浮层，不是 iframe 面板。滑块要实时预览 —— 拖头像
-大小的时候后面的聊天得立刻跟着变，隔着 iframe 看不见。
 
 删掉 run.py 里那一行就完全没有这个功能，别的都不受影响。
 """
@@ -40,8 +42,10 @@ DEFAULTS = {
     "bubbleRadius": 18,     # 气泡圆角 px
     "rowGap": 16,           # 两条消息之间 px
     "timeSize": 10.5,       # 时间戳 px
+    "gapHours": 5,          # 隔这么久才插日期分隔条
     "showAvatar": True,
     "showTime": True,
+    "showDay": True,
     "css": "",              # 自由 CSS，原样注入
 }
 
@@ -51,6 +55,7 @@ NUM_RANGE = {
     "bubbleRadius": (0, 28),
     "rowGap": (2, 40),
     "timeSize": (8, 16),
+    "gapHours": (0.5, 24),
 }
 
 ALLOWED_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -68,7 +73,7 @@ def _clean(raw: dict) -> dict:
                 out[key] = max(low, min(high, float(raw[key])))
             except (TypeError, ValueError):
                 pass
-    for key in ("showAvatar", "showTime"):
+    for key in ("showAvatar", "showTime", "showDay"):
         if key in raw:
             out[key] = bool(raw[key])
     if "css" in raw and isinstance(raw["css"], str):
@@ -105,59 +110,87 @@ CLIENT_SCRIPT = r"""
   opacity:.72;white-space:nowrap;font-variant-numeric:tabular-nums;
   text-align:center;letter-spacing:.01em}
 
-/* 开关那两个 class 也挂在 #log 上，不挂 body */
+/* 日期分隔条。是 #log 的直接子元素，不进 .row —— 免得又踩到那一层 */
+#log .apv-day{display:flex;justify-content:center;
+  margin:calc(var(--apv-gap) + 6px) auto;max-width:720px}
+#log .apv-day > span{font-size:calc(var(--apv-time) + .5px);
+  color:var(--dim,#8a867c);opacity:.78;padding:3px 11px;border-radius:999px;
+  border:1px solid var(--line,#e8e5dc);background:transparent;
+  letter-spacing:.02em;white-space:nowrap;font-variant-numeric:tabular-nums}
+
+/* 开关那几个 class 也挂在 #log 上，不挂 body */
 #log.apv-hide-av .apv-av{display:none}
 #log.apv-hide-av .apv-side{width:auto}
 #log.apv-hide-time .apv-time{display:none}
-/* 两个都关掉时那一列就没用了，收掉免得留一道空隙 */
 #log.apv-hide-av.apv-hide-time .apv-side{display:none}
+#log.apv-hide-day .apv-day{display:none}
 
-/* ── 面板。外壳借上游 .sheetWrap/.sheet（独立元素，不会溢出），
-      内部一律用 apv- 前缀的自有 class ── */
-#apvSheet .sheet{padding-bottom:calc(env(safe-area-inset-bottom,0px) + 18px)}
+/* ── 面板 ─────────────────────────────────────────────────────
+   ⚠️ 上游 .sheet 的壳自带 padding 和布局。里面塞 width:100% 的
+   textarea 或 flex:1 的滑块，加起来超过内容宽度就会把壳顶开。
+   所以这儿写死盒模型，内部所有横向元素一律 min-width:0。 */
+#apvSheet .sheet{box-sizing:border-box;width:100%;max-width:100vw;
+  overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;
+  padding-bottom:calc(env(safe-area-inset-bottom,0px) + 18px)}
+#apvSheet .sheet *{box-sizing:border-box}
 #apvSheet .apv-h{font-size:19px;font-weight:600;margin:2px 0 14px;
   color:var(--text,#2b2a27)}
-#apvSheet .apv-line{display:flex;align-items:center;gap:12px;padding:9px 0}
-#apvSheet .apv-line label{flex:0 0 78px;font-size:13.5px;color:var(--dim,#8a867c)}
-#apvSheet .apv-line input[type=range]{flex:1 1 auto;-webkit-appearance:none;
-  appearance:none;height:26px;background:transparent}
+#apvSheet .apv-line{display:flex;align-items:center;gap:10px;padding:8px 0;
+  min-width:0}
+#apvSheet .apv-line > label{flex:0 0 64px;min-width:0;font-size:13.5px;
+  color:var(--dim,#8a867c);overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+#apvSheet .apv-line input[type=range]{flex:1 1 0;min-width:0;width:auto;
+  -webkit-appearance:none;appearance:none;height:26px;background:transparent;
+  margin:0}
 #apvSheet .apv-line input[type=range]::-webkit-slider-runnable-track{height:3px;
   border-radius:2px;background:var(--line,#e8e5dc)}
 #apvSheet .apv-line input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;
   width:20px;height:20px;border-radius:50%;background:#fff;margin-top:-8.5px;
   border:1px solid var(--line,#e8e5dc);box-shadow:0 1px 4px rgba(0,0,0,.14)}
-#apvSheet .apv-val{flex:0 0 42px;text-align:right;font-size:12.5px;
+#apvSheet .apv-val{flex:0 0 38px;min-width:0;text-align:right;font-size:12.5px;
   color:var(--dim,#8a867c);font-variant-numeric:tabular-nums}
-#apvSheet .apv-sw{margin-left:auto;-webkit-appearance:none;appearance:none;
-  width:44px;height:26px;border-radius:999px;background:var(--line,#e8e5dc);
-  position:relative;transition:background .2s ease;flex:0 0 auto;border:0;cursor:pointer}
+#apvSheet .apv-sw{flex:0 0 auto;margin-left:auto;-webkit-appearance:none;
+  appearance:none;width:44px;height:26px;border-radius:999px;
+  background:var(--line,#e8e5dc);position:relative;transition:background .2s ease;
+  border:0;padding:0;cursor:pointer}
 #apvSheet .apv-sw::after{content:'';position:absolute;top:3px;left:3px;
   width:20px;height:20px;border-radius:50%;background:#fff;
   transition:transform .2s ease;box-shadow:0 1px 3px rgba(0,0,0,.18)}
 #apvSheet .apv-sw.on{background:var(--accent,#c96442)}
 #apvSheet .apv-sw.on::after{transform:translateX(18px)}
-#apvSheet .apv-avs{display:flex;gap:14px;padding:6px 0 2px}
-#apvSheet .apv-pick{flex:1 1 0;display:flex;align-items:center;gap:10px;padding:10px;
-  border:1px dashed var(--line,#e8e5dc);border-radius:14px;cursor:pointer;
-  font-size:13px;color:var(--dim,#8a867c);min-width:0}
-#apvSheet .apv-pick span.t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#apvSheet .apv-pick i{flex:0 0 auto;width:38px;height:38px;border-radius:50%;
+#apvSheet .apv-avs{display:flex;gap:10px;padding:6px 0 2px;min-width:0}
+#apvSheet .apv-pick{flex:1 1 0;min-width:0;display:flex;align-items:center;
+  gap:9px;padding:9px;border:1px dashed var(--line,#e8e5dc);border-radius:14px;
+  cursor:pointer;font-size:12.5px;color:var(--dim,#8a867c)}
+#apvSheet .apv-pick span.t{min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+#apvSheet .apv-pick i{flex:0 0 auto;width:34px;height:34px;border-radius:50%;
   background:var(--panel,#f0eee6) center/cover no-repeat;
   display:flex;align-items:center;justify-content:center;font-style:normal;
-  font-size:15px;color:var(--dim,#8a867c)}
+  font-size:14px;color:var(--dim,#8a867c);overflow:hidden}
 #apvSheet .apv-pick input{display:none}
-#apvSheet .apv-css{width:100%;box-sizing:border-box;min-height:104px;resize:vertical;
-  background:var(--panel,#f0eee6);border:1px solid transparent;border-radius:14px;
-  padding:11px 13px;color:var(--text,#2b2a27);font-size:12.5px;line-height:1.6;
+/* width:100% 会把壳顶开；display:block + auto 让它自己撑到内容宽度 */
+#apvSheet .apv-css{display:block;width:auto;min-width:0;min-height:104px;
+  resize:vertical;background:var(--panel,#f0eee6);border:1px solid transparent;
+  border-radius:14px;padding:11px 13px;color:var(--text,#2b2a27);
+  font-size:12.5px;line-height:1.6;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-#apvSheet .apv-note{font-size:12px;color:var(--dim,#8a867c);opacity:.8;
-  margin:7px 0 0;line-height:1.6}
-#apvSheet .apv-btns{display:flex;gap:10px;margin-top:16px}
-#apvSheet .apv-btns button{flex:1 1 0;min-height:44px;border-radius:999px;border:0;
-  background:var(--panel,#f0eee6);color:var(--text,#2b2a27);font-size:14.5px;
-  font-family:inherit;cursor:pointer}
+#apvSheet .apv-note{font-size:11.5px;color:var(--dim,#8a867c);opacity:.85;
+  margin:8px 0 0;line-height:1.7;word-break:break-word}
+#apvSheet .apv-note code{background:var(--panel,#f0eee6);border-radius:5px;
+  padding:1px 5px;font-size:11px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+#apvSheet .apv-note b{display:block;margin:9px 0 3px;font-weight:600;
+  color:var(--text,#2b2a27);opacity:.72;font-size:11.5px}
+#apvSheet .apv-btns{display:flex;gap:9px;margin-top:16px;min-width:0}
+#apvSheet .apv-btns button{flex:1 1 0;min-width:0;min-height:44px;
+  border-radius:999px;border:0;background:var(--panel,#f0eee6);
+  color:var(--text,#2b2a27);font-size:14px;font-family:inherit;cursor:pointer;
+  padding:0 12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #apvSheet .apv-btns button.go{background:var(--accent,#c96442);color:#fff}
-#apvSheet .apv-sep{height:1px;background:var(--line,#e8e5dc);margin:14px 0;opacity:.7}
+#apvSheet .apv-sep{height:1px;background:var(--line,#e8e5dc);margin:13px 0;
+  opacity:.7}
 </style>
 <style id="apv-user"></style>
 <script>
@@ -166,7 +199,8 @@ CLIENT_SCRIPT = r"""
 
   var DEF = {
     avatarSize: 34, fontSize: 14.5, bubbleRadius: 18, rowGap: 16,
-    timeSize: 10.5, showAvatar: true, showTime: true, css: ''
+    timeSize: 10.5, gapHours: 5,
+    showAvatar: true, showTime: true, showDay: true, css: ''
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
   var META = [
@@ -174,8 +208,35 @@ CLIENT_SCRIPT = r"""
     ['fontSize', '字号', 11, 22, 0.5],
     ['bubbleRadius', '圆角', 0, 28, 1],
     ['rowGap', '行距', 2, 40, 1],
-    ['timeSize', '时间', 8, 16, 0.5]
+    ['timeSize', '时间', 8, 16, 0.5],
+    ['gapHours', '隔多久', 0.5, 24, 0.5]
   ];
+
+  /* 圆条气泡：两边都是纯圆角胶囊，不带小尖角。
+     灌进自由 CSS 那栏，之后就是普通的用户 CSS，可以随便改、清空即恢复。 */
+  var PRESET = [
+    '/* 圆条气泡 · 改坏了按「还原默认」或者清空这里 */',
+    '#log .row.apv > .bubble,',
+    '#log .row.apv > .gu {',
+    '  padding: 9px 15px;',
+    '  border-radius: 999px;',
+    '  line-height: 1.62;',
+    '}',
+    '/* 你说的 */',
+    '#log .row.apv > .bubble {',
+    '  background: color-mix(in srgb, var(--accent) 14%, var(--bg));',
+    '  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);',
+    '  color: var(--text);',
+    '}',
+    '/* 他说的 */',
+    '#log .row.apv > .gu {',
+    '  background: var(--card);',
+    '  border: 1px solid var(--line);',
+    '}',
+    '/* 多行的时候圆角收一点，不然长段落看着怪 */',
+    '#log .row.apv > .bubble:not(:has(br)),',
+    '#log .row.apv > .gu:not(:has(br)) { border-radius: 999px; }'
+  ].join('\n');
 
   function logEl() { return document.getElementById('log'); }
 
@@ -216,13 +277,24 @@ CLIENT_SCRIPT = r"""
     return at;
   }
 
-  function fmt(at) {
+  function clock(at) {
     var d = new Date(at * 1000);
+    return String(d.getHours()).padStart(2, '0') + ':' +
+           String(d.getMinutes()).padStart(2, '0') + ':' +
+           String(d.getSeconds()).padStart(2, '0');
+  }
+
+  function dayLabel(at) {
+    var d = new Date(at * 1000);
+    var now = new Date();
     var hm = String(d.getHours()).padStart(2, '0') + ':' +
              String(d.getMinutes()).padStart(2, '0');
-    var now = new Date();
-    if (d.toDateString() === now.toDateString()) return hm;
-    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm;
+    if (d.toDateString() === now.toDateString()) return '今天 ' + hm;
+    var y = new Date(now.getTime() - 86400000);
+    if (d.toDateString() === y.toDateString()) return '昨天 ' + hm;
+    var head = (d.getMonth() + 1) + '月' + d.getDate() + '日';
+    if (d.getFullYear() !== now.getFullYear()) head = d.getFullYear() + '年' + head;
+    return head + ' ' + hm;
   }
 
   /* ── 应用设置：变量和开关 class 都挂在 #log 上 ───────────────── */
@@ -237,6 +309,7 @@ CLIENT_SCRIPT = r"""
       s.setProperty('--apv-time', cfg.timeSize + 'px');
       L.classList.toggle('apv-hide-av', !cfg.showAvatar);
       L.classList.toggle('apv-hide-time', !cfg.showTime);
+      L.classList.toggle('apv-hide-day', !cfg.showDay);
     }
     var tag = document.getElementById('apv-user');
     if (tag) tag.textContent = cfg.css || '';
@@ -261,7 +334,7 @@ CLIENT_SCRIPT = r"""
     }
   }
 
-  /* ── 往每一行插头像和时间戳 ─────────────────────────────────── */
+  /* ── 往每一行插头像和时间戳，顺带补日期分隔条 ─────────────────── */
   function decorate() {
     var L = logEl();
     if (!L) return;
@@ -282,24 +355,54 @@ CLIENT_SCRIPT = r"""
 
       row.setAttribute('data-apv', '1');
       row.classList.add('apv');
+      var who = mine ? 'me' : 'gu';
+      var at = stampFor(row, mine, text);
 
       var side = document.createElement('div');
       side.className = 'apv-side';
       var av = document.createElement('div');
       av.className = 'apv-av';
-      av.setAttribute('data-who', mine ? 'me' : 'gu');
+      av.setAttribute('data-who', who);
       av.setAttribute('aria-hidden', 'true');
-      if (avSrc[mine ? 'me' : 'gu']) {
-        av.style.backgroundImage = 'url("' + avatarUrl(mine ? 'me' : 'gu') + '")';
+      if (avSrc[who]) {
+        av.style.backgroundImage = 'url("' + avatarUrl(who) + '")';
       } else {
         av.textContent = mine ? '妍' : '沐';
       }
       var tm = document.createElement('div');
       tm.className = 'apv-time';
-      tm.textContent = fmt(stampFor(row, mine, text));
+      tm.textContent = clock(at);
       side.appendChild(av);
       side.appendChild(tm);
       row.insertBefore(side, row.firstChild);
+    }
+    if (rows.length) dayMarks();
+  }
+
+  /* 相邻两条间隔超过 gapHours 就在中间插一行。
+     每次全量重算：行会被往前插（看更早的消息），只补末尾会漏。 */
+  function dayMarks() {
+    var L = logEl();
+    if (!L) return;
+    var old = L.querySelectorAll('.apv-day');
+    for (var i = 0; i < old.length; i++) old[i].remove();
+
+    var rows = L.querySelectorAll('.row[data-apv]');
+    var gap = cfg.gapHours * 3600;
+    var prev = null;
+    for (var j = 0; j < rows.length; j++) {
+      var row = rows[j];
+      if (!stamps.has(row)) continue;
+      var at = stamps.get(row);
+      if (prev === null || at - prev > gap) {
+        var d = document.createElement('div');
+        d.className = 'apv-day';
+        var sp = document.createElement('span');
+        sp.textContent = dayLabel(at);
+        d.appendChild(sp);
+        L.insertBefore(d, row);
+      }
+      prev = at;
     }
   }
 
@@ -361,17 +464,40 @@ CLIENT_SCRIPT = r"""
         '</div>' +
         '<div class="apv-sep"></div>' +
         lines +
-        '<div class="apv-line"><label>显示头像</label>' +
+        '<div class="apv-line"><label>头像</label>' +
           '<button type="button" class="apv-sw" data-sw="showAvatar" ' +
           'role="switch" aria-label="显示头像"></button></div>' +
-        '<div class="apv-line"><label>显示时间</label>' +
+        '<div class="apv-line"><label>时间</label>' +
           '<button type="button" class="apv-sw" data-sw="showTime" ' +
           'role="switch" aria-label="显示时间"></button></div>' +
+        '<div class="apv-line"><label>日期条</label>' +
+          '<button type="button" class="apv-sw" data-sw="showDay" ' +
+          'role="switch" aria-label="显示日期分隔"></button></div>' +
         '<div class="apv-sep"></div>' +
-        '<textarea class="apv-css" spellcheck="false" ' +
-          'placeholder="自己写点 CSS，比如&#10;#log .bubble { background: #eae6dc; }"></textarea>' +
-        '<p class="apv-note">这一栏原样注进页面。写坏了页面会难看，清空就好。' +
-        '气泡是 <code>#log .bubble</code>（你的）和 <code>#log .gu</code>（他的）。</p>' +
+        '<textarea class="apv-css" spellcheck="false" autocapitalize="off" ' +
+          'autocorrect="off" placeholder="在这儿写 CSS"></textarea>' +
+        '<div class="apv-btns" style="margin-top:10px">' +
+          '<button type="button" data-apv-preset="1">用一下圆条样式</button>' +
+        '</div>' +
+        '<p class="apv-note">' +
+          '<b>能用的选择器</b>' +
+          '<code>#log .row.apv &gt; .bubble</code> 你说的话<br>' +
+          '<code>#log .row.apv &gt; .gu</code> 他说的话<br>' +
+          '<code>#log .row.me.apv</code> 你那一行（整行）<br>' +
+          '<code>#log .apv-av</code> 头像　<code>#log .apv-time</code> 时间<br>' +
+          '<code>#log .apv-day &gt; span</code> 中间那个日期条<br>' +
+          '<code>#log .toolline</code> 思考那一行' +
+          '<b>能用的变量</b>' +
+          '<code>--apv-av</code> <code>--apv-font</code> <code>--apv-radius</code> ' +
+          '<code>--apv-gap</code> <code>--apv-time</code><br>' +
+          '上游的：<code>--bg</code> <code>--card</code> <code>--panel</code> ' +
+          '<code>--line</code> <code>--text</code> <code>--dim</code> ' +
+          '<code>--accent</code>' +
+          '<b>说明</b>' +
+          '这一栏原样注进页面，写坏了页面会难看，清空就好。' +
+          '选择器前面那个 <code>#log</code> 别省 —— ' +
+          '<code>.row</code> 这名字页面里别处也在用，写宽了会把锁屏弄坏。' +
+        '</p>' +
         '<div class="apv-btns">' +
           '<button type="button" data-apv-reset="1">还原默认</button>' +
           '<button type="button" class="go" data-apv-close="1">好了</button>' +
@@ -386,6 +512,11 @@ CLIENT_SCRIPT = r"""
       if (t.closest && t.closest('[data-apv-close]')) { closeSheet(); return; }
       if (t.closest && t.closest('[data-apv-reset]')) {
         cfg = JSON.parse(JSON.stringify(DEF));
+        apply(); fillSheet(); dayMarks(); save();
+        return;
+      }
+      if (t.closest && t.closest('[data-apv-preset]')) {
+        cfg.css = PRESET;
         apply(); fillSheet(); save();
         return;
       }
@@ -404,7 +535,9 @@ CLIENT_SCRIPT = r"""
         cfg[k] = parseFloat(el.value);
         var v = sheet.querySelector('[data-v="' + k + '"]');
         if (v) v.textContent = cfg[k];
-        apply(); save();
+        apply();
+        if (k === 'gapHours') dayMarks();
+        save();
         return;
       }
       if (el.classList && el.classList.contains('apv-css')) {
@@ -440,7 +573,7 @@ CLIENT_SCRIPT = r"""
       var el = sheet.querySelector('[data-k="' + k + '"]');
       if (el) el.value = cfg[k];
       var v = sheet.querySelector('[data-v="' + k + '"]');
-      if (v) v.textContent = cfg[k];
+      if (v) v.textContent = k === 'gapHours' ? (cfg[k] + 'h') : cfg[k];
     }
     var sws = sheet.querySelectorAll('[data-sw]');
     for (var j = 0; j < sws.length; j++) {
@@ -497,7 +630,7 @@ CLIENT_SCRIPT = r"""
           avSrc.me = (d.avatars && d.avatars.me) || '';
           avSrc.gu = (d.avatars && d.avatars.gu) || '';
         }
-        apply(); paintAvatars(); fillSheet();
+        apply(); paintAvatars(); fillSheet(); dayMarks();
       })
       .catch(function () {});
 
@@ -518,7 +651,8 @@ CLIENT_SCRIPT = r"""
     open: openSheet,
     close: closeSheet,
     get: function () { return cfg; },
-    redraw: decorate
+    preset: PRESET,
+    redraw: function () { decorate(); dayMarks(); }
   };
 
   if (document.readyState === 'loading') {
