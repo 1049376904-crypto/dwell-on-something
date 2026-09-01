@@ -116,6 +116,10 @@ CLIENT_SCRIPT = r"""
   white-space:nowrap}
 #petSheet .pt-pic.has{border-style:solid}
 #petSheet .pt-pic input{display:none}
+#petSheet .pt-pic .pt-x{flex:0 0 auto;width:22px;height:22px;border:0;
+  background:transparent;color:var(--dim,#8a867c);cursor:pointer;padding:0;
+  display:flex;align-items:center;justify-content:center}
+#petSheet .pt-pic .pt-x svg{width:13px;height:13px}
 #petSheet .pt-btns{display:flex;gap:9px;margin-top:16px;min-width:0}
 #petSheet .pt-btns button{flex:1 1 0;min-width:0;min-height:44px;
   border-radius:999px;border:0;background:var(--panel,#f0eee6);
@@ -138,7 +142,6 @@ CLIENT_SCRIPT = r"""
   var cfg = JSON.parse(JSON.stringify(DEF));
   var pics = {};
 
-  /* 五张图，跟源码一模一样 */
   var WALK_SRC = "https://zkaicc.huilan.com/aicc/api/aicc-file/miniofile/preViewPicture/aicc/71G55kRR_1786448391994.png";
   var IDLE_SRC = "https://cac.opple.com/yc-media/getFile?id=e01f949c613e4add8621fdaba4ba3e5f#.png";
   var BURST_SRC = "https://www.lnjubao.cn/minio-jbpt/upload/20260811/edac7c48967dab963cd16afcfe731abb.png";
@@ -170,7 +173,6 @@ CLIENT_SCRIPT = r"""
       : (BUILTIN[state] || '');
   }
 
-  /* ── DOM ── */
   var wrap = null, img = null;
 
   function build() {
@@ -203,7 +205,6 @@ CLIENT_SCRIPT = r"""
     tempUntil = performance.now() + ms;
   }
 
-  /* ── 键盘 ── */
   var kbUp = false;
   var vv = window.visualViewport;
   function checkKb() { if (vv) kbUp = vv.height < window.innerHeight * 0.8; }
@@ -218,7 +219,6 @@ CLIENT_SCRIPT = r"""
     return vv ? (focused && kbUp) : focused;
   }
 
-  /* ── 走 ── */
   var x = 0, dir = 1, raf = 0;
   var restUntil = 0, nextRest = 0, lastT = 0;
 
@@ -279,7 +279,6 @@ CLIENT_SCRIPT = r"""
     } else if (tempSrc && now < tempUntil) {
       want = tempSrc;
     } else {
-      /* 偶发随机图：每 6~10s 检查一次，约一半概率换张随机图显示 3.5s */
       if (now >= nextRandomAt) {
         if (Math.random() < 0.5) {
           setTemp(urlOf(Math.random() < 0.5 ? 'startupA' : 'startupB'), 3500);
@@ -321,7 +320,6 @@ CLIENT_SCRIPT = r"""
     wrap.classList.toggle('pet-flip', dir === -1);
   }
 
-  /* ── 面板 ── */
   var sheet = null, saveTimer = null;
 
   function save() {
@@ -357,6 +355,12 @@ CLIENT_SCRIPT = r"""
       grid += '<label class="pt-pic" data-pic="' + STATES[j][0] + '">' +
         '<i data-thumb="' + STATES[j][0] + '"></i>' +
         '<span>' + STATES[j][1] + '</span>' +
+        '<button type="button" class="pt-x" data-picdel="' + STATES[j][0] + '" ' +
+          'title="清掉，用回外链图" style="display:none">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+          'stroke-width="2" stroke-linecap="round">' +
+          '<line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/>' +
+          '</svg></button>' +
         '<input type="file" accept="image/*" data-picup="' + STATES[j][0] + '"></label>';
     }
 
@@ -380,7 +384,7 @@ CLIENT_SCRIPT = r"""
         '<div class="pt-grp">换图</div>' +
         '<div class="pt-pics">' + grid + '</div>' +
         '<p class="pt-note">默认用五张外链图。传了哪个换哪个，' +
-          'png / gif / svg 都行，4MB 以内。</p>' +
+          '点格子右边那个 × 就清掉、用回外链。png / gif / svg 都行，4MB 以内。</p>' +
 
         '<div class="pt-btns">' +
           '<button type="button" data-pt-reset="1">还原默认</button>' +
@@ -395,6 +399,24 @@ CLIENT_SCRIPT = r"""
       if (t.closest && t.closest('[data-pt-reset]')) {
         cfg = JSON.parse(JSON.stringify(DEF));
         fillSheet(); save();
+        return;
+      }
+      var del = t.closest && t.closest('[data-picdel]');
+      if (del) {
+        e.preventDefault();
+        e.stopPropagation();
+        var st = del.getAttribute('data-picdel');
+        fetch('api/pet/pic/' + st, { method: 'DELETE' })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (!d || !d.ok) throw new Error('bad');
+            delete pics[st];
+            fillSheet();
+            try { note('（清掉了，用回外链图）'); } catch (e2) {}
+          })
+          .catch(function () {
+            try { note('（没清掉）', 'err'); } catch (e2) {}
+          });
         return;
       }
       var sw = t.closest && t.closest('[data-sw]');
@@ -458,6 +480,11 @@ CLIENT_SCRIPT = r"""
       var box = th[n].parentNode;
       th[n].style.backgroundImage = 'url("' + urlOf(st) + '")';
       if (box) box.classList.toggle('has', !!pics[st]);
+    }
+    var dels = sheet.querySelectorAll('[data-picdel]');
+    for (var m = 0; m < dels.length; m++) {
+      var st2 = dels[m].getAttribute('data-picdel');
+      dels[m].style.display = pics[st2] ? '' : 'none';
     }
   }
 
@@ -527,7 +554,7 @@ CLIENT_SCRIPT = r"""
 
 
 def register_pet_feature(server_module):
-    """接小家伙：四个接口 + 再包一层 index。"""
+    """接小家伙：五个接口 + 再包一层 index。"""
     app = server_module.app
     get_db = server_module.get_db
 
@@ -618,6 +645,21 @@ def register_pet_feature(server_module):
         return send_file(str(p), mimetype=ALLOWED_EXT.get(p.suffix.lower()),
                          max_age=0, conditional=True)
 
+    def api_pic_del(state):
+        """清掉这个状态传过的图，回到外链。"""
+        if state not in STATES:
+            return jsonify({"ok": False, "error": "state"}), 400
+        removed = False
+        for old in ALLOWED_EXT:
+            p = pic_dir / (state + old)
+            if p.exists():
+                try:
+                    p.unlink()
+                    removed = True
+                except OSError:
+                    pass
+        return jsonify({"ok": True, "removed": removed})
+
     app.add_url_rule("/api/pet", endpoint="api_pet_get",
                      view_func=api_get, methods=["GET"])
     app.add_url_rule("/api/pet", endpoint="api_pet_post",
@@ -626,6 +668,8 @@ def register_pet_feature(server_module):
                      view_func=api_pic_put, methods=["POST"])
     app.add_url_rule("/api/pet/pic/<state>", endpoint="api_pet_pic_get",
                      view_func=api_pic_get, methods=["GET"])
+    app.add_url_rule("/api/pet/pic/<state>", endpoint="api_pet_pic_del",
+                     view_func=api_pic_del, methods=["DELETE"])
 
     server_module.pet_client_script = CLIENT_SCRIPT
 
