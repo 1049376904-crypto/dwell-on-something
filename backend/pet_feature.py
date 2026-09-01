@@ -1,34 +1,25 @@
-"""dwell 小家伙：让上游那只 #pet 沿输入栏走起来，顺便能换图。
+"""dwell 小家伙：照源码那套逻辑，在聊天输入栏上方放一只会走路的小宠物。
 
-上游 web/index.html 里已经有一只 `#pet`：能拖、能戳、会跟着聊天状态换图
-（idle / thinking / typing / happy / doze / sleeping / react）。它缺的只有
-一件事 —— 走动。这一层补上走动，再把「换图」做成能自己上传。
+之前几版一直在改上游那只 `#pet`（能拖能戳、靠 petSet 换图），方向错了。
+你给的源码是另一套东西：它自己建 DOM、自己走、自己换图，完全不依赖上游。
 
-⚠️ 关键事实：`web/pet/` 目录在服务器上**不存在**，所以上游那七张
-`pet/clawd-*.svg` 全是 404 —— 他一直是只看不见的空框。这就是之前
-"开了开关却没出现"的真正原因，跟定位、跟换图逻辑都没关系。
+这一版照它的思路重写，只把选择器换成你页面里真实存在的：
 
-所以这一版不再依赖上游那套图文件，直接由本层接管 `img.src`：
-- 五个状态用用户指定的外链图（那五张他有印象、喜欢）
-- 两个状态（thinking / happy）用内嵌 SVG，不依赖任何文件
-- 外链万一加载失败（防盗链 / 图床挂了），兜底换内嵌 SVG，绝不让他消失
+- 它找 `.chat-input-bar`，你的页面没有这个 class —— 输入区是 `.composer`，
+  所以锚点用 `.composer`（聊天页才有；别的页面没有，小猫自然不出现）。
+- 它靠 `visualViewport` 高度判断键盘起没起，这个保留。
+- 它到边翻身（scaleX(-1)）、打字时停下、戳一下跳、连续点爆发图，都保留。
 
-状态识别仍然从上游写入的 src 文件名反推（虽然文件 404，但 src 属性
-里还是写着 `clawd-idle-follow.svg` 这种名字），识别出来再覆盖成正确的
-URL。MutationObserver 盯着 src，一被改回来就再盖一次。
+图：五个状态用你指定的外链（WALK/IDLE/BURST/STARTUP_A/STARTUP_B）。
+thinking / happy 这两个状态源码里没有对应外链，就用一张兜底图顶住 ——
+不自己画 SVG 了（你嫌丑）。兜底图也是外链里挑一张，加载失败再退回
+一个纯色的 data URI，保证他永远不消失。
 
-⚠️ 拖动：把位置存在 localStorage.petPos。走路开着时拖一下只是临时挪开，
-松手八秒后他自己走回去；关掉走路才当成固定摆位。启动时清掉上次会话
-留下的 petPos —— 打开应用就该在输入栏上。
+⚠️ 不碰上游 #pet：它照旧在右下角待着，能拖能戳。这只是新加的一只，
+各自独立。要撤掉就删 run.py 里那一行。
 
-⚠️ 打字判定用 visualViewport 的高度，不是"输入框有没有焦点"。移动端
-软键盘会挤压可视视口高度；只看焦点的话，收起键盘但光标还在时他会一直
-站着不动。桌面端没有这个收缩，退回看焦点。
-
-⚠️ 只在聊天页出现。任何浮层（.sheetWrap.open）打开就藏起来 —— 他的
-z-index 比浮层高，不藏会浮在日记、设置那些页面上面。
-
-删掉 run.py 里那一行就完全没有这个功能，上游那只螃蟹照旧能拖能戳。
+⚠️ 外链失败记在 failed{}，那个状态之后一律用兜底 —— 不然
+onerror→覆盖→再触发观察→再 onerror 会死循环。
 """
 
 from __future__ import annotations
@@ -41,14 +32,14 @@ from flask import jsonify, request, send_file
 
 SETTINGS_KEY = "pet"
 
-# 上游 pet/ 目录里那七张图对应的状态名
+# 五个状态（外链图）＋ 两个状态（兜底图）
 STATES = ("idle", "thinking", "typing", "happy", "doze", "sleeping", "react")
 
 DEFAULTS = {
     "on": True,             # 总开关
     "walk": True,           # 走不走
     "speed": 15,            # 走动速度（越小越慢）
-    "size": 96,             # 图片高度 px（走动时小一点好看）
+    "size": 96,             # 图片高度 px
     "lift": 0,              # 离输入卡顶边多高 px
     "idleChance": 0.35,     # 走一段路停下发呆的概率
     "bounce": True,         # 戳一下跳两下
@@ -86,16 +77,14 @@ def _clean(raw: dict) -> dict:
 
 CLIENT_SCRIPT = r"""
 <style id="pet-base">
-/* 走动时保持上游的 position:fixed，只是每帧由 JS 写 left/top。
-   ⚠️ right/bottom 必须 auto：上游 CSS 里那两个是写死的
-   （right:8px; bottom:calc(118px + safe-area)），不清掉的话
-   left 写了也没用，他会一直贴在右下角。 */
-#pet.petwalk{right:auto !important;bottom:auto !important;
-  transition:none;will-change:left,top}
-#pet.petwalk img{transition:transform .18s ease-out}
-/* 翻身：朝左走的时候整个镜像 */
-#pet.petwalk.pet-flip img{transform:scaleX(-1)}
-#pet.pet-away{display:none !important}
+/* 新的一只，跟上游 #pet 井水不犯河水。贴在输入卡正上方。 */
+#petBottom{position:fixed;z-index:2147482000;pointer-events:none;
+  display:none;will-change:left,top}
+#petBottom img{display:block;pointer-events:auto;cursor:pointer;
+  user-select:none;-webkit-user-drag:none;
+  transition:transform .18s ease-out}
+#petBottom.pet-flip img{transform:scaleX(-1)}
+#petBottom.pet-away{display:none !important}
 
 /* 面板：借上游 .sheetWrap/.sheet 的壳。
    ⚠️ .sheet 自己没有左右内边距（内容本该进 .sheet .body），得自己补；
@@ -171,82 +160,33 @@ CLIENT_SCRIPT = r"""
   var cfg = JSON.parse(JSON.stringify(DEF));
   var pics = {};          // state -> 版本号（有就是传过图）
 
-  /* ── 图 ────────────────────────────────────────────────────────
-     五张是你指定的外链（那只有印象、你喜欢的小宠物）。
-     两张（thinking / happy）没有对应外链，用内嵌 SVG。
-     另有一张兜底 SVG：外链万一加载失败（防盗链 / 图床挂），
-     立刻换上去 —— 他永远不会消失。 */
+  /* ── 图：五个外链（你指定）＋ 兜底 ────────────────────────────
+     thinking / happy 源码里没有对应外链，就用兜底图顶住。
+     不自己画 SVG 了。兜底图也是外链里挑一张，加载失败退回纯色。 */
   var WALK_SRC = "https://zkaicc.huilan.com/aicc/api/aicc-file/miniofile/preViewPicture/aicc/71G55kRR_1786448391994.png";
   var IDLE_SRC = "https://cac.opple.com/yc-media/getFile?id=e01f949c613e4add8621fdaba4ba3e5f#.png";
   var BURST_SRC = "https://www.lnjubao.cn/minio-jbpt/upload/20260811/edac7c48967dab963cd16afcfe731abb.png";
   var STARTUP_A = "https://cdncs.ykt.cbern.com.cn/v0.1/download?path=/zxx_feedback/qdqqd/1786448054276.png";
   var STARTUP_B = "https://cac.opple.com/yc-media/getFile?id=593531468e8f4650801b54d795a32985#.png";
 
-  /* 兜底：一只小橘螃蟹 —— 圆身体、白眼睛、小钳子。
-     不用外部文件，data URI 内嵌，永远加载得出来。 */
-  var FALLBACK = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' +
-    '<rect width="100" height="100" fill="transparent"/>' +
-    '<path d="M18 46 Q6 42 11 26 Q19 27 22 36 L18 46Z" fill="#c96442"/>' +
-    '<path d="M82 46 Q94 42 89 26 Q81 27 78 36 L82 46Z" fill="#c96442"/>' +
-    '<circle cx="50" cy="58" r="32" fill="#c96442"/>' +
-    '<circle cx="38" cy="52" r="8" fill="#fff"/>' +
-    '<circle cx="62" cy="52" r="8" fill="#fff"/>' +
-    '<circle cx="40" cy="54" r="3.5" fill="#2b2a27"/>' +
-    '<circle cx="60" cy="54" r="3.5" fill="#2b2a27"/>' +
-    '<path d="M44 72 Q50 77 56 72" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>' +
-    '</svg>';
+  /* 纯色兜底：一张 1x1 的透明 png，加载失败时用。至少元素在，不消失。 */
+  var BLANK = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
-  /* thinking：头顶三个点，眼睛往上看（在想） */
-  var SVG_THINKING = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' +
-    '<rect width="100" height="100" fill="transparent"/>' +
-    '<path d="M18 46 Q6 42 11 26 Q19 27 22 36 L18 46Z" fill="#c96442"/>' +
-    '<path d="M82 46 Q94 42 89 26 Q81 27 78 36 L82 46Z" fill="#c96442"/>' +
-    '<circle cx="34" cy="14" r="4" fill="#c96442"/>' +
-    '<circle cx="50" cy="10" r="4" fill="#c96442"/>' +
-    '<circle cx="66" cy="14" r="4" fill="#c96442"/>' +
-    '<circle cx="50" cy="58" r="32" fill="#c96442"/>' +
-    '<circle cx="38" cy="50" r="8" fill="#fff"/>' +
-    '<circle cx="62" cy="50" r="8" fill="#fff"/>' +
-    '<circle cx="40" cy="48" r="3.5" fill="#2b2a27"/>' +
-    '<circle cx="60" cy="48" r="3.5" fill="#2b2a27"/>' +
-    '<path d="M44 70 Q50 74 56 70" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>' +
-    '</svg>';
-
-  /* happy：眼睛弯成月牙 */
-  var SVG_HAPPY = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' +
-    '<rect width="100" height="100" fill="transparent"/>' +
-    '<path d="M18 46 Q6 42 11 26 Q19 27 22 36 L18 46Z" fill="#c96442"/>' +
-    '<path d="M82 46 Q94 42 89 26 Q81 27 78 36 L82 46Z" fill="#c96442"/>' +
-    '<circle cx="50" cy="58" r="32" fill="#c96442"/>' +
-    '<path d="M30 50 Q38 42 46 50" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>' +
-    '<path d="M54 50 Q62 42 70 50" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>' +
-    '<path d="M42 70 Q50 78 58 70" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/>' +
-    '</svg>';
-
-  function dataUri(svg) {
-    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
-  }
-  var FALLBACK_URI = dataUri(FALLBACK);
-
-  /* 每个状态最终的默认图：外链 or 内嵌 SVG。
-     前五个是外链（你指定），后两个是我画的。 */
   var BUILTIN = {
     idle: WALK_SRC,
     typing: IDLE_SRC,
     react: BURST_SRC,
     doze: STARTUP_A,
     sleeping: STARTUP_B,
-    thinking: dataUri(SVG_THINKING),
-    happy: dataUri(SVG_HAPPY)
+    thinking: IDLE_SRC,     // 没有专属图，用静止图顶
+    happy: WALK_SRC         // 没有专属图，用走动图顶
   };
-  /* 外链失败过一次就记住：这个状态后面都用兜底 SVG，
-     不然 onerror→覆盖→再触发观察→再 onerror 会死循环。 */
-  var failed = {};
+  var failed = {};          // 外链失败过的状态 → 之后用 BLANK
 
   function urlOf(state) {
     if (pics[state]) return 'api/pet/pic/' + state + '?v=' + pics[state];
-    if (failed[state]) return FALLBACK_URI;
-    return BUILTIN[state] || FALLBACK_URI;
+    if (failed[state]) return BLANK;
+    return BUILTIN[state] || BLANK;
   }
 
   var STATES = [
@@ -261,76 +201,59 @@ CLIENT_SCRIPT = r"""
     ['idleChance', '爱发呆', 0, 1, 0.05]
   ];
 
-  function petEl() { return document.getElementById('pet'); }
-  function petImg() { return document.getElementById('petImg'); }
-  function composer() { return document.querySelector('.composer'); }
+  /* ── 自己的小猫 DOM，不碰上游 #pet ──────────────────────────── */
+  var wrap = null, img = null;
 
-  /* ⚠️ 上一版栽在这儿：上游把拖动位置存在 localStorage.petPos，
-     只要那条记录还在，我就判定"别走了"，于是他退回右下角 ——
-     看起来像"没出现"，其实是没出现在输入栏上。
-     启动时把上次会话留下的那条清掉：打开应用就该在输入栏上。 */
-  try { localStorage.removeItem('petPos'); } catch (e) {}
+  function build() {
+    if (wrap) return;
+    wrap = document.createElement('div');
+    wrap.id = 'petBottom';
+    img = document.createElement('img');
+    img.alt = '小家伙';
+    wrap.appendChild(img);
+    document.body.appendChild(wrap);
 
-  /* 本次会话里刚拖过 —— 松手八秒内不走，之后自己走回去 */
-  var heldUntil = 0;
+    var clickCount = 0, lastClickAt = 0;
+    img.addEventListener('click', function () {
+      var now = performance.now();
+      if (now - lastClickAt > 1500) clickCount = 0;
+      lastClickAt = now;
+      clickCount++;
+      bounce();
+      if (clickCount >= 4) {
+        clickCount = 0;
+        setTemp(urlOf('react'), 2500);   // 连续点：爆发图
+      }
+    });
 
-  /* ── 接管 src ──────────────────────────────────────────────────
-     上游 petSet() 每次状态变化都会把 src 改成 pet/clawd-*.svg（404）。
-     我们从这个文件名反推出当前状态，再把 src 覆盖成真正的图。
-     MutationObserver 盯着：一被改回 404 就再盖一次。 */
-  function stateOf(src) {
-    if (src.indexOf('api/pet/pic/') >= 0) {
-      var m = src.match(/api\/pet\/pic\/(\w+)/);
-      if (m && STATES.some(function (s) { return s[0] === m[1]; })) return m[1];
-      return '';
-    }
-    if (src.indexOf('idle-follow') >= 0) return 'idle';
-    if (src.indexOf('thinking') >= 0) return 'thinking';
-    if (src.indexOf('typing') >= 0) return 'typing';
-    if (src.indexOf('happy') >= 0) return 'happy';
-    if (src.indexOf('idle-doze') >= 0 || src.indexOf('doze') >= 0) return 'doze';
-    if (src.indexOf('sleeping') >= 0) return 'sleeping';
-    if (src.indexOf('double-jump') >= 0) return 'react';
-    return '';
-  }
-
-  function overrideNow(force) {
-    var im = petImg();
-    if (!im) return;
-    var src = im.getAttribute('src') || '';
-    // 自己设过的（data URI 或我们自己的 API）不再动
-    if (src.indexOf('data:image/svg') === 0) return;
-    var st = stateOf(src);
-    if (!st) return;
-    if (!force && src.indexOf('api/pet/pic/') >= 0) return;
-    var want = urlOf(st);
-    if (want && want !== src) {
-      im._petState = st;
-      im.src = want;
-    }
-  }
-
-  function watchImg() {
-    var im = petImg();
-    if (!im || im._petWatched || !window.MutationObserver) return;
-    im._petWatched = 1;
-    // 外链失败兜底：换内嵌 SVG，并记住这个状态别再用外链
-    im.addEventListener('error', function () {
-      var st = im._petState;
-      if (!st) return;
-      if (pics[st]) return;              // 自己传的图失败了就让它失败，不兜
+    img.addEventListener('error', function () {
+      var st = img.getAttribute('data-petstate');
+      if (!st || pics[st]) return;
       if (failed[st]) return;
       failed[st] = 1;
-      im.src = FALLBACK_URI;
+      img.src = BLANK;
     }, true);
-    new MutationObserver(function () { overrideNow(false); })
-      .observe(im, { attributes: true, attributeFilter: ['src'] });
   }
 
-  /* ── 键盘起没起 ────────────────────────────────────────────────
-     ⚠️ 用可视视口高度判断，不是"输入框有没有焦点"。移动端软键盘会
-     挤压 visualViewport.height；只看焦点的话，收起键盘但光标还在时
-     他会一直站着不走。桌面端没这个收缩，退回看焦点。 */
+  var tempSrc = null, tempUntil = 0;
+  function setTemp(src, ms) {
+    tempSrc = src;
+    tempUntil = performance.now() + ms;
+  }
+
+  /* 当前该显示哪张图：打字 → 静止；临时图 → 爆发/随机；否则 → 走动 */
+  function wantSrc(typingNow) {
+    if (typingNow) return urlOf('typing');
+    if (tempSrc && performance.now() < tempUntil) return tempSrc;
+    return urlOf('idle');
+  }
+  function setImg(state, src) {
+    if (img.getAttribute('src') === src) return;
+    img.setAttribute('data-petstate', state);
+    img.src = src;
+  }
+
+  /* ── 键盘起没起：照源码，用 visualViewport 高度 ─────────────── */
   var kbUp = false;
   var vv = window.visualViewport;
   function checkKb() {
@@ -341,7 +264,6 @@ CLIENT_SCRIPT = r"""
     vv.addEventListener('scroll', checkKb);
     checkKb();
   }
-
   function typing() {
     var box = document.getElementById('box');
     var focused = !!(box && document.activeElement === box);
@@ -351,129 +273,79 @@ CLIENT_SCRIPT = r"""
   /* ── 走 ──────────────────────────────────────────────────────── */
   var x = 0, dir = 1, raf = 0;
   var restUntil = 0, nextRest = 0, lastT = 0;
-  var walking = false;
 
-  function stopWalk() {
-    var p = petEl();
-    if (!p) return;
-    p.classList.remove('petwalk', 'pet-flip');
-    walking = false;
+  function bounce() {
+    if (!img || img._hop) return;
+    img._hop = 1;
+    var t0 = performance.now(), dur = 560, peak = -cfg.size * 0.22;
+    var step = function (t) {
+      var k = Math.min(1, (t - t0) / dur);
+      var y = Math.sin(k * Math.PI * 2) * peak * (1 - k);
+      var flip = dir === -1 ? ' scaleX(-1)' : '';
+      img.style.transform = 'translateY(' + y.toFixed(1) + 'px)' + flip;
+      if (k < 1) requestAnimationFrame(step);
+      else { img.style.transform = ''; img._hop = 0; }
+    };
+    requestAnimationFrame(step);
   }
 
   function frame(now) {
     raf = requestAnimationFrame(frame);
-    var p = petEl();
-    if (!p) return;
+    build();
+    if (!wrap || !img) return;
 
-    watchImg();
-    overrideNow(false);
-
-    // ⚠️ 浮层开着就藏起来：他 z-index 比浮层高，不藏会浮在日记、设置上面
+    // 浮层开着就藏起来，别浮在日记、设置上面
     var sheetOpen = !!document.querySelector('.sheetWrap.open');
     var lock = document.getElementById('lockWrap');
-    if (sheetOpen || lock) { p.classList.add('pet-away'); return; }
-    p.classList.remove('pet-away');
+    if (sheetOpen || lock || !cfg.on) {
+      wrap.classList.add('pet-away');
+      return;
+    }
+    wrap.classList.remove('pet-away');
 
-    if (!cfg.on) { p.classList.add('pet-away'); stopWalk(); return; }
-    // 关了走路、或者刚被拖过（八秒内）：回到上游那套，别抢他的位置
-    if (!cfg.walk || now < heldUntil) { stopWalk(); return; }
+    var c = document.querySelector('.composer');
+    if (!c) { wrap.classList.add('pet-away'); return; }
 
-    var c = composer();
-    if (!c) { stopWalk(); return; }
+    wrap.style.display = 'block';
+    img.style.height = cfg.size + 'px';
 
-    var im = petImg();
-    if (im) im.style.height = cfg.size + 'px';
-    p.style.width = cfg.size + 'px';
-    p.style.height = cfg.size + 'px';
-
-    /* ⚠️ 每帧都得重设 right/bottom：CSS 里那两个是写死的，
-       restorePetPos() 和拖动也会写 left/top。不盖掉就一直贴右下角。
-       （class 上有 !important 兜底，这儿再写一遍是双保险） */
-    p.classList.add('petwalk');
-    walking = true;
-    p.style.right = 'auto';
-    p.style.bottom = 'auto';
-
-    // 直接用视口坐标：position:fixed 的参考系就是视口，
-    // 键盘弹起时输入卡自己会上移，读它的 rect 就够了。
     var cr = c.getBoundingClientRect();
     var minX = cr.left + 4;
     var maxX = cr.right - cfg.size - 4;
     if (maxX < minX) maxX = minX;
-    if (!x) x = minX + (maxX - minX) * 0.3;   // 第一帧落在偏左的位置
+    if (!x) x = minX + (maxX - minX) * 0.3;
 
-    p.style.top = (cr.top - cfg.size + cfg.lift) + 'px';
+    wrap.style.top = (cr.top - cfg.size + cfg.lift) + 'px';
 
     var dt = lastT ? Math.min(0.05, (now - lastT) / 1000) : 0.016;
     lastT = now;
 
-    if (typing()) {
-      // 你在打字，他站着看
+    var typingNow = typing();
+    if (typingNow) {
+      setImg('typing', wantSrc(true));
       restUntil = 0;
       nextRest = now + 1500;
-    } else if (now < restUntil) {
-      // 发呆中
     } else {
-      if (nextRest && now > nextRest && Math.random() < cfg.idleChance) {
-        restUntil = now + 2000 + Math.random() * 3000;   // 停 2~5 秒
-        nextRest = 0;
-      } else {
-        x += dir * cfg.speed * dt * 3.2;
-        if (x <= minX) { x = minX; dir = 1; nextRest = now + 600; }
-        if (x >= maxX) { x = maxX; dir = -1; nextRest = now + 600; }
-        if (!nextRest) nextRest = now + 2500 + Math.random() * 3000;
+      setImg('idle', wantSrc(false));
+      if (now < restUntil) {
+        // 发呆中
+      } else if (cfg.walk) {
+        if (nextRest && now > nextRest && Math.random() < cfg.idleChance) {
+          restUntil = now + 2000 + Math.random() * 3000;
+          nextRest = 0;
+        } else {
+          x += dir * cfg.speed * dt * 3.2;
+          if (x <= minX) { x = minX; dir = 1; nextRest = now + 600; }
+          if (x >= maxX) { x = maxX; dir = -1; nextRest = now + 600; }
+          if (!nextRest) nextRest = now + 2500 + Math.random() * 3000;
+        }
       }
     }
 
     if (x < minX) x = minX;
     if (x > maxX) x = maxX;
-    p.style.left = x + 'px';
-    p.classList.toggle('pet-flip', dir === -1);
-  }
-
-  /* 拖动：走路开着的时候，拖一下只是临时挪开，松手八秒后他自己走回去。
-     ⚠️ 上游 pointerup 里会往 localStorage 写 petPos —— 那条会让下次
-     打开又钉在原地，所以走路开着时把它清掉。 */
-  function bindDrag() {
-    var p = petEl();
-    if (!p || p._petDrag) return;
-    p._petDrag = 1;
-    var mark = function () {
-      if (!cfg.walk) return;             // 关了走路才当成固定摆位
-      heldUntil = performance.now() + 8000;
-      try { localStorage.removeItem('petPos'); } catch (e) {}
-    };
-    p.addEventListener('pointerdown', mark);
-    p.addEventListener('pointerup', function () {
-      mark();
-      // 上游是在 pointerup 里写的，等它写完再清
-      setTimeout(function () {
-        if (cfg.walk) { try { localStorage.removeItem('petPos'); } catch (e) {} }
-      }, 30);
-    });
-  }
-
-  /* 戳一下跳两下。上游只换图，没有跳。 */
-  function bindBounce() {
-    var p = petEl();
-    if (!p || p._petBounce) return;
-    p._petBounce = 1;
-    p.addEventListener('click', function () {
-      if (!cfg.bounce) return;
-      var im = petImg();
-      if (!im || im._hop) return;
-      im._hop = 1;
-      var t0 = performance.now(), dur = 560, peak = -cfg.size * 0.22;
-      var step = function (t) {
-        var k = Math.min(1, (t - t0) / dur);
-        var y = Math.sin(k * Math.PI * 2) * peak * (1 - k);
-        var flip = (walking && dir === -1) ? ' scaleX(-1)' : '';
-        im.style.transform = 'translateY(' + y.toFixed(1) + 'px)' + flip;
-        if (k < 1) requestAnimationFrame(step);
-        else { im.style.transform = ''; im._hop = 0; }
-      };
-      requestAnimationFrame(step);
-    });
+    wrap.style.left = x + 'px';
+    wrap.classList.toggle('pet-flip', dir === -1);
   }
 
   /* ── 面板 ───────────────────────────────────────────────────── */
@@ -520,9 +392,8 @@ CLIENT_SCRIPT = r"""
       '<div class="sheet" role="dialog" aria-label="小家伙">' +
         '<div class="grabber"></div>' +
         '<div class="pt-h">小家伙</div>' +
-        '<p class="pt-sub">他会沿着输入栏来回走，撞到边就翻个身；' +
-          '你打字的时候他站着等。戳一下会跳。' +
-          '拖走了也没关系，松手几秒他自己走回来。</p>' +
+        '<p class="pt-sub">聊天输入栏上方一只左右走的小宠物，撞到边翻身，' +
+          '你打字他停下，戳一下跳两下。</p>' +
 
         '<div class="pt-line"><label>让他在</label>' +
           '<button type="button" class="pt-sw" data-sw="on" role="switch"></button></div>' +
@@ -535,16 +406,9 @@ CLIENT_SCRIPT = r"""
 
         '<div class="pt-grp">换他的样子</div>' +
         '<div class="pt-pics">' + grid + '</div>' +
-        '<p class="pt-note">默认：闲着/在写/被戳/打盹/睡着 用五张外链图，' +
-          '在想/高兴 用内嵌的。外链加载不出来会自动换兜底图，不会消失。' +
-          '传了哪个换哪个，png / gif / svg 都行，4MB 以内。</p>' +
-
-        '<div class="pt-sep"></div>' +
-        '<div class="pt-btns">' +
-          '<button type="button" data-pt-free="1">让他回输入栏上</button>' +
-        '</div>' +
-        '<p class="pt-note">关掉「会走路」他就待在你拖的那个地方不动了。' +
-          '想让他回去按上面这颗。</p>' +
+        '<p class="pt-note">默认用五张外链图（走动/静止/爆发/随机A/随机B），' +
+          '在想/高兴 没有专属图，先用别的顶。传了哪个换哪个，' +
+          'png / gif / svg 都行，4MB 以内。</p>' +
 
         '<div class="pt-btns">' +
           '<button type="button" data-pt-reset="1">还原默认</button>' +
@@ -556,23 +420,10 @@ CLIENT_SCRIPT = r"""
     sheet.addEventListener('click', function (e) {
       var t = e.target;
       if (t.closest && t.closest('[data-pt-close]')) { closeSheet(); return; }
-      if (t.closest && t.closest('[data-pt-free]')) {
-        try { localStorage.removeItem('petPos'); } catch (e2) {}
-        heldUntil = 0;
-        cfg.walk = true;
-        var p = petEl();
-        if (p) { p.style.right = 'auto'; p.style.bottom = 'auto'; }
-        fillSheet(); save();
-        try { note('（他回输入栏上去了）'); } catch (e3) {}
-        return;
-      }
       if (t.closest && t.closest('[data-pt-reset]')) {
         cfg = JSON.parse(JSON.stringify(DEF));
-        heldUntil = 0;
         failed = {};
-        try { localStorage.removeItem('petPos'); } catch (e4) {}
         fillSheet(); save();
-        overrideNow(true);
         return;
       }
       var sw = t.closest && t.closest('[data-sw]');
@@ -580,8 +431,6 @@ CLIENT_SCRIPT = r"""
         var k = sw.getAttribute('data-sw');
         cfg[k] = !cfg[k];
         fillSheet(); save();
-        if (k === 'walk' && !cfg[k]) stopWalk();
-        if (k === 'walk' && cfg[k]) heldUntil = 0;
       }
     });
 
@@ -608,9 +457,6 @@ CLIENT_SCRIPT = r"""
           pics[st] = d.v;
           failed[st] = 0;
           fillSheet();
-          // 换的正好是当前这张，立刻生效
-          var im = petImg();
-          if (im) overrideNow(true);
           try { note('（换好了）'); } catch (e2) {}
         })
         .catch(function () {
@@ -640,13 +486,8 @@ CLIENT_SCRIPT = r"""
     for (var n = 0; n < th.length; n++) {
       var st = th[n].getAttribute('data-thumb');
       var box = th[n].parentNode;
-      if (pics[st] !== undefined && pics[st]) {
-        th[n].style.backgroundImage = 'url("' + urlOf(st) + '")';
-        if (box) box.classList.add('has');
-      } else {
-        th[n].style.backgroundImage = 'url("' + urlOf(st) + '")';
-        if (box) box.classList.remove('has');
-      }
+      th[n].style.backgroundImage = 'url("' + urlOf(st) + '")';
+      if (box) box.classList.toggle('has', !!pics[st]);
     }
   }
 
@@ -694,32 +535,19 @@ CLIENT_SCRIPT = r"""
           pics = d.pics || {};
         }
         fillSheet();
-        overrideNow(true);
       })
       .catch(function () {});
 
     mountNav();
-    bindBounce();
-    bindDrag();
     raf = requestAnimationFrame(frame);
-    // 侧边栏和输入卡都是上游后来才画的
-    setInterval(function () {
-      mountNav(); bindBounce(); bindDrag(); watchImg(); overrideNow(false);
-    }, 1200);
+    setInterval(function () { mountNav(); }, 1200);
   }
 
   window.dwellPet = {
     open: openSheet,
     close: closeSheet,
     get: function () { return cfg; },
-    pics: function () { return pics; },
-    // 卡在哪儿了就跑这个
-    home: function () {
-      try { localStorage.removeItem('petPos'); } catch (e) {}
-      heldUntil = 0;
-      cfg.walk = true;
-      save();
-    }
+    pics: function () { return pics; }
   };
 
   if (document.readyState === 'loading') {
