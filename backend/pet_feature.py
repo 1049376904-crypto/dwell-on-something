@@ -4,27 +4,29 @@
 （idle / thinking / typing / happy / doze / sleeping / react）。它缺的只有
 一件事 —— 走动。这一层补上走动，再把「换图」做成能自己上传。
 
-不改 web/index.html。在 index 视图外面再包一层注脚本。
+⚠️ 关键事实：`web/pet/` 目录在服务器上**不存在**，所以上游那七张
+`pet/clawd-*.svg` 全是 404 —— 他一直是只看不见的空框。这就是之前
+"开了开关却没出现"的真正原因，跟定位、跟换图逻辑都没关系。
 
-⚠️ 上游有三处会自己写 `#pet` 的位置，走动时必须每帧盖掉：
-1. `restorePetPos()` —— DOMContentLoaded 时从 `localStorage.petPos` 读回
-   `left/top`，并把 `right/bottom` 设成 `auto`；
-2. 拖动的 `pointermove` —— 每帧写 `left/top`；
-3. `#pet` 的 CSS 里 `right:8px; bottom:calc(118px + ...)` 是写死的。
-所以走动时每帧都要重设 `right/bottom = auto` 再写 `left/top`。
+所以这一版不再依赖上游那套图文件，直接由本层接管 `img.src`：
+- 五个状态用用户指定的外链图（那五张他有印象、喜欢）
+- 两个状态（thinking / happy）用内嵌 SVG，不依赖任何文件
+- 外链万一加载失败（防盗链 / 图床挂了），兜底换内嵌 SVG，绝不让他消失
 
-⚠️ 旧的 `localStorage.petPos` 会让他"看起来没出现"—— 其实是被钉在了
-右下角。启动时如果那条记录不是本次会话拖出来的，直接清掉。
+状态识别仍然从上游写入的 src 文件名反推（虽然文件 404，但 src 属性
+里还是写着 `clawd-idle-follow.svg` 这种名字），识别出来再覆盖成正确的
+URL。MutationObserver 盯着 src，一被改回来就再盖一次。
 
-⚠️ 打字判定用 `visualViewport` 的高度，不是"输入框有没有焦点"。移动端
+⚠️ 拖动：把位置存在 localStorage.petPos。走路开着时拖一下只是临时挪开，
+松手八秒后他自己走回去；关掉走路才当成固定摆位。启动时清掉上次会话
+留下的 petPos —— 打开应用就该在输入栏上。
+
+⚠️ 打字判定用 visualViewport 的高度，不是"输入框有没有焦点"。移动端
 软键盘会挤压可视视口高度；只看焦点的话，收起键盘但光标还在时他会一直
 站着不动。桌面端没有这个收缩，退回看焦点。
 
-⚠️ 只在聊天页出现。任何浮层（`.sheetWrap.open`）打开就藏起来 —— 他的
+⚠️ 只在聊天页出现。任何浮层（.sheetWrap.open）打开就藏起来 —— 他的
 z-index 比浮层高，不藏会浮在日记、设置那些页面上面。
-
-⚠️ 换图不能只改 `src`：上游 `petSet()` 每次状态变化都会重写 `petImg.src`。
-所以这里用 MutationObserver 盯着 src，它一被改写就立刻覆盖回来。
 
 删掉 run.py 里那一行就完全没有这个功能，上游那只螃蟹照旧能拖能戳。
 """
@@ -46,7 +48,7 @@ DEFAULTS = {
     "on": True,             # 总开关
     "walk": True,           # 走不走
     "speed": 15,            # 走动速度（越小越慢）
-    "size": 96,             # 图片高度 px（上游原本 128，走动时小一点好看）
+    "size": 96,             # 图片高度 px（走动时小一点好看）
     "lift": 0,              # 离输入卡顶边多高 px
     "idleChance": 0.35,     # 走一段路停下发呆的概率
     "bounce": True,         # 戳一下跳两下
@@ -169,6 +171,84 @@ CLIENT_SCRIPT = r"""
   var cfg = JSON.parse(JSON.stringify(DEF));
   var pics = {};          // state -> 版本号（有就是传过图）
 
+  /* ── 图 ────────────────────────────────────────────────────────
+     五张是你指定的外链（那只有印象、你喜欢的小宠物）。
+     两张（thinking / happy）没有对应外链，用内嵌 SVG。
+     另有一张兜底 SVG：外链万一加载失败（防盗链 / 图床挂），
+     立刻换上去 —— 他永远不会消失。 */
+  var WALK_SRC = "https://zkaicc.huilan.com/aicc/api/aicc-file/miniofile/preViewPicture/aicc/71G55kRR_1786448391994.png";
+  var IDLE_SRC = "https://cac.opple.com/yc-media/getFile?id=e01f949c613e4add8621fdaba4ba3e5f#.png";
+  var BURST_SRC = "https://www.lnjubao.cn/minio-jbpt/upload/20260811/edac7c48967dab963cd16afcfe731abb.png";
+  var STARTUP_A = "https://cdncs.ykt.cbern.com.cn/v0.1/download?path=/zxx_feedback/qdqqd/1786448054276.png";
+  var STARTUP_B = "https://cac.opple.com/yc-media/getFile?id=593531468e8f4650801b54d795a32985#.png";
+
+  /* 兜底：一只小橘螃蟹 —— 圆身体、白眼睛、小钳子。
+     不用外部文件，data URI 内嵌，永远加载得出来。 */
+  var FALLBACK = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' +
+    '<rect width="100" height="100" fill="transparent"/>' +
+    '<path d="M18 46 Q6 42 11 26 Q19 27 22 36 L18 46Z" fill="#c96442"/>' +
+    '<path d="M82 46 Q94 42 89 26 Q81 27 78 36 L82 46Z" fill="#c96442"/>' +
+    '<circle cx="50" cy="58" r="32" fill="#c96442"/>' +
+    '<circle cx="38" cy="52" r="8" fill="#fff"/>' +
+    '<circle cx="62" cy="52" r="8" fill="#fff"/>' +
+    '<circle cx="40" cy="54" r="3.5" fill="#2b2a27"/>' +
+    '<circle cx="60" cy="54" r="3.5" fill="#2b2a27"/>' +
+    '<path d="M44 72 Q50 77 56 72" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>' +
+    '</svg>';
+
+  /* thinking：头顶三个点，眼睛往上看（在想） */
+  var SVG_THINKING = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' +
+    '<rect width="100" height="100" fill="transparent"/>' +
+    '<path d="M18 46 Q6 42 11 26 Q19 27 22 36 L18 46Z" fill="#c96442"/>' +
+    '<path d="M82 46 Q94 42 89 26 Q81 27 78 36 L82 46Z" fill="#c96442"/>' +
+    '<circle cx="34" cy="14" r="4" fill="#c96442"/>' +
+    '<circle cx="50" cy="10" r="4" fill="#c96442"/>' +
+    '<circle cx="66" cy="14" r="4" fill="#c96442"/>' +
+    '<circle cx="50" cy="58" r="32" fill="#c96442"/>' +
+    '<circle cx="38" cy="50" r="8" fill="#fff"/>' +
+    '<circle cx="62" cy="50" r="8" fill="#fff"/>' +
+    '<circle cx="40" cy="48" r="3.5" fill="#2b2a27"/>' +
+    '<circle cx="60" cy="48" r="3.5" fill="#2b2a27"/>' +
+    '<path d="M44 70 Q50 74 56 70" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round"/>' +
+    '</svg>';
+
+  /* happy：眼睛弯成月牙 */
+  var SVG_HAPPY = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">' +
+    '<rect width="100" height="100" fill="transparent"/>' +
+    '<path d="M18 46 Q6 42 11 26 Q19 27 22 36 L18 46Z" fill="#c96442"/>' +
+    '<path d="M82 46 Q94 42 89 26 Q81 27 78 36 L82 46Z" fill="#c96442"/>' +
+    '<circle cx="50" cy="58" r="32" fill="#c96442"/>' +
+    '<path d="M30 50 Q38 42 46 50" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>' +
+    '<path d="M54 50 Q62 42 70 50" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>' +
+    '<path d="M42 70 Q50 78 58 70" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/>' +
+    '</svg>';
+
+  function dataUri(svg) {
+    return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+  }
+  var FALLBACK_URI = dataUri(FALLBACK);
+
+  /* 每个状态最终的默认图：外链 or 内嵌 SVG。
+     前五个是外链（你指定），后两个是我画的。 */
+  var BUILTIN = {
+    idle: WALK_SRC,
+    typing: IDLE_SRC,
+    react: BURST_SRC,
+    doze: STARTUP_A,
+    sleeping: STARTUP_B,
+    thinking: dataUri(SVG_THINKING),
+    happy: dataUri(SVG_HAPPY)
+  };
+  /* 外链失败过一次就记住：这个状态后面都用兜底 SVG，
+     不然 onerror→覆盖→再触发观察→再 onerror 会死循环。 */
+  var failed = {};
+
+  function urlOf(state) {
+    if (pics[state]) return 'api/pet/pic/' + state + '?v=' + pics[state];
+    if (failed[state]) return FALLBACK_URI;
+    return BUILTIN[state] || FALLBACK_URI;
+  }
+
   var STATES = [
     ['idle', '闲着'], ['thinking', '在想'], ['typing', '在写'],
     ['happy', '高兴'], ['doze', '打盹'], ['sleeping', '睡着'],
@@ -194,37 +274,56 @@ CLIENT_SCRIPT = r"""
   /* 本次会话里刚拖过 —— 松手八秒内不走，之后自己走回去 */
   var heldUntil = 0;
 
-  /* ── 换图 ──────────────────────────────────────────────────────
-     ⚠️ 不能只改 src：上游 petSet() 每次状态变化都会重写它。
-     用 MutationObserver 盯着，一被改写就覆盖回来。 */
-  function urlOf(state) {
-    return pics[state] ? ('api/pet/pic/' + state + '?v=' + pics[state]) : '';
+  /* ── 接管 src ──────────────────────────────────────────────────
+     上游 petSet() 每次状态变化都会把 src 改成 pet/clawd-*.svg（404）。
+     我们从这个文件名反推出当前状态，再把 src 覆盖成真正的图。
+     MutationObserver 盯着：一被改回 404 就再盖一次。 */
+  function stateOf(src) {
+    if (src.indexOf('api/pet/pic/') >= 0) {
+      var m = src.match(/api\/pet\/pic\/(\w+)/);
+      if (m && STATES.some(function (s) { return s[0] === m[1]; })) return m[1];
+      return '';
+    }
+    if (src.indexOf('idle-follow') >= 0) return 'idle';
+    if (src.indexOf('thinking') >= 0) return 'thinking';
+    if (src.indexOf('typing') >= 0) return 'typing';
+    if (src.indexOf('happy') >= 0) return 'happy';
+    if (src.indexOf('idle-doze') >= 0 || src.indexOf('doze') >= 0) return 'doze';
+    if (src.indexOf('sleeping') >= 0) return 'sleeping';
+    if (src.indexOf('double-jump') >= 0) return 'react';
+    return '';
   }
 
-  function overrideNow() {
+  function overrideNow(force) {
     var im = petImg();
     if (!im) return;
-    // 上游把文件名写进 src，从里头认出当前是哪个状态
     var src = im.getAttribute('src') || '';
-    if (src.indexOf('api/pet/pic/') >= 0) return;   // 已经是我们的图了
-    var hit = '';
-    if (src.indexOf('idle-follow') >= 0) hit = 'idle';
-    else if (src.indexOf('thinking') >= 0) hit = 'thinking';
-    else if (src.indexOf('typing') >= 0) hit = 'typing';
-    else if (src.indexOf('happy') >= 0) hit = 'happy';
-    else if (src.indexOf('idle-doze') >= 0) hit = 'doze';
-    else if (src.indexOf('sleeping') >= 0) hit = 'sleeping';
-    else if (src.indexOf('double-jump') >= 0) hit = 'react';
-    if (!hit) return;
-    var want = urlOf(hit);
-    if (want) im.src = want;
+    // 自己设过的（data URI 或我们自己的 API）不再动
+    if (src.indexOf('data:image/svg') === 0) return;
+    var st = stateOf(src);
+    if (!st) return;
+    if (!force && src.indexOf('api/pet/pic/') >= 0) return;
+    var want = urlOf(st);
+    if (want && want !== src) {
+      im._petState = st;
+      im.src = want;
+    }
   }
 
   function watchImg() {
     var im = petImg();
     if (!im || im._petWatched || !window.MutationObserver) return;
     im._petWatched = 1;
-    new MutationObserver(function () { overrideNow(); })
+    // 外链失败兜底：换内嵌 SVG，并记住这个状态别再用外链
+    im.addEventListener('error', function () {
+      var st = im._petState;
+      if (!st) return;
+      if (pics[st]) return;              // 自己传的图失败了就让它失败，不兜
+      if (failed[st]) return;
+      failed[st] = 1;
+      im.src = FALLBACK_URI;
+    }, true);
+    new MutationObserver(function () { overrideNow(false); })
       .observe(im, { attributes: true, attributeFilter: ['src'] });
   }
 
@@ -267,6 +366,7 @@ CLIENT_SCRIPT = r"""
     if (!p) return;
 
     watchImg();
+    overrideNow(false);
 
     // ⚠️ 浮层开着就藏起来：他 z-index 比浮层高，不藏会浮在日记、设置上面
     var sheetOpen = !!document.querySelector('.sheetWrap.open');
@@ -435,9 +535,9 @@ CLIENT_SCRIPT = r"""
 
         '<div class="pt-grp">换他的样子</div>' +
         '<div class="pt-pics">' + grid + '</div>' +
-        '<p class="pt-note">不传就用原来那七张 —— 现在用的就是原来的。' +
-          '传了哪个换哪个，点同一格再选一次就是替换。' +
-          'png / gif / svg 都行，4MB 以内。</p>' +
+        '<p class="pt-note">默认：闲着/在写/被戳/打盹/睡着 用五张外链图，' +
+          '在想/高兴 用内嵌的。外链加载不出来会自动换兜底图，不会消失。' +
+          '传了哪个换哪个，png / gif / svg 都行，4MB 以内。</p>' +
 
         '<div class="pt-sep"></div>' +
         '<div class="pt-btns">' +
@@ -469,8 +569,10 @@ CLIENT_SCRIPT = r"""
       if (t.closest && t.closest('[data-pt-reset]')) {
         cfg = JSON.parse(JSON.stringify(DEF));
         heldUntil = 0;
+        failed = {};
         try { localStorage.removeItem('petPos'); } catch (e4) {}
         fillSheet(); save();
+        overrideNow(true);
         return;
       }
       var sw = t.closest && t.closest('[data-sw]');
@@ -504,10 +606,11 @@ CLIENT_SCRIPT = r"""
         .then(function (d) {
           if (!d || !d.ok) throw new Error((d && d.error) || 'bad');
           pics[st] = d.v;
+          failed[st] = 0;
           fillSheet();
           // 换的正好是当前这张，立刻生效
           var im = petImg();
-          if (im) { im.setAttribute('src', im.getAttribute('src') || ''); overrideNow(); }
+          if (im) overrideNow(true);
           try { note('（换好了）'); } catch (e2) {}
         })
         .catch(function () {
@@ -537,11 +640,11 @@ CLIENT_SCRIPT = r"""
     for (var n = 0; n < th.length; n++) {
       var st = th[n].getAttribute('data-thumb');
       var box = th[n].parentNode;
-      if (pics[st]) {
+      if (pics[st] !== undefined && pics[st]) {
         th[n].style.backgroundImage = 'url("' + urlOf(st) + '")';
         if (box) box.classList.add('has');
       } else {
-        th[n].style.backgroundImage = '';
+        th[n].style.backgroundImage = 'url("' + urlOf(st) + '")';
         if (box) box.classList.remove('has');
       }
     }
@@ -591,7 +694,7 @@ CLIENT_SCRIPT = r"""
           pics = d.pics || {};
         }
         fillSheet();
-        overrideNow();
+        overrideNow(true);
       })
       .catch(function () {});
 
@@ -601,7 +704,7 @@ CLIENT_SCRIPT = r"""
     raf = requestAnimationFrame(frame);
     // 侧边栏和输入卡都是上游后来才画的
     setInterval(function () {
-      mountNav(); bindBounce(); bindDrag(); watchImg();
+      mountNav(); bindBounce(); bindDrag(); watchImg(); overrideNow(false);
     }, 1200);
   }
 
