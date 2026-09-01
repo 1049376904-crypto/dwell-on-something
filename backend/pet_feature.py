@@ -1,25 +1,10 @@
-"""dwell 小家伙：照源码那套逻辑，在聊天输入栏上方放一只会走路的小宠物。
+"""dwell 小家伙：照源码逻辑，五个状态，不自创。
 
-之前几版一直在改上游那只 `#pet`（能拖能戳、靠 petSet 换图），方向错了。
-你给的源码是另一套东西：它自己建 DOM、自己走、自己换图，完全不依赖上游。
+源码只有五个状态：走动(WALK)、静止(IDLE)、爆发(BURST)、随机A(STARTUP_A)、
+随机B(STARTUP_B)。这一版就五个，不多不少。
 
-这一版照它的思路重写，只把选择器换成你页面里真实存在的：
-
-- 它找 `.chat-input-bar`，你的页面没有这个 class —— 输入区是 `.composer`，
-  所以锚点用 `.composer`（聊天页才有；别的页面没有，小猫自然不出现）。
-- 它靠 `visualViewport` 高度判断键盘起没起，这个保留。
-- 它到边翻身（scaleX(-1)）、打字时停下、戳一下跳、连续点爆发图，都保留。
-
-图：五个状态用你指定的外链（WALK/IDLE/BURST/STARTUP_A/STARTUP_B）。
-thinking / happy 这两个状态源码里没有对应外链，就用一张兜底图顶住 ——
-不自己画 SVG 了（你嫌丑）。兜底图也是外链里挑一张，加载失败再退回
-一个纯色的 data URI，保证他永远不消失。
-
-⚠️ 不碰上游 #pet：它照旧在右下角待着，能拖能戳。这只是新加的一只，
-各自独立。要撤掉就删 run.py 里那一行。
-
-⚠️ 外链失败记在 failed{}，那个状态之后一律用兜底 —— 不然
-onerror→覆盖→再触发观察→再 onerror 会死循环。
+不碰上游 #pet。独立建一只，自己走、自己换图。
+锚点用 .composer（聊天页才有，别的页面没有）。
 """
 
 from __future__ import annotations
@@ -32,17 +17,17 @@ from flask import jsonify, request, send_file
 
 SETTINGS_KEY = "pet"
 
-# 五个状态（外链图）＋ 两个状态（兜底图）
-STATES = ("idle", "thinking", "typing", "happy", "doze", "sleeping", "react")
+# 源码只有五个状态
+STATES = ("walk", "idle", "burst", "startupA", "startupB")
 
 DEFAULTS = {
-    "on": True,             # 总开关
-    "walk": True,           # 走不走
-    "speed": 15,            # 走动速度（越小越慢）
-    "size": 96,             # 图片高度 px
-    "lift": 0,              # 离输入卡顶边多高 px
-    "idleChance": 0.35,     # 走一段路停下发呆的概率
-    "bounce": True,         # 戳一下跳两下
+    "on": True,
+    "walk": True,
+    "speed": 15,
+    "size": 96,
+    "lift": 0,
+    "idleChance": 0.35,
+    "bounce": True,
 }
 
 NUM_RANGE = {
@@ -59,7 +44,6 @@ PIC_MAX = 4 * 1024 * 1024
 
 
 def _clean(raw: dict) -> dict:
-    """钳到合法范围。坏值一律回落默认，不报错。"""
     out = dict(DEFAULTS)
     if not isinstance(raw, dict):
         return out
@@ -77,7 +61,6 @@ def _clean(raw: dict) -> dict:
 
 CLIENT_SCRIPT = r"""
 <style id="pet-base">
-/* 新的一只，跟上游 #pet 井水不犯河水。贴在输入卡正上方。 */
 #petBottom{position:fixed;z-index:2147482000;pointer-events:none;
   display:none;will-change:left,top}
 #petBottom img{display:block;pointer-events:auto;cursor:pointer;
@@ -86,10 +69,6 @@ CLIENT_SCRIPT = r"""
 #petBottom.pet-flip img{transform:scaleX(-1)}
 #petBottom.pet-away{display:none !important}
 
-/* 面板：借上游 .sheetWrap/.sheet 的壳。
-   ⚠️ .sheet 自己没有左右内边距（内容本该进 .sheet .body），得自己补；
-   ⚠️ .sheet::after 是贴在底下的 80px 挡板，这里 .sheet 变成滚动容器了，
-      那个绝对定位的伪元素会跟着内容滚到中间去，拿背景色盖掉一条。 */
 #petSheet .sheet{box-sizing:border-box;width:100%;max-width:100vw;
   overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;
   padding:0 20px calc(env(safe-area-inset-bottom,0px) + 18px)}
@@ -126,7 +105,6 @@ CLIENT_SCRIPT = r"""
   transition:transform .2s ease;box-shadow:0 1px 3px rgba(0,0,0,.18)}
 #petSheet .pt-sw.on{background:var(--accent,#c96442)}
 #petSheet .pt-sw.on::after{transform:translateX(18px)}
-/* 七个状态的换图格子 */
 #petSheet .pt-pics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
   gap:9px;margin-top:4px}
 #petSheet .pt-pic{display:flex;align-items:center;gap:9px;padding:9px;
@@ -158,41 +136,26 @@ CLIENT_SCRIPT = r"""
     idleChance: 0.35, bounce: true
   };
   var cfg = JSON.parse(JSON.stringify(DEF));
-  var pics = {};          // state -> 版本号（有就是传过图）
+  var pics = {};
 
-  /* ── 图：五个外链（你指定）＋ 兜底 ────────────────────────────
-     thinking / happy 源码里没有对应外链，就用兜底图顶住。
-     不自己画 SVG 了。兜底图也是外链里挑一张，加载失败退回纯色。 */
+  /* 五张图，跟源码一模一样 */
   var WALK_SRC = "https://zkaicc.huilan.com/aicc/api/aicc-file/miniofile/preViewPicture/aicc/71G55kRR_1786448391994.png";
   var IDLE_SRC = "https://cac.opple.com/yc-media/getFile?id=e01f949c613e4add8621fdaba4ba3e5f#.png";
   var BURST_SRC = "https://www.lnjubao.cn/minio-jbpt/upload/20260811/edac7c48967dab963cd16afcfe731abb.png";
   var STARTUP_A = "https://cdncs.ykt.cbern.com.cn/v0.1/download?path=/zxx_feedback/qdqqd/1786448054276.png";
   var STARTUP_B = "https://cac.opple.com/yc-media/getFile?id=593531468e8f4650801b54d795a32985#.png";
 
-  /* 纯色兜底：一张 1x1 的透明 png，加载失败时用。至少元素在，不消失。 */
-  var BLANK = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
-
   var BUILTIN = {
-    idle: WALK_SRC,
-    typing: IDLE_SRC,
-    react: BURST_SRC,
-    doze: STARTUP_A,
-    sleeping: STARTUP_B,
-    thinking: IDLE_SRC,     // 没有专属图，用静止图顶
-    happy: WALK_SRC         // 没有专属图，用走动图顶
+    walk: WALK_SRC,
+    idle: IDLE_SRC,
+    burst: BURST_SRC,
+    startupA: STARTUP_A,
+    startupB: STARTUP_B
   };
-  var failed = {};          // 外链失败过的状态 → 之后用 BLANK
-
-  function urlOf(state) {
-    if (pics[state]) return 'api/pet/pic/' + state + '?v=' + pics[state];
-    if (failed[state]) return BLANK;
-    return BUILTIN[state] || BLANK;
-  }
 
   var STATES = [
-    ['idle', '闲着'], ['thinking', '在想'], ['typing', '在写'],
-    ['happy', '高兴'], ['doze', '打盹'], ['sleeping', '睡着'],
-    ['react', '被戳']
+    ['walk', '走动'], ['idle', '静止'], ['burst', '爆发'],
+    ['startupA', '随机A'], ['startupB', '随机B']
   ];
   var META = [
     ['speed', '走多快', 2, 120, 1],
@@ -201,7 +164,13 @@ CLIENT_SCRIPT = r"""
     ['idleChance', '爱发呆', 0, 1, 0.05]
   ];
 
-  /* ── 自己的小猫 DOM，不碰上游 #pet ──────────────────────────── */
+  function urlOf(state) {
+    return pics[state]
+      ? 'api/pet/pic/' + state + '?v=' + pics[state]
+      : (BUILTIN[state] || '');
+  }
+
+  /* ── DOM ── */
   var wrap = null, img = null;
 
   function build() {
@@ -210,6 +179,7 @@ CLIENT_SCRIPT = r"""
     wrap.id = 'petBottom';
     img = document.createElement('img');
     img.alt = '小家伙';
+    img.src = urlOf('walk');
     wrap.appendChild(img);
     document.body.appendChild(wrap);
 
@@ -222,17 +192,9 @@ CLIENT_SCRIPT = r"""
       bounce();
       if (clickCount >= 4) {
         clickCount = 0;
-        setTemp(urlOf('react'), 2500);   // 连续点：爆发图
+        setTemp(urlOf('burst'), 2500);
       }
     });
-
-    img.addEventListener('error', function () {
-      var st = img.getAttribute('data-petstate');
-      if (!st || pics[st]) return;
-      if (failed[st]) return;
-      failed[st] = 1;
-      img.src = BLANK;
-    }, true);
   }
 
   var tempSrc = null, tempUntil = 0;
@@ -241,24 +203,10 @@ CLIENT_SCRIPT = r"""
     tempUntil = performance.now() + ms;
   }
 
-  /* 当前该显示哪张图：打字 → 静止；临时图 → 爆发/随机；否则 → 走动 */
-  function wantSrc(typingNow) {
-    if (typingNow) return urlOf('typing');
-    if (tempSrc && performance.now() < tempUntil) return tempSrc;
-    return urlOf('idle');
-  }
-  function setImg(state, src) {
-    if (img.getAttribute('src') === src) return;
-    img.setAttribute('data-petstate', state);
-    img.src = src;
-  }
-
-  /* ── 键盘起没起：照源码，用 visualViewport 高度 ─────────────── */
+  /* ── 键盘 ── */
   var kbUp = false;
   var vv = window.visualViewport;
-  function checkKb() {
-    if (vv) kbUp = vv.height < window.innerHeight * 0.8;
-  }
+  function checkKb() { if (vv) kbUp = vv.height < window.innerHeight * 0.8; }
   if (vv) {
     vv.addEventListener('resize', checkKb);
     vv.addEventListener('scroll', checkKb);
@@ -270,31 +218,32 @@ CLIENT_SCRIPT = r"""
     return vv ? (focused && kbUp) : focused;
   }
 
-  /* ── 走 ──────────────────────────────────────────────────────── */
+  /* ── 走 ── */
   var x = 0, dir = 1, raf = 0;
   var restUntil = 0, nextRest = 0, lastT = 0;
 
   function bounce() {
     if (!img || img._hop) return;
     img._hop = 1;
-    var t0 = performance.now(), dur = 560, peak = -cfg.size * 0.22;
+    var t0 = performance.now(), dur = 520, peak = -cfg.size * 0.5;
     var step = function (t) {
-      var k = Math.min(1, (t - t0) / dur);
-      var y = Math.sin(k * Math.PI * 2) * peak * (1 - k);
+      var p = Math.min(1, (t - t0) / dur);
+      var y = Math.sin(p * Math.PI * 2) * peak * (1 - p);
       var flip = dir === -1 ? ' scaleX(-1)' : '';
       img.style.transform = 'translateY(' + y.toFixed(1) + 'px)' + flip;
-      if (k < 1) requestAnimationFrame(step);
+      if (p < 1) requestAnimationFrame(step);
       else { img.style.transform = ''; img._hop = 0; }
     };
     requestAnimationFrame(step);
   }
+
+  var nextRandomAt = 0;
 
   function frame(now) {
     raf = requestAnimationFrame(frame);
     build();
     if (!wrap || !img) return;
 
-    // 浮层开着就藏起来，别浮在日记、设置上面
     var sheetOpen = !!document.querySelector('.sheetWrap.open');
     var lock = document.getElementById('lockWrap');
     if (sheetOpen || lock || !cfg.on) {
@@ -310,8 +259,8 @@ CLIENT_SCRIPT = r"""
     img.style.height = cfg.size + 'px';
 
     var cr = c.getBoundingClientRect();
-    var minX = cr.left + 4;
-    var maxX = cr.right - cfg.size - 4;
+    var minX = cr.left + 6;
+    var maxX = cr.right - cfg.size - 6;
     if (maxX < minX) maxX = minX;
     if (!x) x = minX + (maxX - minX) * 0.3;
 
@@ -321,15 +270,39 @@ CLIENT_SCRIPT = r"""
     lastT = now;
 
     var typingNow = typing();
+    var want;
+
     if (typingNow) {
-      setImg('typing', wantSrc(true));
+      want = urlOf('idle');
       restUntil = 0;
       nextRest = now + 1500;
+    } else if (tempSrc && now < tempUntil) {
+      want = tempSrc;
     } else {
-      setImg('idle', wantSrc(false));
+      /* 偶发随机图：每 6~10s 检查一次，约一半概率换张随机图显示 3.5s */
+      if (now >= nextRandomAt) {
+        if (Math.random() < 0.5) {
+          setTemp(urlOf(Math.random() < 0.5 ? 'startupA' : 'startupB'), 3500);
+        }
+        nextRandomAt = now + 6000 + Math.random() * 4000;
+      }
+      if (tempSrc && now < tempUntil) {
+        want = tempSrc;
+      } else {
+        tempSrc = null;
+        want = urlOf('walk');
+      }
+    }
+
+    if (img.getAttribute('src') !== want) img.src = want;
+
+    if (typingNow || (cfg.bounce && img._hop)) {
+      if (x < minX) x = minX;
+      if (x > maxX) x = maxX;
+    } else if (cfg.walk && !(tempSrc && now < tempUntil)) {
       if (now < restUntil) {
         // 发呆中
-      } else if (cfg.walk) {
+      } else {
         if (nextRest && now > nextRest && Math.random() < cfg.idleChance) {
           restUntil = now + 2000 + Math.random() * 3000;
           nextRest = 0;
@@ -348,7 +321,7 @@ CLIENT_SCRIPT = r"""
     wrap.classList.toggle('pet-flip', dir === -1);
   }
 
-  /* ── 面板 ───────────────────────────────────────────────────── */
+  /* ── 面板 ── */
   var sheet = null, saveTimer = null;
 
   function save() {
@@ -393,7 +366,7 @@ CLIENT_SCRIPT = r"""
         '<div class="grabber"></div>' +
         '<div class="pt-h">小家伙</div>' +
         '<p class="pt-sub">聊天输入栏上方一只左右走的小宠物，撞到边翻身，' +
-          '你打字他停下，戳一下跳两下。</p>' +
+          '你打字他停下，戳一下跳两下，连续点会爆发。</p>' +
 
         '<div class="pt-line"><label>让他在</label>' +
           '<button type="button" class="pt-sw" data-sw="on" role="switch"></button></div>' +
@@ -404,10 +377,9 @@ CLIENT_SCRIPT = r"""
 
         '<div class="pt-grp">调一调</div>' + lines +
 
-        '<div class="pt-grp">换他的样子</div>' +
+        '<div class="pt-grp">换图</div>' +
         '<div class="pt-pics">' + grid + '</div>' +
-        '<p class="pt-note">默认用五张外链图（走动/静止/爆发/随机A/随机B），' +
-          '在想/高兴 没有专属图，先用别的顶。传了哪个换哪个，' +
+        '<p class="pt-note">默认用五张外链图。传了哪个换哪个，' +
           'png / gif / svg 都行，4MB 以内。</p>' +
 
         '<div class="pt-btns">' +
@@ -422,7 +394,6 @@ CLIENT_SCRIPT = r"""
       if (t.closest && t.closest('[data-pt-close]')) { closeSheet(); return; }
       if (t.closest && t.closest('[data-pt-reset]')) {
         cfg = JSON.parse(JSON.stringify(DEF));
-        failed = {};
         fillSheet(); save();
         return;
       }
@@ -455,7 +426,6 @@ CLIENT_SCRIPT = r"""
         .then(function (d) {
           if (!d || !d.ok) throw new Error((d && d.error) || 'bad');
           pics[st] = d.v;
-          failed[st] = 0;
           fillSheet();
           try { note('（换好了）'); } catch (e2) {}
         })
@@ -503,7 +473,6 @@ CLIENT_SCRIPT = r"""
     try { if (typeof openDrawer === 'function') openDrawer(); } catch (e) {}
   }
 
-  /* 侧边栏加一项，跟在「外观」后面（没有外观就跟着日记） */
   function mountNav() {
     if (document.getElementById('navPet')) return;
     var anchor = document.getElementById('navLook')
@@ -525,7 +494,6 @@ CLIENT_SCRIPT = r"""
     anchor.parentNode.insertBefore(b, anchor.nextSibling);
   }
 
-  /* ── 起 ─────────────────────────────────────────────────────── */
   function boot() {
     fetch('api/pet', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
@@ -559,11 +527,7 @@ CLIENT_SCRIPT = r"""
 
 
 def register_pet_feature(server_module):
-    """接小家伙：四个接口 + 再包一层 index。
-
-    要排在 frontend_feature 之后；排在 appearance 之后能让侧边栏那项
-    跟在「外观」后面（取不到也会退回跟着「日记」）。
-    """
+    """接小家伙：四个接口 + 再包一层 index。"""
     app = server_module.app
     get_db = server_module.get_db
 
@@ -602,7 +566,6 @@ def register_pet_feature(server_module):
         return None
 
     def pic_stamps() -> dict:
-        """哪些状态传过图，各自的版本号。没传的不出现在这张表里。"""
         out = {}
         for st in STATES:
             p = pic_path(st)
@@ -636,7 +599,6 @@ def register_pet_feature(server_module):
             return jsonify({"ok": False, "error": "文件是空的"}), 400
         if len(blob) > PIC_MAX:
             return jsonify({"ok": False, "error": "超过 4MB"}), 413
-        # 换格式时把旧的清掉，不然 pic_path 会先撞上旧文件
         for old in ALLOWED_EXT:
             p = pic_dir / (state + old)
             if p.exists():
